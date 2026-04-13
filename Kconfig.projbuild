@@ -27,7 +27,7 @@ menu "PTP Daemon Configuration"
 
          config NETUTILS_PTPD_GPTP_PROFILE
             bool "Enable gPTP profile"
-            default n
+            default y
             help
                 Act as a gPTP endpoint, capable of supporting Audio/Video Bridging (AVB).
 
