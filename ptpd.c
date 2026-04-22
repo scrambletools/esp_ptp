@@ -82,8 +82,93 @@
 
 #include <sys/timex.h>
 #include "esp_eth_clock.h"
+#include "esp_timer.h"
 
 #define ETH_TYPE_PTP 0x88F7
+
+/* Lateness diagnostic — detects when ptpd is starved by higher-priority
+ * tasks. If pdelay exchange misses exceed 3 in a row the upstream bridge
+ * declares the link asCapable=false and stops forwarding sync. */
+static int64_t s_ptpd_last_loop_us = 0;
+static int64_t s_ptpd_loop_max_gap_us = 0;
+static int64_t s_ptpd_last_report_us = 0;
+static uint32_t s_ptpd_loop_iters = 0;
+static uint32_t s_ptpd_tx_req_total = 0;
+static uint32_t s_ptpd_tx_req_late = 0;
+static int64_t s_ptpd_tx_req_late_max_us = 0;
+
+/* Per-message-type RX counters. Incremented in ptp_process_rx_packet for
+ * each successfully-dispatched packet. Reset per report window so we can
+ * compare against wire captures: expected ~80 syncs + ~80 follow-ups +
+ * ~10 announces + ~1 pdelay_req/resp/fup each over a 10 s window. */
+static uint32_t s_ptpd_rx_sync = 0;
+static uint32_t s_ptpd_rx_followup = 0;
+static uint32_t s_ptpd_rx_announce = 0;
+static uint32_t s_ptpd_rx_pdelay_req = 0;
+static uint32_t s_ptpd_rx_pdelay_resp = 0;
+static uint32_t s_ptpd_rx_pdelay_fup = 0;
+/* Max gap between two consecutive received syncs. If the wire shows
+ * steady 125 ms syncs but this goes above say 1 s, ptpd isn't seeing
+ * them even though they're reaching the NIC. */
+static int64_t s_ptpd_rx_sync_last_us = 0;
+static int64_t s_ptpd_rx_sync_max_gap_us = 0;
+
+static void ptpd_lateness_record_rx_sync(void) {
+  int64_t now = esp_timer_get_time();
+  if (s_ptpd_rx_sync_last_us) {
+    int64_t gap = now - s_ptpd_rx_sync_last_us;
+    if (gap > s_ptpd_rx_sync_max_gap_us) s_ptpd_rx_sync_max_gap_us = gap;
+  }
+  s_ptpd_rx_sync_last_us = now;
+  s_ptpd_rx_sync++;
+}
+
+static void ptpd_lateness_record_tx(int64_t lateness_us) {
+  s_ptpd_tx_req_total++;
+  if (lateness_us > 200000LL) {
+    s_ptpd_tx_req_late++;
+    if (lateness_us > s_ptpd_tx_req_late_max_us)
+      s_ptpd_tx_req_late_max_us = lateness_us;
+  }
+}
+
+static void ptpd_lateness_tick(void) {
+  int64_t now = esp_timer_get_time();
+  s_ptpd_loop_iters++;
+  if (s_ptpd_last_loop_us) {
+    int64_t gap = now - s_ptpd_last_loop_us;
+    if (gap > s_ptpd_loop_max_gap_us) s_ptpd_loop_max_gap_us = gap;
+  }
+  s_ptpd_last_loop_us = now;
+  if (s_ptpd_last_report_us == 0) {
+    s_ptpd_last_report_us = now;
+    return;
+  }
+  if (now - s_ptpd_last_report_us < 10000000LL) return;
+  ESP_LOGW("ptpd-late",
+    "iters=%u loop_gap_max=%lldms tx=%u/%u late(max=%lldms) "
+    "rx_sync=%u max_gap=%lldms fup=%u ann=%u pd_req=%u pd_resp=%u pd_fup=%u",
+    (unsigned)s_ptpd_loop_iters, s_ptpd_loop_max_gap_us / 1000,
+    (unsigned)s_ptpd_tx_req_late, (unsigned)s_ptpd_tx_req_total,
+    s_ptpd_tx_req_late_max_us / 1000,
+    (unsigned)s_ptpd_rx_sync, s_ptpd_rx_sync_max_gap_us / 1000,
+    (unsigned)s_ptpd_rx_followup, (unsigned)s_ptpd_rx_announce,
+    (unsigned)s_ptpd_rx_pdelay_req, (unsigned)s_ptpd_rx_pdelay_resp,
+    (unsigned)s_ptpd_rx_pdelay_fup);
+  s_ptpd_loop_max_gap_us = 0;
+  s_ptpd_loop_iters = 0;
+  s_ptpd_tx_req_total = 0;
+  s_ptpd_tx_req_late = 0;
+  s_ptpd_tx_req_late_max_us = 0;
+  s_ptpd_rx_sync = 0;
+  s_ptpd_rx_sync_max_gap_us = 0;
+  s_ptpd_rx_followup = 0;
+  s_ptpd_rx_announce = 0;
+  s_ptpd_rx_pdelay_req = 0;
+  s_ptpd_rx_pdelay_resp = 0;
+  s_ptpd_rx_pdelay_fup = 0;
+  s_ptpd_last_report_us = now;
+}
 
 #define SET_MAC_ADDR(addr, a, b, c, d, e, f) do { \
     addr[0] = a; addr[1] = b; addr[2] = c; \
@@ -798,7 +883,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->local_time_ns_prev = 0;
 
   state->offset_pi.kp = 1;
-  state->offset_pi.ki = 10;
+  state->offset_pi.ki = 3; // was 10, changed to match ptp4l default gain of ~0.3
   state->offset_pi.drift_acc = 0;
 
 #ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
@@ -1403,6 +1488,13 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state)
                               &state->last_transmitted_delayreq, &delta);
       if (timespec_to_ms(&delta) > state->next_delayreq_interval_ms)
         {
+          /* Skip the first tx (last_transmitted_delayreq == 0) so startup
+           * isn't counted as "late". */
+          if (state->last_transmitted_delayreq.tv_sec != 0) {
+            int64_t late_ms = (int64_t)timespec_to_ms(&delta) -
+                              (int64_t)state->next_delayreq_interval_ms;
+            ptpd_lateness_record_tx(late_ms * 1000LL);
+          }
           ptp_send_delay_req(state);
         }
     }
@@ -2078,11 +2170,13 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 #if defined(CONFIG_NETUTILS_PTPD_CLIENT) || \
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always acts as a client
     case PTP_MSGTYPE_ANNOUNCE:
+      s_ptpd_rx_announce++;
       ptpinfo("Got announce packet, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
       return ptp_process_announce(state, &state->rxbuf.announce);
 
     case PTP_MSGTYPE_SYNC:
+      ptpd_lateness_record_rx_sync();
       ptpinfo("Got sync packet, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
       if (!state->selected_source_valid) {
@@ -2091,6 +2185,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       return ptp_process_sync(state, &state->rxbuf.sync);
 
     case PTP_MSGTYPE_FOLLOW_UP:
+      s_ptpd_rx_followup++;
       ptpinfo("Got follow-up packet, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
       if (!state->selected_source_valid) {
@@ -2100,6 +2195,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 
     case PTP_MSGTYPE_DELAY_RESP:
     case PTP_MSGTYPE_PDELAY_RESP:
+      s_ptpd_rx_pdelay_resp++;
       ptpinfo("Got delay-resp, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
       return ptp_process_delay_resp(state, &state->rxbuf.delay_resp);
@@ -2109,12 +2205,14 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always responds to delay requests
     case PTP_MSGTYPE_DELAY_REQ:
     case PTP_MSGTYPE_PDELAY_REQ:
+      s_ptpd_rx_pdelay_req++;
       ptpinfo("Got delay req, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
       return ptp_process_delay_req(state, &state->rxbuf.delay_req);
 #endif
 
     case PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP:
+      s_ptpd_rx_pdelay_fup++;
       ptpinfo("Got peer delay resp follow-up, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
       return ptp_process_delay_resp_follow_up(state,
@@ -2318,6 +2416,7 @@ static int ptp_daemon(int argc, FAR char** argv)
 
   while (!state->stop)
     {
+      ptpd_lateness_tick();
 #ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
       state->can_send_delayreq = true;
 #else
@@ -2426,7 +2525,7 @@ int ptpd_start(FAR const char *interface)
 #ifdef ESP_PTP
   if (s_state == NULL) {
     xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
-              (void *)interface, tskIDLE_PRIORITY + 2, NULL);
+                (void *)interface, 6, NULL);
     return 1;
   }
   ESP_LOGE(TAG, "Other instance of PTP is already running");
