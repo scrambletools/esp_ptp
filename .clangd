@@ -1,0 +1,26 @@
+CompileFlags:
+  # This component is compiled as part of ESP-AVB-Example; use that app's
+  # ESP-IDF compile_commands.json when editing the component standalone.
+  CompilationDatabase: /home/user/Development/ESP-AVB-Example/build/
+  Add:
+    # clangd does not fully expand ESP-IDF's GCC specs file, so point it at
+    # the C library headers that the build actually uses.
+    - -isystem
+    - /home/user/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/picolibc/include
+  Remove:
+    - -fno-shrink-wrap
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -fzero-init-padding-bits=all
+    - -fno-malloc-dce
+    - -mtune=esp-base
+    - -march=*
+    # Not needed here and clangd can emit a bogus diagnostic from
+    # esp_wifi/remote/scripts/ignore_extensions.h while indexing these headers.
+    - -I/home/user/Development/esp-idf/components/esp_wifi/remote/include/injected
+
+InlayHints:
+  Enabled: false
+
+Diagnostics:
+  UnusedIncludes: None
