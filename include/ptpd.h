@@ -47,6 +47,12 @@
  * Public Types
  ****************************************************************************/
 
+typedef enum
+  {
+    ptp_profile_standard = 0,
+    ptp_profile_gptp = 1,
+  } ptp_profile_e;
+
 typedef struct
   {
     uint8_t id[8];     /* Clock identity */
@@ -65,6 +71,16 @@ typedef struct
 
 struct ptpd_status_s
 {
+  /* Active PTP profile. */
+
+  ptp_profile_e ptp_profile;
+
+  /* AVB Lite Endpoint Declaration TLV detected on the Pdelay channel
+   * (profiles/avb_lite.md §2.1/§2.2). True when the immediate Pdelay peer
+   * is also an endpoint, indicating no AVB-aware bridge sits between us. */
+
+  bool peer_is_endpoint;
+
   /* Is there a valid remote clock source active? */
 
   bool clock_source_valid;
@@ -146,6 +162,24 @@ extern "C"
  ****************************************************************************/
 
 int ptpd_start(FAR const char *interface);
+
+/****************************************************************************
+ * Name: ptpd_set_profile
+ *
+ * Description:
+ *   Change the active PTP profile at runtime.
+ *
+ * Input Parameters:
+ *   pid      - Process ID previously returned by ptpd_start()
+ *   profile  - New PTP profile.
+ *
+ * Returned Value:
+ *   On success, returns OK.
+ *   On failure, a negated errno value is returned.
+ *
+ ****************************************************************************/
+
+int ptpd_set_profile(int pid, ptp_profile_e profile);
 
 /****************************************************************************
  * Name: ptpd_status

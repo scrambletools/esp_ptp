@@ -73,6 +73,7 @@
 #ifdef ESP_PTP
 #include "ptpd.h"
 #include "esp_eth_driver.h"
+#include "esp_event.h"
 #include "esp_vfs_l2tap.h"
 #include "semaphore.h"
 #include "esp_log.h"
@@ -267,6 +268,7 @@ struct ptp_state_s
 #ifdef ESP_PTP
   uint8_t intf_hw_addr[ETH_ADDR_LEN];
   int ptp_socket;
+  ptp_profile_e ptp_profile;
 
   int64_t remote_time_ns_prev;
   int64_t local_time_ns_prev;
@@ -330,6 +332,40 @@ struct ptp_state_s
   struct timespec last_transmitted_announce;
   struct timespec last_transmitted_delayresp;
   struct timespec last_transmitted_delayreq;
+
+  /* gPTP → standard PTP fallback gate. One-shot per session: set true after
+   * either AVB Lite §2.2 condition fires; cleared on Ethernet link-up so the
+   * check re-arms for the new link. */
+
+  bool gptp_fallback_done;
+  bool eth_event_handler_registered;
+
+  /* AVB Lite Endpoint Declaration TLV detection (profiles/avb_lite.md §2.1).
+   * Set true when an incoming Pdelay_{Req,Resp,Resp_Follow_Up} carries the
+   * Endpoint Declaration TLV — meaning the immediate Pdelay peer is also an
+   * endpoint, so no AVB-aware bridge sits between us. Triggers fallback to
+   * standard PTP profile per profiles/avb_lite.md §2.2. */
+
+  bool peer_is_endpoint;
+  unsigned int pdelay_req_attempts_unanswered;
+
+  /* AVB Lite §2.2 cond 3 — Pdelay_Resp source clockIdentity cardinality.
+   * A spec-compliant AVB bridge presents exactly one boundary-clock peer per
+   * port; ≥2 distinct responders within the 3 s window indicates a flooding
+   * (non-AVB) L2 substrate. We track sourceidentity (8 bytes) rather than
+   * MAC because that's what the PTP header carries directly. */
+
+#define PTP_PDELAY_RESP_MAX_TRACKED   4
+  uint8_t pdelay_resp_responders[PTP_PDELAY_RESP_MAX_TRACKED][8];
+  unsigned int pdelay_resp_responder_count;
+  bool pdelay_multi_responder;
+
+  /* AVB Lite post-fallback endpoint beacon (profiles/avb_lite.md §2.3).
+   * After fallback to standard PTP, periodically emit a Pdelay_Req carrying
+   * the Endpoint Declaration TLV, targeted at the gPTP bridge-group MAC, so
+   * peers still in gPTP can detect us and follow us into AVB Lite. */
+
+  struct timespec last_endpoint_beacon;
 
   /* Timestamps related to path delay calculation (CLOCK_REALTIME) */
 
@@ -403,6 +439,89 @@ static struct ptp_state_s *s_state;
  * Private Functions
  ****************************************************************************/
 #ifdef ESP_PTP
+static void ptp_clean_after_step(FAR struct ptp_state_s *state);
+
+static inline bool ptp_is_gptp(FAR const struct ptp_state_s *state)
+{
+  return state->ptp_profile == ptp_profile_gptp;
+}
+
+static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state)
+{
+  if (!ptp_is_gptp(state))
+    {
+      return;
+    }
+
+  state->gptp_fallback_done = false;
+  state->last_transmitted_delayreq.tv_sec = 0;
+  state->last_transmitted_delayreq.tv_nsec = 0;
+
+  /* AVB Lite fallback re-evaluation on link-up (profiles/avb_lite.md §2.2). */
+
+  state->peer_is_endpoint = false;
+  state->pdelay_req_attempts_unanswered = 0;
+  state->pdelay_resp_responder_count = 0;
+  state->pdelay_multi_responder = false;
+  memset(state->pdelay_resp_responders, 0,
+         sizeof(state->pdelay_resp_responders));
+  state->last_endpoint_beacon.tv_sec = 0;
+  state->last_endpoint_beacon.tv_nsec = 0;
+
+  ptpinfo("Armed profile fallback evaluation\n");
+}
+
+static void ptp_eth_event_handler(void *arg, esp_event_base_t event_base,
+                                  int32_t event_id, void *event_data)
+{
+  UNUSED(event_base);
+  UNUSED(event_data);
+  FAR struct ptp_state_s *state = (FAR struct ptp_state_s *)arg;
+
+  if (!state)
+    {
+      return;
+    }
+
+  if (event_id == ETHERNET_EVENT_CONNECTED)
+    {
+      /* A link-up event starts a new "startup" window. Resume in the current
+       * profile; if that profile is gPTP, require one PDelay_Resp again. */
+      ptp_arm_profile_fallback(state);
+    }
+  else if (event_id == ETHERNET_EVENT_DISCONNECTED)
+    {
+    }
+}
+
+static void ptp_reset_for_profile(FAR struct ptp_state_s *state)
+{
+  state->selected_source_valid = false;
+  memset(&state->selected_source, 0, sizeof(state->selected_source));
+  state->path_delay_avgcount = 0;
+  state->path_delay_ns = 0;
+  state->peer_delay_avgcount = 0;
+  state->peer_delay_ns = 0;
+  state->correction_ns = 0;
+  state->can_send_delayreq = false;
+  state->delayreq_time.tv_sec = 0;
+  state->delayreq_time.tv_nsec = 0;
+  state->last_transmitted_delayreq.tv_sec = 0;
+  state->last_transmitted_delayreq.tv_nsec = 0;
+  ptp_clean_after_step(state);
+
+  if (ptp_is_gptp(state))
+    {
+      state->delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
+      state->next_delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
+    }
+  else
+    {
+      state->delayreq_interval_ms = CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
+      state->next_delayreq_interval_ms = CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
+    }
+}
+
 // Convert 8 bytes to 64-bit signed integer (nanoseconds << 16)
 static int64_t get_correction_ns(uint8_t *correction_field)
 {
@@ -463,27 +582,34 @@ static int ptp_get_esp_eth_handle(struct ptp_state_s *state, esp_eth_handle_t *e
   return ioctl(state->ptp_socket, L2TAP_G_DEVICE_DRV_HNDL, eth_handle);
 }
 
-static void ptp_create_eth_frame(struct ptp_state_s *state, uint8_t *eth_frame, void *ptp_msg, uint16_t ptp_msg_len)
+static void ptp_create_eth_frame_to(struct ptp_state_s *state, uint8_t *eth_frame,
+                                    void *ptp_msg, uint16_t ptp_msg_len,
+                                    const uint8_t *dest_mac)
 {
   struct eth_hdr eth_hdr = {
     .type = htons(ETH_TYPE_PTP)
   };
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  memcpy(&eth_hdr.dest.addr, LLDP_MULTICAST_ADDR, ETH_ADDR_LEN);
-#else
-  memcpy(&eth_hdr.dest.addr, PTP4L_MULTICAST_ADDR, ETH_ADDR_LEN);
-#endif
+  memcpy(&eth_hdr.dest.addr, dest_mac, ETH_ADDR_LEN);
   memcpy(&eth_hdr.src.addr, state->intf_hw_addr, ETH_ADDR_LEN);
 
   memcpy(eth_frame, &eth_hdr, sizeof(eth_hdr));
   memcpy(eth_frame + sizeof(eth_hdr), ptp_msg, ptp_msg_len);
 }
 
-static int ptp_net_send(FAR struct ptp_state_s *state, void *ptp_msg, uint16_t ptp_msg_len, struct timespec *ts)
+static void ptp_create_eth_frame(struct ptp_state_s *state, uint8_t *eth_frame, void *ptp_msg, uint16_t ptp_msg_len)
+{
+  ptp_create_eth_frame_to(state, eth_frame, ptp_msg, ptp_msg_len,
+                          ptp_is_gptp(state) ? LLDP_MULTICAST_ADDR
+                                             : PTP4L_MULTICAST_ADDR);
+}
+
+static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
+                           uint16_t ptp_msg_len, struct timespec *ts,
+                           const uint8_t *dest_mac)
 {
   uint8_t eth_frame[ptp_msg_len + ETH_HEADER_LEN];
-  ptp_create_eth_frame(state, eth_frame, ptp_msg, ptp_msg_len);
+  ptp_create_eth_frame_to(state, eth_frame, ptp_msg, ptp_msg_len, dest_mac);
 
   // wrap "Info Records Buffer" into union to ensure proper alignment of data (this is typically needed when
   // accessing double word variables or structs containing double word variables)
@@ -512,6 +638,14 @@ static int ptp_net_send(FAR struct ptp_state_s *state, void *ptp_msg, uint16_t p
     }
 
   return ret;
+}
+
+static int ptp_net_send(FAR struct ptp_state_s *state, void *ptp_msg,
+                        uint16_t ptp_msg_len, struct timespec *ts)
+{
+  return ptp_net_send_to(state, ptp_msg, ptp_msg_len, ts,
+                         ptp_is_gptp(state) ? LLDP_MULTICAST_ADDR
+                                            : PTP4L_MULTICAST_ADDR);
 }
 
 static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg, uint16_t ptp_msg_len, struct timespec *ts)
@@ -887,12 +1021,11 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->offset_pi.drift_acc = 0;
 
 #ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  state->delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
-  state->next_delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
+  state->ptp_profile = ptp_profile_gptp;
 #else
-  state->delayreq_interval_ms = CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
-  state->next_delayreq_interval_ms = CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
+  state->ptp_profile = ptp_profile_standard;
 #endif
+  ptp_reset_for_profile(state);
 
   state->own_identity.header.version = 2;
   state->own_identity.header.domain = CONFIG_NETUTILS_PTPD_DOMAIN;
@@ -921,13 +1054,20 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->own_identity.gm_priority1 = 255; // When daemon is statically configured as slave, set the worst
 #endif
 
+  if (esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                 ptp_eth_event_handler, state) == ESP_OK)
+    {
+      state->eth_event_handler_registered = true;
+    }
+  else
+    {
+      ptpwarn("failed to register Ethernet event handler; gPTP link-up fallback check will only run at daemon startup\n");
+    }
+
   s_state = state;
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  ptpinfo("PTP daemon started in gPTP mode.\n");
-#else
-  ptpinfo("PTP daemon started in normal mode.\n");
-#endif
+  ptpinfo("PTP daemon started in %s mode.\n",
+          ptp_is_gptp(state) ? "gPTP" : "standard");
 
   return OK;
 }
@@ -1088,6 +1228,13 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
 static int ptp_destroy_state(FAR struct ptp_state_s *state)
 {
 #ifdef ESP_PTP
+  if (state->eth_event_handler_registered)
+    {
+      esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                   ptp_eth_event_handler);
+      state->eth_event_handler_registered = false;
+    }
+
   // Remove well-known PTP multicast destination MAC addresses from the filter
   esp_eth_handle_t eth_handle;
   if (ptp_get_esp_eth_handle(state, &eth_handle) < 0)
@@ -1176,6 +1323,128 @@ static int ptp_check_multicast_status(FAR struct ptp_state_s *state)
 }
 #endif // !ESP_PTP
 
+/* Track the source clockIdentity of a received Pdelay_Resp; if the count of
+ * distinct responders crosses 2, latch pdelay_multi_responder.
+ * Per profiles/avb_lite.md §2.2 cond 3 — spec-compliant AVB bridge presents
+ * exactly one boundary-clock peer per port. */
+static void ptp_record_pdelay_responder(FAR struct ptp_state_s *state,
+                                        FAR const uint8_t *sourceidentity)
+{
+  if (state->pdelay_multi_responder)
+    {
+      return;
+    }
+  for (unsigned i = 0; i < state->pdelay_resp_responder_count; i++)
+    {
+      if (memcmp(state->pdelay_resp_responders[i], sourceidentity, 8) == 0)
+        {
+          return; /* already tracked */
+        }
+    }
+  if (state->pdelay_resp_responder_count < PTP_PDELAY_RESP_MAX_TRACKED)
+    {
+      memcpy(state->pdelay_resp_responders[state->pdelay_resp_responder_count],
+             sourceidentity, 8);
+    }
+  state->pdelay_resp_responder_count++;
+  if (state->pdelay_resp_responder_count >= 2)
+    {
+      state->pdelay_multi_responder = true;
+    }
+}
+
+static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
+                                           size_t base_len);
+
+/* Emit a Pdelay_Req beacon carrying the Endpoint Declaration TLV, addressed
+ * to the gPTP bridge-group MAC regardless of the local PTP profile, so peers
+ * still in gPTP can detect us after we have fallen back. The beacon is
+ * informational only; no Pdelay_Resp is expected or processed.
+ * Per profiles/avb_lite.md §2.3.
+ */
+static int ptp_send_endpoint_beacon(FAR struct ptp_state_s *state)
+{
+  ptp_msgbuf req;
+  struct timespec ts;
+  size_t req_len;
+
+  memset(&req, 0, sizeof(req));
+  req.header = state->own_identity.header;
+  req.header.messagetype = PTP_MSGTYPE_PDELAY_REQ | PTP_MSGTYPE_SDOID_GPTP;
+  req.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
+  req.header.controlfield = 5;
+  req_len = sizeof(struct ptp_pdelay_req_s);
+  req_len += ptp_append_endpoint_decl_tlv(req.raw, req_len);
+  req.header.messagelength[1] = req_len;
+  ptp_increment_sequence(&state->delay_req_seq, &req.header);
+
+  static const uint8_t lldp_mac[6] = LLDP_MULTICAST_ADDR;
+  int ret = ptp_net_send_to(state, &req, req_len, &ts, lldp_mac);
+  if (ret >= 0)
+    {
+      ptpinfo("Sent endpoint beacon, seq %ld\n",
+              (long)ptp_get_sequence(&req.header));
+    }
+  return ret;
+}
+
+/* Append the AVB Lite Endpoint Declaration TLV to a Pdelay-class message
+ * buffer at offset base_len. Returns the number of bytes added.
+ * Per profiles/avb_lite.md §2.1.
+ */
+static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
+                                              size_t base_len)
+{
+  FAR struct ptp_endpoint_decl_tlv_s *tlv =
+      (FAR struct ptp_endpoint_decl_tlv_s *)(msg_buf + base_len);
+  static const uint8_t orgid[3]  = PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES;
+  static const uint8_t orgsub[3] = PTP_ENDPOINT_DECL_TLV_SUBTYPE_BYTES;
+
+  tlv->type[0]   = (PTP_TLV_TYPE_ORGANIZATION_EXTENSION >> 8) & 0xFF;
+  tlv->type[1]   = PTP_TLV_TYPE_ORGANIZATION_EXTENSION & 0xFF;
+  tlv->length[0] = 0x00;
+  tlv->length[1] = 0x07;
+  memcpy(tlv->orgidentity, orgid, sizeof(orgid));
+  memcpy(tlv->orgsubtype,  orgsub, sizeof(orgsub));
+  tlv->data = PTP_ENDPOINT_DECL_TLV_DATA;
+  return sizeof(struct ptp_endpoint_decl_tlv_s);
+}
+
+/* Scan a Pdelay-class message for the AVB Lite Endpoint Declaration TLV.
+ * msg_buf points at the message start, total_len is the on-wire length,
+ * base_len is sizeof the standard message body (Pdelay_Req / Resp / Fup).
+ * Returns true if the TLV is present and identifies the sender as an
+ * AVB Lite endpoint. Per profiles/avb_lite.md §2.1.
+ */
+static bool ptp_msg_has_endpoint_decl_tlv(FAR const uint8_t *msg_buf,
+                                             size_t total_len,
+                                             size_t base_len)
+{
+  static const uint8_t orgid[3]  = PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES;
+  static const uint8_t orgsub[3] = PTP_ENDPOINT_DECL_TLV_SUBTYPE_BYTES;
+  size_t offset = base_len;
+
+  while (offset + 4 <= total_len)
+    {
+      uint16_t type = ((uint16_t)msg_buf[offset] << 8) | msg_buf[offset + 1];
+      uint16_t len  = ((uint16_t)msg_buf[offset + 2] << 8) | msg_buf[offset + 3];
+      size_t   body = offset + 4;
+      if (body + len > total_len)
+        {
+          break; /* malformed / truncated */
+        }
+      if (type == PTP_TLV_TYPE_ORGANIZATION_EXTENSION && len >= 7 &&
+          memcmp(msg_buf + body,     orgid,  3) == 0 &&
+          memcmp(msg_buf + body + 3, orgsub, 3) == 0 &&
+          msg_buf[body + 6] == PTP_ENDPOINT_DECL_TLV_DATA)
+        {
+          return true;
+        }
+      offset = body + len;
+    }
+  return false;
+}
+
 /* Send PTP server announcement packet */
 
 static int ptp_send_announce(FAR struct ptp_state_s *state)
@@ -1199,10 +1468,10 @@ static int ptp_send_announce(FAR struct ptp_state_s *state)
   msg.header.messagelength[1] = sizeof(msg);
   msg.header.logmessageinterval = msec_to_log_period(CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS);
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-  msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
-#endif
+  if (ptp_is_gptp(state)) {
+    msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
+    msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
+  }
 
   ptp_increment_sequence(&state->announce_seq, &msg.header);
   ptp_gettime(state, &ts);
@@ -1274,10 +1543,10 @@ static int ptp_send_sync(FAR struct ptp_state_s *state)
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always uses two-step sync
   msg.header.flags[0] = PTP_FLAGS0_TWOSTEP;
 #endif
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-  msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
-#endif
+  if (ptp_is_gptp(state)) {
+    msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
+    msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
+  }
 
 #ifndef ESP_PTP
   txhdr.msg_name = &addr;
@@ -1326,9 +1595,9 @@ static int ptp_send_sync(FAR struct ptp_state_s *state)
   msg.header.flags[0] = 0;     // Reset 2-step flag
   msg.header.controlfield = 2; // Follow-up message
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-#endif
+  if (ptp_is_gptp(state)) {
+    msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
+  }
 
   /* Add the information TLV (required for gPTP and ignored otherwise) */
 
@@ -1369,15 +1638,12 @@ static int ptp_send_sync(FAR struct ptp_state_s *state)
 
 static int ptp_send_delay_req(FAR struct ptp_state_s *state)
 {
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  struct ptp_pdelay_req_s req;
-#else
-  struct ptp_delay_req_s req;
-#endif
+  ptp_msgbuf req;
 #ifndef ESP_PTP
   struct sockaddr_in addr;
 #endif // !ESP_PTP
   int ret;
+  size_t req_len;
 
 #ifndef ESP_PTP
   addr.sin_family      = AF_INET;
@@ -1387,31 +1653,34 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state)
 
   memset(&req, 0, sizeof(req));
   req.header = state->own_identity.header;
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  req.header.messagetype = PTP_MSGTYPE_PDELAY_REQ;
-#else
-  req.header.messagetype = PTP_MSGTYPE_DELAY_REQ;
-#endif
   req.header.logmessageinterval = msec_to_log_period(state->delayreq_interval_ms);
-  req.header.messagelength[1] = sizeof(req);
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  req.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-  req.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
-  req.header.controlfield = 5;
-#endif
+  if (ptp_is_gptp(state)) {
+    req.header.messagetype = PTP_MSGTYPE_PDELAY_REQ | PTP_MSGTYPE_SDOID_GPTP;
+    req.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
+    req.header.controlfield = 5;
+    req_len = sizeof(struct ptp_pdelay_req_s);
+    /* Append AVB Lite Endpoint Declaration TLV (profiles/avb_lite.md §2.1) */
+    req_len += ptp_append_endpoint_decl_tlv(req.raw, req_len);
+    /* Reset per-cycle responder set so the §2.2 cond 3 (cardinality) check
+     * sees only the responders for this single Pdelay_Req. */
+    state->pdelay_resp_responder_count = 0;
+    memset(state->pdelay_resp_responders, 0,
+           sizeof(state->pdelay_resp_responders));
+  } else {
+    req.header.messagetype = PTP_MSGTYPE_DELAY_REQ;
+    ptp_gettime(state, &state->delayreq_time);
+    timespec_to_ptp_format(&state->delayreq_time, req.delay_req.origintimestamp);
+    req_len = sizeof(struct ptp_delay_req_s);
+  }
+  req.header.messagelength[1] = req_len;
 
   ptp_increment_sequence(&state->delay_req_seq, &req.header);
 
-#ifndef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  ptp_gettime(state, &state->delayreq_time);
-  timespec_to_ptp_format(&state->delayreq_time, req.origintimestamp);
-#endif
-
 #ifdef ESP_PTP
-  ret = ptp_net_send(state, &req, sizeof(req), &state->delayreq_time);
+  ret = ptp_net_send(state, &req, req_len, &state->delayreq_time);
 #else
-  ret = sendto(state->tx_socket, &req, sizeof(req), 0,
+  ret = sendto(state->tx_socket, &req, req_len, 0,
                (FAR struct sockaddr *)&addr, sizeof(addr));
 #endif // ESP_PTP
 
@@ -1430,11 +1699,64 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state)
   else
     {
       clock_gettime(CLOCK_MONOTONIC, &state->last_transmitted_delayreq);
+      if (ptp_is_gptp(state) && !state->gptp_fallback_done) {
+        /* For AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2). */
+        state->pdelay_req_attempts_unanswered++;
+      }
       ptpinfo("Sent delay req, seq %ld\n",
               (long)ptp_get_sequence(&req.header));
     }
 
   return ret;
+}
+
+static void ptp_check_profile_fallback(FAR struct ptp_state_s *state)
+{
+  if (!ptp_is_gptp(state) || state->gptp_fallback_done)
+    {
+      return;
+    }
+
+  /* AVB Lite fallback condition 1 (profiles/avb_lite.md §2.2):
+   * a Pdelay_{Req,Resp,Resp_Follow_Up} arrived carrying the Endpoint
+   * Declaration TLV — the peer is an endpoint, no AVB-aware bridge between us.
+   */
+
+  if (state->peer_is_endpoint)
+    {
+      ptpwarn("Endpoint Declaration TLV seen on Pdelay channel; "
+              "switching to standard PTP mode\n");
+      state->gptp_fallback_done = true;
+      state->ptp_profile = ptp_profile_standard;
+      ptp_reset_for_profile(state);
+      return;
+    }
+
+  /* AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2):
+   * three consecutive Pdelay_Req attempts with no Pdelay_Resp received. */
+
+  if (state->pdelay_req_attempts_unanswered >= 3)
+    {
+      ptpwarn("No Pdelay_Resp after %u attempts; switching to standard PTP mode\n",
+              state->pdelay_req_attempts_unanswered);
+      state->gptp_fallback_done = true;
+      state->ptp_profile = ptp_profile_standard;
+      ptp_reset_for_profile(state);
+      return;
+    }
+
+  /* AVB Lite fallback condition 3 (profiles/avb_lite.md §2.2):
+   * Pdelay_Resp from two or more distinct sourceidentity values, indicating
+   * a flooding non-AVB switch in the L2 path rather than a single AVB
+   * boundary-clock peer. */
+
+  if (state->pdelay_multi_responder)
+    {
+      ptpwarn("Pdelay_Resp from multiple sources; switching to standard PTP mode\n");
+      state->gptp_fallback_done = true;
+      state->ptp_profile = ptp_profile_standard;
+      ptp_reset_for_profile(state);
+    }
 }
 
 /* Check if we need to send packets */
@@ -1473,13 +1795,9 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state)
 
 #if defined(CONFIG_NETUTILS_PTPD_SEND_DELAYREQ) ||                             \
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-    if (true) // gPTP always sends delay requests
+    if (ptp_is_gptp(state) ||
+        (state->selected_source_valid && state->can_send_delayreq))
     {
-#else
-    if (state->selected_source_valid && state->can_send_delayreq)
-    {
-#endif // CONFIG_NETUTILS_PTPD_GPTP_PROFILE
       struct timespec time_now;
       struct timespec delta;
 
@@ -1499,6 +1817,27 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state)
         }
     }
 #endif // CONFIG_NETUTILS_PTPD_SEND_DELAYREQ || CONFIG_NETUTILS_PTPD_GPTP_PROFILE
+
+  /* Post-fallback endpoint beacon (profiles/avb_lite.md §2.3): once we've
+   * fallen back to standard PTP, periodically emit a Pdelay_Req-with-TLV
+   * to the gPTP bridge-group MAC so peers still in gPTP can detect us and
+   * follow us into the standard profile. Cadence is 3 s, matching the
+   * §2.2 evaluation window so any peer's window is guaranteed to overlap
+   * at least one beacon. */
+
+  if (state->gptp_fallback_done && state->ptp_profile == ptp_profile_standard)
+    {
+      struct timespec time_now;
+      struct timespec delta;
+      clock_gettime(CLOCK_MONOTONIC, &time_now);
+      clock_timespec_subtract(&time_now, &state->last_endpoint_beacon, &delta);
+      if (state->last_endpoint_beacon.tv_sec == 0 ||
+          timespec_to_ms(&delta) >= 3000)
+        {
+          ptp_send_endpoint_beacon(state);
+          state->last_endpoint_beacon = time_now;
+        }
+    }
 
   return OK;
 }
@@ -1538,11 +1877,11 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
 {
   // Compute how off we are against master
   int64_t offset_ns = timespec_delta_ns(remote_timestamp, local_timestamp);
-#if CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  offset_ns += state->peer_delay_ns + state->correction_ns;
-#else
-  offset_ns += state->path_delay_ns;
-#endif
+  if (ptp_is_gptp(state)) {
+    offset_ns += state->peer_delay_ns + state->correction_ns;
+  } else {
+    offset_ns += state->path_delay_ns;
+  }
   // TODO add offset filter
 
   // Execute PI controller to elimitate the offset
@@ -1585,11 +1924,10 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   // we would get incorrect delay
   int64_t diff = llabs(offset_ns) - llabs(state->last_offset_ns);
   static int cnt = 0;
-#if CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  if (llabs(diff) < CONFIG_NETUTILS_PTPD_PEER_DELAY_STABILITY_NS) {
-#else
-  if (llabs(diff) < CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS) {
-#endif
+  if ((ptp_is_gptp(state) &&
+       llabs(diff) < CONFIG_NETUTILS_PTPD_PEER_DELAY_STABILITY_NS) ||
+      (!ptp_is_gptp(state) &&
+       llabs(diff) < CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS)) {
     if (cnt <= 3)
       cnt++;
   } else {
@@ -1607,7 +1945,7 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   state->last_offset_ns = offset_ns;
 }
 
-void ptp_clean_after_step(FAR struct ptp_state_s *state)
+static void ptp_clean_after_step(FAR struct ptp_state_s *state)
 {
   state->remote_time_ns_prev = 0;
   state->local_time_ns_prev = 0;
@@ -1638,11 +1976,11 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
           (long)remote_timestamp->tv_nsec);
 
   delta_ns = timespec_delta_ns(remote_timestamp, local_timestamp);
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  delta_ns += state->peer_delay_ns;
-#else
-  delta_ns += state->path_delay_ns;
-#endif
+  if (ptp_is_gptp(state)) {
+    delta_ns += state->peer_delay_ns;
+  } else {
+    delta_ns += state->path_delay_ns;
+  }
   absdelta_ns = (delta_ns < 0) ? -delta_ns : delta_ns;
 
   if (absdelta_ns > adj_limit_ns)
@@ -1878,15 +2216,12 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
 #endif // !ESP_PTP
   int ret;
 
-#ifndef CONFIG_NETUTILS_PTPD_GPTP_PROFILE // gPTP always responds to delay
-                                          // requests
-  if (state->selected_source_valid)
+  if (!ptp_is_gptp(state) && state->selected_source_valid)
     {
-      /* We are operating as a client, ignore delay requests */
+      /* We are operating as a standard PTP client, ignore delay requests */
 
       return OK;
     }
-#endif // !CONFIG_NETUTILS_PTPD_GPTP_PROFILE
 
 #ifndef ESP_PTP
   addr.sin_family      = AF_INET;
@@ -1896,23 +2231,19 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
 
   memset(&resp, 0, sizeof(resp));
   resp.header = state->own_identity.header;
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  resp.header.messagetype = PTP_MSGTYPE_PDELAY_RESP;
-#else
-  resp.header.messagetype = PTP_MSGTYPE_DELAY_RESP;
-#endif
-  resp.header.messagelength[1] = sizeof(struct ptp_delay_resp_s);
+  resp.header.messagetype = ptp_is_gptp(state) ? PTP_MSGTYPE_PDELAY_RESP : PTP_MSGTYPE_DELAY_RESP;
+  size_t resp_len = sizeof(struct ptp_delay_resp_s);
 
 #if defined(CONFIG_NETUTILS_PTPD_TWOSTEP_SYNC) ||                              \
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
   resp.header.flags[0] = PTP_FLAGS0_TWOSTEP;
 #endif
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-  resp.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
-  resp.header.controlfield = 5;
-#endif
+  if (ptp_is_gptp(state)) {
+    resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
+    resp.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
+    resp.header.controlfield = 5;
+  }
 
   timespec_to_ptp_format(&state->rxtime, resp.delay_resp.receivetimestamp);
   memcpy(resp.delay_resp.reqidentity, req->header.sourceidentity,
@@ -1924,10 +2255,17 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
   // this is typically ignored in a response, except in the case of gPTP
   resp.header.logmessageinterval = msec_to_log_period(CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS);
 
+  /* Append AVB Lite Endpoint Declaration TLV to gPTP Pdelay_Resp
+   * (profiles/avb_lite.md §2.1) */
+  if (ptp_is_gptp(state)) {
+    resp_len += ptp_append_endpoint_decl_tlv(resp.raw, resp_len);
+  }
+  resp.header.messagelength[1] = resp_len;
+
   /* Send the response message */
 
 #ifdef ESP_PTP
-  ret = ptp_net_send(state, &resp, sizeof(struct ptp_delay_resp_s), &ts);
+  ret = ptp_net_send(state, &resp, resp_len, &ts);
 #else
   ret = sendto(state->tx_socket, &resp, sizeof(resp), 0,
                (FAR struct sockaddr *)&addr, sizeof(addr));
@@ -1943,32 +2281,38 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
 
   /* gPTP profile requires response follow-up message */
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  timespec_to_ptp_format(&ts, resp.delay_resp_follow_up.origintimestamp);
-  resp.header.messagetype = PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP;
-  resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-  resp.header.messagelength[1] = sizeof(struct ptp_delay_resp_follow_up_s);
-  resp.header.flags[0] = 0; // Reset 2-step flag
+  if (ptp_is_gptp(state)) {
+    /* Rebuild the buffer for follow-up: the prior TLV append was at the end
+     * of the Pdelay_Resp body, but the follow-up has a different body size.
+     * Clear the Pdelay_Resp TLV area before laying down the follow-up's TLV. */
+    memset(resp.raw + sizeof(struct ptp_delay_resp_s), 0,
+           sizeof(resp.raw) - sizeof(struct ptp_delay_resp_s));
+    timespec_to_ptp_format(&ts, resp.delay_resp_follow_up.origintimestamp);
+    resp.header.messagetype = PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP;
+    resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
+    size_t fup_len = sizeof(struct ptp_delay_resp_follow_up_s);
+    fup_len += ptp_append_endpoint_decl_tlv(resp.raw, fup_len);
+    resp.header.messagelength[1] = fup_len;
+    resp.header.flags[0] = 0; // Reset 2-step flag
 
-  /* Send the response follow-up message, currently only for ESP as it requires
-   * hw timestamp data */
+    /* Send the response follow-up message, currently only for ESP as it requires
+     * hw timestamp data */
 
 #ifdef ESP_PTP
-  ret = ptp_net_send(state, &resp, sizeof(struct ptp_delay_resp_follow_up_s),
-                     NULL);
+    ret = ptp_net_send(state, &resp, fup_len, NULL);
 #endif // ESP_PTP
 
-  if (ret < 0)
-    {
-      ptperr("sendto for delay response follow-up message failed: %d\n", errno);
-      return ret;
-    }
-  ptpinfo("Sent response + response follow-up, seq %ld\n",
-          (long)ptp_get_sequence(&resp.header));
-#else
-      ptpinfo("Sent delay resp, seq %ld\n",
-              (long)ptp_get_sequence(&req->header));
-#endif /* CONFIG_NETUTILS_PTPD_GPTP_PROFILE */
+    if (ret < 0)
+      {
+        ptperr("sendto for delay response follow-up message failed: %d\n", errno);
+        return ret;
+      }
+    ptpinfo("Sent response + response follow-up, seq %ld\n",
+            (long)ptp_get_sequence(&resp.header));
+  } else {
+    ptpinfo("Sent delay resp, seq %ld\n",
+            (long)ptp_get_sequence(&req->header));
+  }
 
   return OK;
 }
@@ -1976,30 +2320,36 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
 static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
                                   FAR struct ptp_delay_resp_s *msg)
 {
-#ifndef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
   int64_t path_delay;
   int64_t sync_delay;
   struct timespec remote_rxtime;
-#endif
   uint16_t sequence;
 
-/* gPTP peer delay responses are valid from any peer */
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-  if (memcmp(msg->reqidentity,
-             state->own_identity.header.sourceidentity,
-             sizeof(msg->reqidentity)) != 0)
-#else
-  if (!state->selected_source_valid ||
-      memcmp(msg->header.sourceidentity,
-             state->selected_source.header.sourceidentity,
-             sizeof(msg->header.sourceidentity)) != 0 ||
-      memcmp(msg->reqidentity,
-             state->own_identity.header.sourceidentity,
-             sizeof(msg->reqidentity)) != 0)
-#endif // CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-    {
+  if (ptp_is_gptp(state)) {
+    /* gPTP peer delay responses are valid from any peer */
+    if (memcmp(msg->reqidentity, state->own_identity.header.sourceidentity,
+               sizeof(msg->reqidentity)) != 0) {
       return OK; /* This packet wasn't for us */
     }
+  } else {
+    if (!state->selected_source_valid ||
+        memcmp(msg->header.sourceidentity,
+               state->selected_source.header.sourceidentity,
+               sizeof(msg->header.sourceidentity)) != 0 ||
+        memcmp(msg->reqidentity,
+               state->own_identity.header.sourceidentity,
+               sizeof(msg->reqidentity)) != 0) {
+      return OK; /* This packet wasn't for us */
+    }
+  }
+
+  if (ptp_is_gptp(state)) {
+    /* AVB Lite §2.2 cond 2 reset — receiving a Pdelay_Resp clears the
+     * unanswered-attempt counter. We deliberately do NOT latch
+     * gptp_fallback_done here: §2.2 cond 1 (Endpoint Declaration TLV) must
+     * still be evaluated in subsequent ptp_check_profile_fallback calls. */
+    state->pdelay_req_attempts_unanswered = 0;
+  }
 
   sequence = ptp_get_sequence(&msg->header);
 
@@ -2010,46 +2360,43 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
       return OK;
     }
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
+  if (ptp_is_gptp(state)) {
+    /* We need to wait for a resp follow-up to calc peer delay. */
 
-  /* We need to wait for a resp follow-up to calc peer delay. */
+    state->twostep_delay_resp_rxtime = state->rxtime;
+    state->twostep_delay_resp_packet = *msg;
+    ptpinfo("Waiting for delay response follow-up\n");
+  } else {
+    /* Path delay is calculated as the average between delta for sync
+     * message and delta for delay req message.
+     * (IEEE-1588 section 11.3: Delay request-response mechanism)
+     */
 
-  state->twostep_delay_resp_rxtime = state->rxtime;
-  state->twostep_delay_resp_packet = *msg;
-  ptpinfo("Waiting for delay response follow-up\n");
+    ptp_format_to_timespec(msg->receivetimestamp, &remote_rxtime);
+    path_delay = timespec_delta_ns(&remote_rxtime, &state->delayreq_time);
+    sync_delay = state->path_delay_ns - state->last_delta_ns;
+    path_delay = (path_delay + sync_delay) / 2;
 
-#else
-  /* Path delay is calculated as the average between delta for sync
-   * message and delta for delay req message.
-   * (IEEE-1588 section 11.3: Delay request-response mechanism)
-   */
+    if (path_delay >= 0 && path_delay < CONFIG_NETUTILS_PTPD_MAX_PATH_DELAY_NS)
+      {
+        if (state->path_delay_avgcount <
+            CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT)
+          {
+            state->path_delay_avgcount++;
+          }
 
-  ptp_format_to_timespec(msg->receivetimestamp, &remote_rxtime);
-  path_delay = timespec_delta_ns(&remote_rxtime, &state->delayreq_time);
-  sync_delay = state->path_delay_ns - state->last_delta_ns;
-  path_delay = (path_delay + sync_delay) / 2;
+        state->path_delay_ns += (path_delay - state->path_delay_ns)
+                                / state->path_delay_avgcount;
 
-  if (path_delay >= 0 && path_delay < CONFIG_NETUTILS_PTPD_MAX_PATH_DELAY_NS)
-    {
-      if (state->path_delay_avgcount <
-          CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT)
-        {
-          state->path_delay_avgcount++;
-        }
-
-      state->path_delay_ns += (path_delay - state->path_delay_ns)
-                              / state->path_delay_avgcount;
-
-      ptpinfo("Path delay: %ld ns (avg: %ld ns)\n",
-        (long)path_delay, (long)state->path_delay_ns);
-    }
-  else
-    {
-      ptpwarn("Path delay out of range: %lld ns\n",
-              (long long)path_delay);
-    }
-
-#endif // CONFIG_NETUTILS_PTPD_GPTP_PROFILE
+        ptpinfo("Path delay: %ld ns (avg: %ld ns)\n",
+          (long)path_delay, (long)state->path_delay_ns);
+      }
+    else
+      {
+        ptpwarn("Path delay out of range: %lld ns\n",
+                (long long)path_delay);
+      }
+  }
 
   /* Calculate interval until next packet */
   if (msg->header.logmessageinterval <= 12)
@@ -2070,6 +2417,10 @@ ptpinfo("Randomized delay req interval: %d ms\n", state->next_delayreq_interval_
 
 static int ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
                                  FAR struct ptp_delay_resp_follow_up_s *msg) {
+  if (!ptp_is_gptp(state)) {
+    return OK;
+  }
+
   int64_t peer_delay_roundtrip;
   int64_t peer_delay_reflection;
   int64_t peer_delay;
@@ -2161,6 +2512,11 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       return OK;
     }
 
+  bool msg_is_gptp = (state->rxbuf.header.messagetype & PTP_MSGTYPE_SDOID_GPTP) != 0;
+  if (msg_is_gptp != ptp_is_gptp(state)) {
+    return OK;
+  }
+
   clock_gettime(CLOCK_MONOTONIC, &state->last_received_multicast);
 
   /* Rout the packet to the appropriate handler */
@@ -2198,6 +2554,14 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       s_ptpd_rx_pdelay_resp++;
       ptpinfo("Got delay-resp, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
+      if (ptp_msg_has_endpoint_decl_tlv(state->rxbuf.raw, length,
+                                           sizeof(struct ptp_delay_resp_s))) {
+        state->peer_is_endpoint = true;
+      }
+      if (!state->gptp_fallback_done) {
+        ptp_record_pdelay_responder(state,
+                                    state->rxbuf.header.sourceidentity);
+      }
       return ptp_process_delay_resp(state, &state->rxbuf.delay_resp);
 #endif
 
@@ -2208,6 +2572,10 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       s_ptpd_rx_pdelay_req++;
       ptpinfo("Got delay req, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
+      if (ptp_msg_has_endpoint_decl_tlv(state->rxbuf.raw, length,
+                                           sizeof(struct ptp_pdelay_req_s))) {
+        state->peer_is_endpoint = true;
+      }
       return ptp_process_delay_req(state, &state->rxbuf.delay_req);
 #endif
 
@@ -2215,6 +2583,11 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       s_ptpd_rx_pdelay_fup++;
       ptpinfo("Got peer delay resp follow-up, seq %ld\n",
               (long)ptp_get_sequence(&state->rxbuf.header));
+      if (ptp_msg_has_endpoint_decl_tlv(
+              state->rxbuf.raw, length,
+              sizeof(struct ptp_delay_resp_follow_up_s))) {
+        state->peer_is_endpoint = true;
+      }
       return ptp_process_delay_resp_follow_up(state,
                                             &state->rxbuf.delay_resp_follow_up);
     default:
@@ -2268,6 +2641,8 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state)
     }
 
   status = state->status_req.dest;
+  status->ptp_profile = state->ptp_profile;
+  status->peer_is_endpoint = state->peer_is_endpoint;
   status->clock_source_valid = state->selected_source_valid;
 
   /* Copy own identity info to status struct */
@@ -2417,11 +2792,7 @@ static int ptp_daemon(int argc, FAR char** argv)
   while (!state->stop)
     {
       ptpd_lateness_tick();
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-      state->can_send_delayreq = true;
-#else
-      state->can_send_delayreq = false;
-#endif // CONFIG_NETUTILS_PTPD_GPTP_PROFILE
+      state->can_send_delayreq = ptp_is_gptp(state);
 
 #ifndef ESP_PTP
       rxhdr.msg_name = NULL;
@@ -2485,6 +2856,7 @@ static int ptp_daemon(int argc, FAR char** argv)
         }
 #endif // !ESP_PTP
       ptp_periodic_send(state);
+      ptp_check_profile_fallback(state);
 
       state->selected_source_valid = is_selected_source_valid(state);
       ptp_process_statusreq(state);
@@ -2576,6 +2948,41 @@ int ptpd_start(FAR const char *interface)
  *   status simultaneously, some of the requests may timeout.
  *
  ****************************************************************************/
+
+int ptpd_set_profile(int pid, ptp_profile_e profile)
+{
+#ifdef ESP_PTP
+  UNUSED(pid);
+
+  if (profile != ptp_profile_standard && profile != ptp_profile_gptp)
+    {
+      return -EINVAL;
+    }
+
+  if (s_state == NULL)
+    {
+      return -ESRCH;
+    }
+
+  if (s_state->ptp_profile != profile)
+    {
+      s_state->ptp_profile = profile;
+      ptp_reset_for_profile(s_state);
+      if (profile == ptp_profile_gptp)
+        {
+          ptp_arm_profile_fallback(s_state);
+        }
+      ptpinfo("PTP profile changed to %s mode.\n",
+              profile == ptp_profile_gptp ? "gPTP" : "standard");
+    }
+
+  return OK;
+#else
+  UNUSED(pid);
+  UNUSED(profile);
+  return -ENOTSUP;
+#endif
+}
 
 int ptpd_status(int pid, FAR struct ptpd_status_s *status)
 {

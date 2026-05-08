@@ -199,4 +199,23 @@ struct ptp_pdelay_req_s
   uint8_t reserved[20];
 };
 
+/* AVB Lite Endpoint Declaration TLV — per profiles/avb_lite.md §2.1.
+ * Carried in Pdelay_Req, Pdelay_Resp, and Pdelay_Resp_Follow_Up to let
+ * AVB Lite endpoints detect each other across non-AVB-aware bridges. */
+
+#define PTP_TLV_TYPE_ORGANIZATION_EXTENSION 0x0003
+
+#define PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES   {0x8C, 0x1F, 0x64}
+#define PTP_ENDPOINT_DECL_TLV_SUBTYPE_BYTES {0x36, 0xC0, 0x01}
+#define PTP_ENDPOINT_DECL_TLV_DATA  0x01
+
+struct ptp_endpoint_decl_tlv_s
+{
+  uint8_t type[2];          // 0x0003 = ORGANIZATION_EXTENSION
+  uint8_t length[2];        // 0x0007 = 7 bytes (orgid + orgsubtype + data)
+  uint8_t orgidentity[3];   // 0x8C 0x1F 0x64
+  uint8_t orgsubtype[3];    // 0x36 0xC0 0x01 (Endpoint Declaration)
+  uint8_t data;             // 0x01
+};
+
 #endif /* __APPS_NETUTILS_PTPD_PTPV2_H */
