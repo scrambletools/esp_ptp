@@ -31,6 +31,9 @@
 
 // ESP_PTP
 #include <time.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
 #ifndef FAR
 #define FAR
 #endif
@@ -52,6 +55,32 @@ typedef enum
     ptp_profile_standard = 0,
     ptp_profile_gptp = 1,
   } ptp_profile_e;
+
+/* Per-port physical medium. ETHERNET runs the standard 802.1AS
+ * pdelay_req/resp protocol on an L2TAP-bound socket. WIFI_BEACON_IE is
+ * for time-aware-bridge configurations where the port participates in
+ * gPTP semantics but the on-wire transport for peer-delay (and
+ * optionally for FollowUpInformation) does not use 802.1AS frames. */
+
+typedef enum
+  {
+    ptp_port_medium_ethernet = 0,
+    ptp_port_medium_wifi_beacon_ie = 1,
+  } ptp_port_medium_e;
+
+/* How peer-delay is measured on a port. GPTP_WIRE is the protocol-driven
+ * Pdelay_Req/Resp exchange. FTM_EXTERNAL means the daemon does not
+ * generate or process Pdelay frames on this port; instead the
+ * application drives ptpd_inject_peer_delay() with values derived from
+ * out-of-band measurements (e.g. 802.11 FTM). NONE disables peer-delay
+ * on this port entirely. */
+
+typedef enum
+  {
+    ptp_port_peer_delay_source_gptp_wire = 0,
+    ptp_port_peer_delay_source_ftm_external = 1,
+    ptp_port_peer_delay_source_none = 2,
+  } ptp_port_peer_delay_source_e;
 
 typedef struct
   {
@@ -162,6 +191,108 @@ extern "C"
  ****************************************************************************/
 
 int ptpd_start(FAR const char *interface);
+
+/****************************************************************************
+ * Name: ptpd_start_port
+ *
+ * Description:
+ *   Multi-port variant of ptpd_start(). Starts (or augments) the PTP
+ *   daemon, configuring the addressed port with the given medium and
+ *   peer-delay source. The legacy ptpd_start() is equivalent to:
+ *     ptpd_start_port(0, interface,
+ *                     ptp_port_medium_ethernet,
+ *                     ptp_port_peer_delay_source_gptp_wire)
+ *
+ *   Phase 1a wires this as a thin wrapper that supports only the legacy
+ *   port 0 / ethernet / gptp_wire combination — other combinations
+ *   return -ENOSYS until subsequent phases.
+ *
+ * Returned Value:
+ *   On success, the non-negative task ID of the PTP daemon is returned;
+ *   On failure, a negated errno value is returned.
+ *
+ ****************************************************************************/
+
+int ptpd_start_port(int port_index,
+                    FAR const char *interface,
+                    ptp_port_medium_e medium,
+                    ptp_port_peer_delay_source_e peer_delay_source);
+
+/****************************************************************************
+ * Name: ptpd_inject_peer_delay
+ *
+ * Description:
+ *   Push an externally-measured peer-delay sample into the running
+ *   daemon for a port whose peer_delay_source is FTM_EXTERNAL. The
+ *   value feeds the same averaging path that the on-wire pdelay
+ *   handler uses on GPTP_WIRE ports.
+ *
+ ****************************************************************************/
+
+int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns);
+
+/****************************************************************************
+ * Name: ptpd_inject_sync
+ *
+ * Description:
+ *   Push a marshalled FollowUpInformation TLV (per IEEE 802.1AS-2020
+ *   §11.4.4 / §12.7) into the daemon for a port whose Sync transport
+ *   is out-of-band (e.g. carried in an 802.11 beacon Vendor IE).
+ *
+ *   follow_up_info points to the FollowUpInformation byte buffer; len
+ *   is the buffer length. Memory ownership stays with the caller.
+ *
+ ****************************************************************************/
+
+int ptpd_inject_sync(int port_index,
+                     FAR const uint8_t *follow_up_info,
+                     size_t len);
+
+/****************************************************************************
+ * Name: ptpd_register_sync_egress_cb
+ *
+ * Description:
+ *   Register a callback invoked by the daemon whenever it would emit a
+ *   gPTP Sync/Follow_Up on the addressed port. The callback receives a
+ *   marshalled FollowUpInformation TLV; the application then carries
+ *   that payload to the wire (e.g. by updating the AP's beacon Vendor
+ *   IE on a Wi-Fi port). One callback per port; passing NULL clears.
+ *
+ ****************************************************************************/
+
+typedef void (*ptpd_sync_egress_cb_t)(int port_index,
+                                      FAR const uint8_t *follow_up_info,
+                                      size_t len,
+                                      FAR void *ctx);
+
+int ptpd_register_sync_egress_cb(int port_index,
+                                 ptpd_sync_egress_cb_t cb,
+                                 FAR void *ctx);
+
+/****************************************************************************
+ * Name: ptpd_now
+ *
+ * Description:
+ *   Read the PTP-disciplined system time. This is the primary clock
+ *   surface for clients that previously called
+ *   clock_gettime(CLOCK_PTP_SYSTEM, ts). On platforms where
+ *   CLOCK_PTP_SYSTEM is backed by the EMAC IEEE-1588 hardware clock
+ *   (ESP32-P4 with esp_eth_clock), the helper returns the same value
+ *   that clockid would. On platforms without 1588 hardware (e.g.
+ *   ESP32-C6) the helper sources time from a software-disciplined
+ *   clock backed by esp_timer_get_time() — see ptp_clock_sw_init().
+ *
+ *   esp_ptp must stand alone — the helper is in the ptpd_* namespace,
+ *   not avb_*. (esp_avb is the primary consumer; that context is
+ *   captured here in the comment only.)
+ *
+ * Returned Value:
+ *   On success returns 0 and writes the current PTP time into *ts.
+ *   On failure returns -1 with errno set, matching clock_gettime().
+ *
+ ****************************************************************************/
+
+int ptpd_now(FAR struct timespec *ts);
 
 /****************************************************************************
  * Name: ptpd_set_profile

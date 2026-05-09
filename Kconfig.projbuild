@@ -245,6 +245,18 @@ menu "PTP Daemon Configuration"
 
         endif # NETUTILS_PTPD_CLIENT
 
+        config ESP_PTP_NUM_PORTS
+            int "Number of PTP ports"
+            default 1
+            range 1 2
+            depends on NETUTILS_PTPD
+            help
+                Number of independent PTP port instances managed by the daemon.
+                The default is 1 (single Ethernet port, the historical
+                behavior). Set to 2 for time-aware bridge configurations
+                that mix one Ethernet port and one Wi-Fi port whose peer
+                delay is sourced externally (e.g. via 802.11 FTM).
+
     endif # NETUTILS_PTPD
 
 endmenu # PTP Daemon Configuration
