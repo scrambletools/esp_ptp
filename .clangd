@@ -1,7 +1,7 @@
 CompileFlags:
-  # This component is compiled as part of ESP-AVB-Example; use that app's
+  # This component is compiled as part of ESP-AVB-Endpoint; use that app's
   # ESP-IDF compile_commands.json when editing the component standalone.
-  CompilationDatabase: /home/user/Development/ESP-AVB-Example/build/
+  CompilationDatabase: /home/user/Development/ESP-AVB-Endpoint/build/
   Add:
     # clangd does not fully expand ESP-IDF's GCC specs file, so point it at
     # the C library headers that the build actually uses.

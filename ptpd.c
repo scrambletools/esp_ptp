@@ -82,8 +82,25 @@
 #include <math.h>
 
 #include <sys/timex.h>
-#include "esp_eth_clock.h"
 #include "esp_timer.h"
+#include "soc/soc_caps.h"
+
+/* Hardware PTP clock backend (esp_eth_clock + CLOCK_PTP_SYSTEM) is
+ * only present on chips with an on-chip MAC (e.g. ESP32-P4). On
+ * Wi-Fi-only targets like ESP32-C6 the esp_eth_clock.h header exists
+ * but its CLOCK_PTP_SYSTEM / esp_eth_clock_init definitions are
+ * compiled out (gated on SOC_EMAC_SUPPORTED inside the header). Fall
+ * back to CLOCK_REALTIME so this file still compiles. Runtime gPTP
+ * behaviour there relies on the software-clock backend in
+ * ptp_clock_sw.c via ptpd_set_sw_clock_now() + ptpd_now(). */
+#if SOC_EMAC_SUPPORTED
+#  include "esp_eth_clock.h"
+#  define PTPD_HAVE_ESP_ETH_CLOCK 1
+#  define PTPD_CLOCK_ID           CLOCK_PTP_SYSTEM
+#else
+#  define PTPD_HAVE_ESP_ETH_CLOCK 0
+#  define PTPD_CLOCK_ID           CLOCK_REALTIME
+#endif
 
 #define ETH_TYPE_PTP 0x88F7
 
@@ -897,11 +914,7 @@ static int ptp_gettime(FAR struct ptp_state_s *state,
                        FAR struct timespec *ts)
 {
   UNUSED(state);
-#ifdef ESP_PTP
-  return clock_gettime(CLOCK_PTP_SYSTEM, ts);
-#else
-  return clock_gettime(CLOCK_REALTIME, ts);
-#endif // ESP_PTP
+  return clock_gettime(PTPD_CLOCK_ID, ts);
 }
 
 /* Change current system timestamp by jumping */
@@ -910,11 +923,7 @@ static int ptp_settime(FAR struct ptp_state_s *state,
                        FAR struct timespec *ts)
 {
   UNUSED(state);
-#ifdef ESP_PTP
-  return clock_settime(CLOCK_PTP_SYSTEM, ts);
-#else
-  return clock_settime(CLOCK_REALTIME, ts);
-#endif // ESP_PTP
+  return clock_settime(PTPD_CLOCK_ID, ts);
 }
 
 /* Smoothly adjust timestamp. */
@@ -926,7 +935,7 @@ static int ptp_adjtime(FAR struct ptp_state_s *state, int64_t delta_ns)
     .modes = ADJ_OFFSET | ADJ_NANO,
     .offset = (long)delta_ns,
   };
-  return clock_adjtime(CLOCK_PTP_SYSTEM, &tx);
+  return clock_adjtime(PTPD_CLOCK_ID, &tx);
 #else
   struct timeval delta;
   delta.tv_sec = delta_ns / NSEC_PER_SEC;
@@ -1007,13 +1016,19 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
     ptperr("failed to get socket eth_handle %d\n", errno);
     return ERROR;
   }
+#if PTPD_HAVE_ESP_ETH_CLOCK
   esp_eth_clock_cfg_t clk_cfg = {
-    .clock_id = CLOCK_PTP_SYSTEM,
+    .clock_id = PTPD_CLOCK_ID,
   };
   if (esp_eth_clock_init(eth_handle, &clk_cfg) != ESP_OK) {
     ptperr("failed to initialize PTP clock");
     return ERROR;
   }
+#else
+  /* Wi-Fi-only target: no hardware PTP clock. ptpd_now() routes
+   * through the software-clock backend (see ptp_clock_sw.c). */
+  (void)eth_handle;
+#endif
 
   // Enable time stamping in L2TAP
   if(ioctl(state->port[0].ptp_socket, L2TAP_S_TIMESTAMP_EN) < 0)
@@ -1940,7 +1955,7 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
     .modes = ADJ_FREQUENCY,
     .freq = freq_ppb,
   };
-  clock_adjtime(CLOCK_PTP_SYSTEM, &tx);
+  clock_adjtime(PTPD_CLOCK_ID, &tx);
 
   state->remote_time_ns_prev = remote_time_ns;
   state->local_time_ns_prev = local_time_ns;
@@ -3016,11 +3031,7 @@ int ptpd_now(FAR struct timespec *ts)
     {
       return s_sw_clock_now(ts);
     }
-#ifdef ESP_PTP
-  return clock_gettime(CLOCK_PTP_SYSTEM, ts);
-#else
-  return clock_gettime(CLOCK_REALTIME, ts);
-#endif
+  return clock_gettime(PTPD_CLOCK_ID, ts);
 }
 
 int ptpd_start(FAR const char *interface)
@@ -3122,6 +3133,18 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status)
   sem_t donesem;
   struct ptpd_statusreq_s req;
   struct timespec timeout;
+
+  /* Defend against callers that ask for status before the daemon has
+   * been started. ptpd_start() sets s_state; on builds that haven't
+   * called it (e.g. Phase 6b.2 c6 endpoint, which uses esp_ptp's
+   * software clock fallback without running the protocol loop yet)
+   * dereferencing s_state crashes with a NULL store fault. The
+   * documented contract for this function is "returns 0 on success,
+   * non-zero otherwise" — callers (e.g. avb_initialize_state) already
+   * skip the status field when this returns nonzero. */
+  if (s_state == NULL) {
+    return -ENODEV;
+  }
 
   /* Fill in the status request */
 

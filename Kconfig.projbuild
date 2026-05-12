@@ -251,11 +251,114 @@ menu "PTP Daemon Configuration"
             range 1 2
             depends on NETUTILS_PTPD
             help
-                Number of independent PTP port instances managed by the daemon.
-                The default is 1 (single Ethernet port, the historical
-                behavior). Set to 2 for time-aware bridge configurations
-                that mix one Ethernet port and one Wi-Fi port whose peer
-                delay is sourced externally (e.g. via 802.11 FTM).
+                Number of independent PTP port instances managed by the
+                daemon. The default is 1 (a single endpoint port). Set to
+                2 for time-aware bridges (two BRIDGED ports) or endpoints
+                with failover (one PRIMARY + one FAILOVER port).
+
+        # Per-port configuration. Each port has three knobs:
+        #
+        #   MEDIUM     ethernet | wifi | wifi_cp
+        #              wifi is a locally-attached radio; wifi_cp is a
+        #              Wi-Fi radio reached via ESP-Hosted on a coprocessor.
+        #
+        #   TYPE       primary | failover | bridged
+        #              primary  : main port for an endpoint (required if
+        #                         NUM_PORTS == 1)
+        #              failover : hot-standby for the primary
+        #              bridged  : participates in an L2 bridge with the
+        #                         other bridged port(s)
+        #
+        #   WIFI_ROLE  ap | sta
+        #              only meaningful for wifi / wifi_cp. ap transmits
+        #              beacons (FollowUpInfo carrier) and responds to FTM;
+        #              sta consumes beacons and initiates FTM.
+
+        choice ESP_PTP_PORT0_MEDIUM
+            prompt "Port 0 medium"
+            default ESP_PTP_PORT0_MEDIUM_ETHERNET
+            depends on NETUTILS_PTPD
+
+            config ESP_PTP_PORT0_MEDIUM_ETHERNET
+                bool "ethernet"
+            config ESP_PTP_PORT0_MEDIUM_WIFI
+                bool "wifi"
+            config ESP_PTP_PORT0_MEDIUM_WIFI_CP
+                bool "wifi_cp"
+        endchoice
+
+        choice ESP_PTP_PORT0_TYPE
+            prompt "Port 0 type"
+            default ESP_PTP_PORT0_TYPE_PRIMARY
+            depends on NETUTILS_PTPD
+
+            config ESP_PTP_PORT0_TYPE_PRIMARY
+                bool "primary"
+            config ESP_PTP_PORT0_TYPE_FAILOVER
+                bool "failover"
+                depends on ESP_PTP_NUM_PORTS = 2
+            config ESP_PTP_PORT0_TYPE_BRIDGED
+                bool "bridged"
+                depends on ESP_PTP_NUM_PORTS = 2
+        endchoice
+
+        choice ESP_PTP_PORT0_WIFI_ROLE
+            prompt "Port 0 wifi role"
+            default ESP_PTP_PORT0_WIFI_ROLE_STA
+            depends on NETUTILS_PTPD
+            depends on ESP_PTP_PORT0_MEDIUM_WIFI || ESP_PTP_PORT0_MEDIUM_WIFI_CP
+
+            config ESP_PTP_PORT0_WIFI_ROLE_AP
+                bool "ap"
+            config ESP_PTP_PORT0_WIFI_ROLE_STA
+                bool "sta"
+        endchoice
+
+        choice ESP_PTP_PORT1_MEDIUM
+            prompt "Port 1 medium"
+            default ESP_PTP_PORT1_MEDIUM_WIFI_CP
+            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+
+            config ESP_PTP_PORT1_MEDIUM_ETHERNET
+                bool "ethernet"
+            config ESP_PTP_PORT1_MEDIUM_WIFI
+                bool "wifi"
+            config ESP_PTP_PORT1_MEDIUM_WIFI_CP
+                bool "wifi_cp"
+        endchoice
+
+        choice ESP_PTP_PORT1_TYPE
+            prompt "Port 1 type"
+            default ESP_PTP_PORT1_TYPE_BRIDGED
+            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+
+            config ESP_PTP_PORT1_TYPE_PRIMARY
+                bool "primary"
+            config ESP_PTP_PORT1_TYPE_FAILOVER
+                bool "failover"
+            config ESP_PTP_PORT1_TYPE_BRIDGED
+                bool "bridged"
+        endchoice
+
+        choice ESP_PTP_PORT1_WIFI_ROLE
+            prompt "Port 1 wifi role"
+            default ESP_PTP_PORT1_WIFI_ROLE_AP
+            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+            depends on ESP_PTP_PORT1_MEDIUM_WIFI || ESP_PTP_PORT1_MEDIUM_WIFI_CP
+
+            config ESP_PTP_PORT1_WIFI_ROLE_AP
+                bool "ap"
+            config ESP_PTP_PORT1_WIFI_ROLE_STA
+                bool "sta"
+        endchoice
+
+        # Derived: at least one port is wifi_cp + AP. Gates the
+        # beacon-IE publish code path in ptp_beacon_ie.c.
+        config ESP_PTP_HAS_WIFI_CP_AP
+            bool
+            default y if (ESP_PTP_PORT0_MEDIUM_WIFI_CP && ESP_PTP_PORT0_WIFI_ROLE_AP)
+            default y if (ESP_PTP_PORT1_MEDIUM_WIFI_CP && ESP_PTP_PORT1_WIFI_ROLE_AP)
+            default n
 
     endif # NETUTILS_PTPD
 

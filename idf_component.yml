@@ -1,8 +1,9 @@
-version: "0.9.5"
-description: "PTP client and server component for ESP32"
+version: "1.0.0"
+description: "PTP implementation for ESP32"
 url: "https://github.com/scrambletools/esp_ptp"
 license: "Apache 2.0"
 dependencies:
   idf: ^6.0
 targets:
   - esp32p4
+  - esp32c6
