@@ -13,8 +13,8 @@ menu "PTP Daemon Configuration"
         help
             Build a minimal implementation of IEEE-1588 precision time protocol.
             Uses system gettimeofday() and adjtime() calls to synchronize clock
-            with a master clock through network, or to provide a master clock to
-            other systems.
+            with a timetransmitter clock through network, or to provide a
+            timetransmitter clock to other systems.
 
     if NETUTILS_PTPD
 
@@ -45,9 +45,9 @@ menu "PTP Daemon Configuration"
                 Act as a PTP server, providing NuttX clock time to other systems.
 
                 Both server and client can be simultaneously enabled. NuttX will then
-                synchronize to a higher priority master clock, or act as a master
-                clock itself if it has the highest priority.
-                Refer to Best Master Clock algorithm in IEEE-1588 for details.
+                synchronize to a higher priority timetransmitter clock, or act as a
+                timetransmitter clock itself if it has the highest priority.
+                Refer to the BTCA in IEEE-1588 for details.
 
         config NETUTILS_PTPD_STACKSIZE
             int "PTP daemon stack stack size"
@@ -93,7 +93,7 @@ menu "PTP Daemon Configuration"
                 default 248
                 range 0 255
                 help
-                    Set master clock class to announce when acting as a PTP server.
+                    Set BTC clock class to announce when acting as a PTP server.
                     Lower value means higher quality clock source.
                     248 is the default for unknown class.
 
@@ -102,7 +102,7 @@ menu "PTP Daemon Configuration"
                 default 254
                 range 0 255
                 help
-                    Set master clock accuracy to announce when acting as a PTP server.
+                    Set BTC clock accuracy to announce when acting as a PTP server.
                     Logarithmic scale is defined in IEEE-1588:
                     32: +-  25 ns
                     33: +- 100 ns
@@ -256,11 +256,19 @@ menu "PTP Daemon Configuration"
                 2 for time-aware bridges (two BRIDGED ports) or endpoints
                 with failover (one PRIMARY + one FAILOVER port).
 
-        # Per-port configuration. Each port has three knobs:
+        # Per-port configuration. Each port has five independent knobs:
         #
-        #   MEDIUM     ethernet | wifi | wifi_cp
-        #              wifi is a locally-attached radio; wifi_cp is a
-        #              Wi-Fi radio reached via ESP-Hosted on a coprocessor.
+        #   MEDIUM     ethernet | wifi
+        #              The link-layer technology on the wire.
+        #
+        #   HOST_IF    emac | ahb | sdio | spi | usb | other
+        #              How the port is attached to the host SoC. Determines
+        #              the achievable PTP timestamp accuracy and the per-port
+        #              admission budget — emac is the only one with
+        #              hardware timestamping and lowest latency; ahb is the
+        #              native on-chip Wi-Fi MAC; sdio is the typical
+        #              P4+C6 coprocessor link; spi covers external Eth/Wi-Fi
+        #              chips and is the slowest of the four.
         #
         #   TYPE       primary | failover | bridged
         #              primary  : main port for an endpoint (required if
@@ -269,10 +277,16 @@ menu "PTP Daemon Configuration"
         #              bridged  : participates in an L2 bridge with the
         #                         other bridged port(s)
         #
-        #   WIFI_ROLE  ap | sta
-        #              only meaningful for wifi / wifi_cp. ap transmits
+        #   WIFI_MODE  ap | sta
+        #              only meaningful for medium=wifi. ap transmits
         #              beacons (FollowUpInfo carrier) and responds to FTM;
         #              sta consumes beacons and initiates FTM.
+        #
+        #   LINK_SPEED_MBPS
+        #              Nominal PHY-rate cap, in megabits per second. Used
+        #              for MSRP admission math and for failover scoring.
+        #              Typical: 100 / 1000 (eth), 150 / 300 / 600 (Wi-Fi
+        #              negotiated cap).
 
         choice ESP_PTP_PORT0_MEDIUM
             prompt "Port 0 medium"
@@ -283,8 +297,26 @@ menu "PTP Daemon Configuration"
                 bool "ethernet"
             config ESP_PTP_PORT0_MEDIUM_WIFI
                 bool "wifi"
-            config ESP_PTP_PORT0_MEDIUM_WIFI_CP
-                bool "wifi_cp"
+        endchoice
+
+        choice ESP_PTP_PORT0_HOST_IF
+            prompt "Port 0 host interface"
+            default ESP_PTP_PORT0_HOST_IF_EMAC if ESP_PTP_PORT0_MEDIUM_ETHERNET
+            default ESP_PTP_PORT0_HOST_IF_AHB  if ESP_PTP_PORT0_MEDIUM_WIFI
+            depends on NETUTILS_PTPD
+
+            config ESP_PTP_PORT0_HOST_IF_EMAC
+                bool "emac"
+            config ESP_PTP_PORT0_HOST_IF_AHB
+                bool "ahb"
+            config ESP_PTP_PORT0_HOST_IF_SDIO
+                bool "sdio"
+            config ESP_PTP_PORT0_HOST_IF_SPI
+                bool "spi"
+            config ESP_PTP_PORT0_HOST_IF_USB
+                bool "usb"
+            config ESP_PTP_PORT0_HOST_IF_OTHER
+                bool "other"
         endchoice
 
         choice ESP_PTP_PORT0_TYPE
@@ -302,29 +334,53 @@ menu "PTP Daemon Configuration"
                 depends on ESP_PTP_NUM_PORTS = 2
         endchoice
 
-        choice ESP_PTP_PORT0_WIFI_ROLE
-            prompt "Port 0 wifi role"
-            default ESP_PTP_PORT0_WIFI_ROLE_STA
+        choice ESP_PTP_PORT0_WIFI_MODE
+            prompt "Port 0 wifi mode"
+            default ESP_PTP_PORT0_WIFI_MODE_STA
             depends on NETUTILS_PTPD
-            depends on ESP_PTP_PORT0_MEDIUM_WIFI || ESP_PTP_PORT0_MEDIUM_WIFI_CP
+            depends on ESP_PTP_PORT0_MEDIUM_WIFI
 
-            config ESP_PTP_PORT0_WIFI_ROLE_AP
+            config ESP_PTP_PORT0_WIFI_MODE_AP
                 bool "ap"
-            config ESP_PTP_PORT0_WIFI_ROLE_STA
+            config ESP_PTP_PORT0_WIFI_MODE_STA
                 bool "sta"
         endchoice
 
+        config ESP_PTP_PORT0_LINK_SPEED_MBPS
+            int "Port 0 nominal link speed (Mbps)"
+            default 1000 if ESP_PTP_PORT0_MEDIUM_ETHERNET
+            default 150  if ESP_PTP_PORT0_MEDIUM_WIFI
+            depends on NETUTILS_PTPD
+
         choice ESP_PTP_PORT1_MEDIUM
             prompt "Port 1 medium"
-            default ESP_PTP_PORT1_MEDIUM_WIFI_CP
+            default ESP_PTP_PORT1_MEDIUM_WIFI
             depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
 
             config ESP_PTP_PORT1_MEDIUM_ETHERNET
                 bool "ethernet"
             config ESP_PTP_PORT1_MEDIUM_WIFI
                 bool "wifi"
-            config ESP_PTP_PORT1_MEDIUM_WIFI_CP
-                bool "wifi_cp"
+        endchoice
+
+        choice ESP_PTP_PORT1_HOST_IF
+            prompt "Port 1 host interface"
+            default ESP_PTP_PORT1_HOST_IF_SDIO if ESP_PTP_PORT1_MEDIUM_WIFI
+            default ESP_PTP_PORT1_HOST_IF_EMAC if ESP_PTP_PORT1_MEDIUM_ETHERNET
+            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+
+            config ESP_PTP_PORT1_HOST_IF_EMAC
+                bool "emac"
+            config ESP_PTP_PORT1_HOST_IF_AHB
+                bool "ahb"
+            config ESP_PTP_PORT1_HOST_IF_SDIO
+                bool "sdio"
+            config ESP_PTP_PORT1_HOST_IF_SPI
+                bool "spi"
+            config ESP_PTP_PORT1_HOST_IF_USB
+                bool "usb"
+            config ESP_PTP_PORT1_HOST_IF_OTHER
+                bool "other"
         endchoice
 
         choice ESP_PTP_PORT1_TYPE
@@ -340,24 +396,32 @@ menu "PTP Daemon Configuration"
                 bool "bridged"
         endchoice
 
-        choice ESP_PTP_PORT1_WIFI_ROLE
-            prompt "Port 1 wifi role"
-            default ESP_PTP_PORT1_WIFI_ROLE_AP
+        choice ESP_PTP_PORT1_WIFI_MODE
+            prompt "Port 1 wifi mode"
+            default ESP_PTP_PORT1_WIFI_MODE_AP
             depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
-            depends on ESP_PTP_PORT1_MEDIUM_WIFI || ESP_PTP_PORT1_MEDIUM_WIFI_CP
+            depends on ESP_PTP_PORT1_MEDIUM_WIFI
 
-            config ESP_PTP_PORT1_WIFI_ROLE_AP
+            config ESP_PTP_PORT1_WIFI_MODE_AP
                 bool "ap"
-            config ESP_PTP_PORT1_WIFI_ROLE_STA
+            config ESP_PTP_PORT1_WIFI_MODE_STA
                 bool "sta"
         endchoice
 
-        # Derived: at least one port is wifi_cp + AP. Gates the
-        # beacon-IE publish code path in ptp_beacon_ie.c.
-        config ESP_PTP_HAS_WIFI_CP_AP
+        config ESP_PTP_PORT1_LINK_SPEED_MBPS
+            int "Port 1 nominal link speed (Mbps)"
+            default 150  if ESP_PTP_PORT1_MEDIUM_WIFI
+            default 1000 if ESP_PTP_PORT1_MEDIUM_ETHERNET
+            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+
+        # Derived: at least one port is Wi-Fi-AP reached via a coprocessor
+        # (sdio or spi). Gates the beacon-IE publish code path in
+        # ptp_beacon_ie.c (we publish through ESP-Hosted's beacon-Vendor-IE
+        # API rather than the native esp_wifi one).
+        config ESP_PTP_HAS_AP_VIA_COPROCESSOR
             bool
-            default y if (ESP_PTP_PORT0_MEDIUM_WIFI_CP && ESP_PTP_PORT0_WIFI_ROLE_AP)
-            default y if (ESP_PTP_PORT1_MEDIUM_WIFI_CP && ESP_PTP_PORT1_WIFI_ROLE_AP)
+            default y if (ESP_PTP_PORT0_MEDIUM_WIFI && ESP_PTP_PORT0_WIFI_MODE_AP && (ESP_PTP_PORT0_HOST_IF_SDIO || ESP_PTP_PORT0_HOST_IF_SPI))
+            default y if (ESP_PTP_PORT1_MEDIUM_WIFI && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
             default n
 
     endif # NETUTILS_PTPD

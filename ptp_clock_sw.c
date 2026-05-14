@@ -15,7 +15,7 @@
  * Reads and writes happen on the daemon task, which is the same
  * thread, so no locking is required. If a higher-priority caller
  * ever needs to read the clock, mark the anchor pair atomic and use
- * a seqlock — not needed in Phase 3.
+ * a seqlock — not needed today.
  */
 
 #include "ptp_clock_sw.h"

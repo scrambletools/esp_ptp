@@ -129,7 +129,7 @@ struct ptp_header_s
   uint8_t logmessageinterval;
 };
 
-/* Announce a master clock */
+/* Announce a timetransmitter clock */
 
 struct ptp_announce_s
 {
@@ -137,16 +137,16 @@ struct ptp_announce_s
   uint8_t origintimestamp[10];
   uint8_t utcoffset[2];
   uint8_t reserved;
-  uint8_t gm_priority1;
-  uint8_t gm_quality[4];
-  uint8_t gm_priority2;
-  uint8_t gm_identity[8];
+  uint8_t btc_priority1;
+  uint8_t btc_quality[4];
+  uint8_t btc_priority2;
+  uint8_t btc_identity[8];
   uint8_t stepsremoved[2];
   uint8_t timesource;
   struct ptp_pathtrace_tlv_s pathtracetlv; // gPTP required
 };
 
-/* Sync: transmit timestamp from master clock */
+/* Sync: transmit timestamp from timetransmitter clock */
 
 struct ptp_sync_s
 {

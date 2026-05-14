@@ -30,14 +30,14 @@
  * esp_wifi_set_vendor_ie() locally on the coprocessor where the
  * radio actually lives. See esp_ptp_rpc/src/ptp_custom_rpc.c.
  *
- * Current stub publishes a zero-payload FollowUpInformation; Phase 7b
- * replaces the payload with live state marshalled from ptpd's Sync
- * stream and turns this into a periodic publisher task.
+ * Current stub publishes a zero-payload FollowUpInformation. The
+ * payload will eventually be marshalled live from ptpd's Sync stream
+ * and this becomes a periodic publisher task.
  */
 
 #include "sdkconfig.h"
 
-#ifdef CONFIG_ESP_PTP_HAS_WIFI_CP_AP
+#ifdef CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
 
 #include "ptp_rpc_proto.h"
 
@@ -55,7 +55,7 @@
  * dependency on espressif__esp_hosted (projects without an ESP-Hosted
  * coprocessor won't have that component). The symbols only need to
  * resolve at link time for builds that actually use this code path
- * (CONFIG_ESP_PTP_HAS_WIFI_CP_AP=y), and those builds always link
+ * (CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y), and those builds always link
  * espressif__esp_hosted from elsewhere. */
 extern esp_err_t esp_hosted_send_custom_data(uint32_t msg_id,
                                              const uint8_t *data,
@@ -173,4 +173,4 @@ __attribute__((constructor)) static void ptp_beacon_ie_autoreg(void) {
                                             on_set_vendor_ie_ack, NULL);
 }
 
-#endif /* CONFIG_ESP_PTP_HAS_WIFI_CP_AP */
+#endif /* CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR */

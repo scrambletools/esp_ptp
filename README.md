@@ -1,4 +1,4 @@
-# PTP / gPTP daemon component for ESP-IDF
+# PTP / gPTP implementation for ESP-IDF
 
 This component provides a Precision Time Protocol daemon for ESP-IDF
 with support for both the standard IEEE 1588 PTP profile and the
@@ -12,6 +12,16 @@ software-disciplined clocks for chips without IEEE 1588 hardware, and
 out-of-band time transport (e.g. 802.11 beacon Vendor IE for
 AVB-over-Wi-Fi). It is maintained by Scramble and registered at the
 ESP Component Registry (<https://components.espressif.com>).
+
+## Terminology
+
+This component uses **BTC** (best timetransmitter clock) in place of
+the older "grandmaster clock" / "GM" terminology from IEEE 1588 and
+802.1AS, and **BTCA** in place of "BMCA" (best master clock
+algorithm). The wire format and algorithm are unchanged — only the
+identifiers and prose differ. The renaming applies to both code
+identifiers (e.g. `btc_id`, `btc_priority1`) and human-readable
+comments / docs.
 
 ## Profiles
 
@@ -100,6 +110,6 @@ Boards:
 
 Network peers:
 
-- MOTU AVB switch (gPTP grandmaster)
+- MOTU AVB switch (gPTP BTC)
 - Apple Mac Mini M1 / M4
 - Sonnet Thunderbolt AVB Adapter

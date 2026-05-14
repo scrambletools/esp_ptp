@@ -68,6 +68,45 @@ typedef enum
     ptp_port_medium_wifi_beacon_ie = 1,
   } ptp_port_medium_e;
 
+/* Port-host-interface taxonomy. How the port is physically attached to
+ * the host SoC — determines timestamp accuracy, latency floor, and
+ * per-port admission budget. EMAC is the only category with hardware
+ * timestamping; the rest fall back to software timestamping with
+ * progressively worse jitter as you move down the list. */
+
+typedef enum
+  {
+    ptp_port_host_if_emac  = 0,   /* on-chip MAC, RMII/RGMII; HW TS */
+    ptp_port_host_if_ahb   = 1,   /* on-chip peripheral on AHB (native Wi-Fi) */
+    ptp_port_host_if_sdio  = 2,   /* external coprocessor over SDIO */
+    ptp_port_host_if_spi   = 3,   /* external Eth/Wi-Fi chip over SPI */
+    ptp_port_host_if_usb   = 4,   /* USB-attached */
+    ptp_port_host_if_other = 5,
+  } ptp_port_host_if_e;
+
+/* Port type — the port's role in the gPTP / AVB topology. PRIMARY and
+ * FAILOVER are endpoint-side; BRIDGED ports participate in an L2 bridge
+ * with the other BRIDGED port(s) on the same entity. Any port being
+ * BRIDGED implies the entity is in bridge mode. */
+
+typedef enum
+  {
+    ptp_port_type_primary  = 0,
+    ptp_port_type_failover = 1,
+    ptp_port_type_bridged  = 2,
+  } ptp_port_type_e;
+
+/* Wi-Fi mode for ports with medium=wifi. Numeric values match IDF's
+ * WIFI_IF_STA=0 / WIFI_IF_AP=1 so the field can be cast directly when
+ * calling esp_wifi_internal_tx. NONE is for non-wifi ports. */
+
+typedef enum
+  {
+    ptp_port_wifi_mode_sta  = 0,    /* joins external AP */
+    ptp_port_wifi_mode_ap   = 1,    /* hosts SoftAP */
+    ptp_port_wifi_mode_none = 0xFF, /* port is not wifi */
+  } ptp_port_wifi_mode_e;
+
 /* How peer-delay is measured on a port. GPTP_WIRE is the protocol-driven
  * Pdelay_Req/Resp exchange. FTM_EXTERNAL means the daemon does not
  * generate or process Pdelay frames on this port; instead the
@@ -91,8 +130,8 @@ typedef struct
     int accuracy;      /* Clock accuracy (IEEE-1588, lower is better) */
     int variance;      /* Clock variance (IEEE-1588, lower is better) */
     int priority2;     /* Secondary priority field */
-    uint8_t gm_id[8];  /* Grandmaster clock identity */
-    int stepsremoved;  /* How many steps from grandmaster clock */
+    uint8_t btc_id[8];  /* BTC clock identity */
+    int stepsremoved;  /* How many steps from BTC clock */
     int timesource;    /* Type of time source (IEEE-1588) */
   } clock_info_s;
 
@@ -203,9 +242,9 @@ int ptpd_start(FAR const char *interface);
  *                     ptp_port_medium_ethernet,
  *                     ptp_port_peer_delay_source_gptp_wire)
  *
- *   Phase 1a wires this as a thin wrapper that supports only the legacy
+ *   Today this is a thin wrapper that supports only the legacy
  *   port 0 / ethernet / gptp_wire combination — other combinations
- *   return -ENOSYS until subsequent phases.
+ *   return -ENOSYS until they are wired through the daemon.
  *
  * Returned Value:
  *   On success, the non-negative task ID of the PTP daemon is returned;

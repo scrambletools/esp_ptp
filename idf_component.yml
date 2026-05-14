@@ -4,6 +4,7 @@ url: "https://github.com/scrambletools/esp_ptp"
 license: "Apache 2.0"
 dependencies:
   idf: ^6.0
+  scrambletools/esp_ptp_rpc: "*"
 targets:
   - esp32p4
   - esp32c6
