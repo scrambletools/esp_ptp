@@ -77,6 +77,7 @@
 #include "esp_log.h"
 #include "esp_ptp.h"
 #include "esp_vfs_l2tap.h"
+#include "esp_wifi.h"
 #include "lwip/prot/ethernet.h" // Ethernet headers
 #include "semaphore.h"
 #include <math.h>
@@ -293,15 +294,27 @@ struct ptpd_statusreq_s {
 
 #define PTP_PDELAY_RESP_MAX_TRACKED 4
 
+/* Bootstrap arguments passed from ptpd_start / ptpd_start_port to the
+ * daemon task on creation. Heap-allocated by the start function,
+ * consumed and freed by ptp_daemon after ptp_initialize_state copies
+ * what it needs. Encodes which port the daemon is bootstrapping on,
+ * its medium, and the interface label so ptp_initialize_state can
+ * dispatch to the correct per-medium init helper without baking in
+ * any port-index assumption. */
+struct ptp_bootstrap_args_s {
+  int port_index;
+  ptp_port_medium_e medium;
+  char interface[16];
+};
+
 struct ptp_port_s {
   /* Configuration. */
   bool enabled;
   ptp_port_medium_e medium;
   ptp_port_host_if_e host_if;       /* how this port attaches to the SoC */
   ptp_port_type_e type;             /* primary / failover / bridged */
-  ptp_port_wifi_mode_e wifi_mode;   /* ap/sta for medium=wifi, none otherwise */
+  ptp_port_wifi_mode_e wifi_mode;   /* ap/sta for medium=wifi_ftm, none otherwise */
   uint32_t link_speed_mbps;         /* nominal PHY-rate cap */
-  ptp_port_peer_delay_source_e peer_delay_source;
   char interface_name[16];
 
   /* Egress callback for ports whose Sync transport is out-of-band
@@ -960,10 +973,10 @@ static int ptp_getrxtime(FAR struct ptp_state_s *state,
 #ifdef ESP_PTP
 static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
   /* ---- Port 0 ---- */
-#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_ETHERNET)
-  state->port[0].medium = ptp_port_medium_ethernet;
-#elif defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI)
-  state->port[0].medium = ptp_port_medium_wifi_beacon_ie;
+#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS)
+  state->port[0].medium = ptp_port_medium_eth_hwts;
+#elif defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM)
+  state->port[0].medium = ptp_port_medium_wifi_ftm;
 #endif
 #if defined(CONFIG_ESP_PTP_PORT0_HOST_IF_EMAC)
   state->port[0].host_if = ptp_port_host_if_emac;
@@ -1000,10 +1013,10 @@ static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
 
   /* ---- Port 1 ---- */
 #if CONFIG_ESP_PTP_NUM_PORTS > 1
-#if defined(CONFIG_ESP_PTP_PORT1_MEDIUM_ETHERNET)
-  state->port[1].medium = ptp_port_medium_ethernet;
-#elif defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI)
-  state->port[1].medium = ptp_port_medium_wifi_beacon_ie;
+#if defined(CONFIG_ESP_PTP_PORT1_MEDIUM_ETH_HWTS)
+  state->port[1].medium = ptp_port_medium_eth_hwts;
+#elif defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM)
+  state->port[1].medium = ptp_port_medium_wifi_ftm;
 #endif
 #if defined(CONFIG_ESP_PTP_PORT1_HOST_IF_EMAC)
   state->port[1].host_if = ptp_port_host_if_emac;
@@ -1041,72 +1054,135 @@ static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
 }
 #endif /* ESP_PTP */
 
-/* Initialize PTP client/server state and create sockets */
 #ifdef ESP_PTP
-static int ptp_initialize_state(FAR struct ptp_state_s *state,
-                                FAR const char *interface) {
-  state->port[0].ptp_socket = open("/dev/net/tap", 0);
-  if (state->port[0].ptp_socket < 0) {
-    ptperr("Failed to create tx socket: %d\n", errno);
+
+/* Per-medium port initialisation. Each helper assumes the caller has
+ * already filled the port's enabled/medium/interface_name/wifi_mode
+ * fields (the wifi_mode comes from ptp_apply_port_topology_kconfig).
+ * The helper performs medium-specific work — opening sockets and
+ * registering driver hooks for eth_hwts, fetching the radio MAC for
+ * wifi_ftm — and writes intf_hw_addr. Used by ptp_initialize_state on
+ * the bootstrap port AND by ptpd_start_port's attach branch for
+ * additional ports added to a running daemon. */
+
+static int ptp_port_init_eth_hwts(FAR struct ptp_state_s *state, int port_index,
+                                  FAR const char *interface) {
+  struct ptp_port_s *p = &state->port[port_index];
+
+  p->ptp_socket = open("/dev/net/tap", 0);
+  if (p->ptp_socket < 0) {
+    ptperr("port %d: failed to create L2TAP socket: %d\n", port_index, errno);
     return ERROR;
   }
-
-  // Set Ethernet interface on which to get raw frames
-  if (ioctl(state->port[0].ptp_socket, L2TAP_S_INTF_DEVICE, interface) < 0) {
-    ptperr("failed to set network interface at socket: %d\n", errno);
+  if (ioctl(p->ptp_socket, L2TAP_S_INTF_DEVICE, interface) < 0) {
+    ptperr("port %d: failed to bind L2TAP to interface \"%s\": %d\n",
+           port_index, interface, errno);
     return ERROR;
   }
-
-  // Set the Ethertype filter (frames with this type will be available through
-  // the state->tx_socket)
   uint16_t eth_type_filter = ETH_TYPE_PTP;
-  if (ioctl(state->port[0].ptp_socket, L2TAP_S_RCV_FILTER, &eth_type_filter) <
-      0) {
-    ptperr("failed to set Ethertype filter: %d\n", errno);
+  if (ioctl(p->ptp_socket, L2TAP_S_RCV_FILTER, &eth_type_filter) < 0) {
+    ptperr("port %d: failed to set L2TAP ethertype filter: %d\n",
+           port_index, errno);
     return ERROR;
   }
-  // Enable time stamping in driver
   esp_eth_handle_t eth_handle;
-  if (ptp_get_esp_eth_handle(state, &eth_handle) < 0) {
-    ptperr("failed to get socket eth_handle %d\n", errno);
+  if (ioctl(p->ptp_socket, L2TAP_G_DEVICE_DRV_HNDL, &eth_handle) < 0) {
+    ptperr("port %d: failed to fetch eth_handle from L2TAP: %d\n",
+           port_index, errno);
     return ERROR;
   }
 #if PTPD_HAVE_ESP_ETH_CLOCK
-  esp_eth_clock_cfg_t clk_cfg = {
-      .clock_id = PTPD_CLOCK_ID,
-  };
+  esp_eth_clock_cfg_t clk_cfg = {.clock_id = PTPD_CLOCK_ID};
   if (esp_eth_clock_init(eth_handle, &clk_cfg) != ESP_OK) {
-    ptperr("failed to initialize PTP clock");
+    ptperr("port %d: failed to initialise EMAC PTP clock\n", port_index);
     return ERROR;
   }
 #else
-  /* Wi-Fi-only target: no hardware PTP clock. ptpd_now() routes
-   * through the software-clock backend (see ptp_clock_sw.c). */
+  /* Target without on-chip 1588 hardware (e.g. C6 wired via SDIO).
+   * ptpd_now() routes through the software-clock backend instead. */
   (void)eth_handle;
 #endif
-
-  // Enable time stamping in L2TAP
-  if (ioctl(state->port[0].ptp_socket, L2TAP_S_TIMESTAMP_EN) < 0) {
-    ptperr("failed to enable time stamping in l2 socket: %d\n", errno);
+  if (ioctl(p->ptp_socket, L2TAP_S_TIMESTAMP_EN) < 0) {
+    ptperr("port %d: failed to enable L2TAP timestamping: %d\n",
+           port_index, errno);
     return ERROR;
   }
 
-  // get HW address
-  esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &state->port[0].intf_hw_addr);
+  esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, &p->intf_hw_addr);
 
-  // Add well-known PTP multicast destination MAC addresses to the filter
   uint8_t dest_addr[ETH_ADDR_LEN];
   SET_MAC_ADDR(dest_addr, 0x01, 0x1B, 0x19, 0x00, 0x00, 0x00);
   esp_eth_ioctl(eth_handle, ETH_CMD_ADD_MAC_FILTER, dest_addr);
   SET_MAC_ADDR(dest_addr, 0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E);
   esp_eth_ioctl(eth_handle, ETH_CMD_ADD_MAC_FILTER, dest_addr);
 
+  /* Eth-link events drive gPTP link-up fallback detection. The
+   * handler is registered once per daemon (re-registration on a
+   * second eth_hwts port would be a no-op or error from the event
+   * loop); the eth_event_handler_registered flag prevents double-
+   * registration when more than one eth_hwts port comes up. */
+  if (!state->eth_event_handler_registered) {
+    if (esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                   ptp_eth_event_handler, state) == ESP_OK) {
+      state->eth_event_handler_registered = true;
+    } else {
+      ptpwarn("port %d: failed to register ETH_EVENT handler; gPTP "
+              "link-up fallback check will only run at daemon startup\n",
+              port_index);
+    }
+  }
+
+  return OK;
+}
+
+static int ptp_port_init_wifi_ftm(FAR struct ptp_state_s *state, int port_index,
+                                  FAR const char *interface) {
+  (void)interface; /* label only on this medium — no socket to bind */
+  struct ptp_port_s *p = &state->port[port_index];
+
+  /* No L2TAP socket: Sync rides the SoftAP's Beacon Vendor IE via the
+   * sync_egress_cb and peer-delay is FTM-driven via inject_peer_delay. */
+  p->ptp_socket = -1;
+
+  wifi_interface_t wifi_if;
+  if (p->wifi_mode == ptp_port_wifi_mode_ap) {
+    wifi_if = WIFI_IF_AP;
+  } else if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+    wifi_if = WIFI_IF_STA;
+  } else {
+    ptperr("port %d (wifi_ftm): wifi_mode not set — check "
+           "ESP_PTP_PORT%d_WIFI_MODE_{AP,STA} Kconfig\n",
+           port_index, port_index);
+    return ERROR;
+  }
+  if (esp_wifi_get_mac(wifi_if, p->intf_hw_addr) != ESP_OK) {
+    ptperr("port %d (wifi_ftm): esp_wifi_get_mac(%s) failed — Wi-Fi "
+           "must be initialised (esp_wifi_init/start) before this call\n",
+           port_index, wifi_if == WIFI_IF_AP ? "WIFI_IF_AP" : "WIFI_IF_STA");
+    return ERROR;
+  }
+
+  return OK;
+}
+
+/* Initialise daemon-wide state and bootstrap the addressed port. The
+ * port_index, medium and interface come from the heap-allocated
+ * ptp_bootstrap_args_s the caller (ptpd_start / ptpd_start_port)
+ * handed to the daemon task. */
+static int ptp_initialize_state(FAR struct ptp_state_s *state,
+                                FAR const struct ptp_bootstrap_args_s *args) {
+  if (args->port_index < 0 ||
+      args->port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    ptperr("bootstrap port_index %d out of range [0,%d)\n",
+           args->port_index, CONFIG_ESP_PTP_NUM_PORTS);
+    return ERROR;
+  }
+
+  /* Daemon-wide state: servo, profile, time baselines. */
   state->remote_time_ns_prev = 0;
   state->local_time_ns_prev = 0;
-
   state->offset_pi.kp = 1;
-  state->offset_pi.ki =
-      3; // was 10, changed to match ptp4l default gain of ~0.3
+  state->offset_pi.ki = 3; /* matches ptp4l default gain ~0.3 */
   state->offset_pi.drift_acc = 0;
 
 #ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
@@ -1116,16 +1192,52 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
 #endif
   ptp_reset_for_profile(state);
 
+  /* Per-port topology (host_if, type, wifi_mode, link_speed_mbps) for
+   * ALL ports from Kconfig. esp_avb mirrors these knobs; esp_ptp's
+   * copy informs ptpd's own decisions (timestamp accuracy, sync
+   * cadence). Runs before per-medium init so the helpers can read
+   * wifi_mode etc. on the bootstrap port. */
+  ptp_apply_port_topology_kconfig(state);
+
+  /* Seed the bootstrap port's API-level config — the runtime fields
+   * (intf_hw_addr, ptp_socket) are filled by the medium helper. */
+  struct ptp_port_s *p = &state->port[args->port_index];
+  p->enabled = true;
+  p->medium = args->medium;
+  strncpy(p->interface_name, args->interface,
+          sizeof(p->interface_name) - 1);
+  p->interface_name[sizeof(p->interface_name) - 1] = '\0';
+
+  int rc;
+  switch (args->medium) {
+  case ptp_port_medium_eth_hwts:
+    rc = ptp_port_init_eth_hwts(state, args->port_index, args->interface);
+    break;
+  case ptp_port_medium_wifi_ftm:
+    rc = ptp_port_init_wifi_ftm(state, args->port_index, args->interface);
+    break;
+  default:
+    ptperr("bootstrap medium %d not supported\n", (int)args->medium);
+    return ERROR;
+  }
+  if (rc != OK) {
+    return ERROR;
+  }
+
+  /* Daemon clockIdentity is sourced from the bootstrap port's MAC.
+   * EUI-64 mapping per 802.1AS-2020 §8.5.2.2 (insert 0xff:0xfe in the
+   * middle of the 48-bit MAC to form the 8-byte clockIdentity). */
+  uint8_t *mac = p->intf_hw_addr;
   state->own_identity.header.version = 2;
   state->own_identity.header.domain = CONFIG_NETUTILS_PTPD_DOMAIN;
-  state->own_identity.header.sourceidentity[0] = state->port[0].intf_hw_addr[0];
-  state->own_identity.header.sourceidentity[1] = state->port[0].intf_hw_addr[1];
-  state->own_identity.header.sourceidentity[2] = state->port[0].intf_hw_addr[2];
+  state->own_identity.header.sourceidentity[0] = mac[0];
+  state->own_identity.header.sourceidentity[1] = mac[1];
+  state->own_identity.header.sourceidentity[2] = mac[2];
   state->own_identity.header.sourceidentity[3] = 0xff;
   state->own_identity.header.sourceidentity[4] = 0xfe;
-  state->own_identity.header.sourceidentity[5] = state->port[0].intf_hw_addr[3];
-  state->own_identity.header.sourceidentity[6] = state->port[0].intf_hw_addr[4];
-  state->own_identity.header.sourceidentity[7] = state->port[0].intf_hw_addr[5];
+  state->own_identity.header.sourceidentity[5] = mac[3];
+  state->own_identity.header.sourceidentity[6] = mac[4];
+  state->own_identity.header.sourceidentity[7] = mac[5];
   state->own_identity.header.sourceportindex[0] = 0;
   state->own_identity.header.sourceportindex[1] = 1;
 #if defined(CONFIG_NETUTILS_PTPD_SERVER) ||                                    \
@@ -1133,7 +1245,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->own_identity.btc_priority1 = CONFIG_NETUTILS_PTPD_PRIORITY1;
   state->own_identity.btc_quality[0] = CONFIG_NETUTILS_PTPD_CLASS;
   state->own_identity.btc_quality[1] = CONFIG_NETUTILS_PTPD_ACCURACY;
-  state->own_identity.btc_quality[2] = 0xff; /* No variance estimate */
+  state->own_identity.btc_quality[2] = 0xff;
   state->own_identity.btc_quality[3] = 0xff;
   state->own_identity.btc_priority2 = CONFIG_NETUTILS_PTPD_PRIORITY2;
   memcpy(state->own_identity.btc_identity,
@@ -1141,38 +1253,16 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
          sizeof(state->own_identity.btc_identity));
   state->own_identity.timesource = CONFIG_NETUTILS_PTPD_CLOCKSOURCE;
 #else
-  state->own_identity.btc_priority1 =
-      255; // When daemon is statically configured as timereceiver, set the worst
+  /* Statically configured as timereceiver: advertise worst priority. */
+  state->own_identity.btc_priority1 = 255;
 #endif
-
-  if (esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
-                                 ptp_eth_event_handler, state) == ESP_OK) {
-    state->eth_event_handler_registered = true;
-  } else {
-    ptpwarn("failed to register Ethernet event handler; gPTP link-up fallback "
-            "check will only run at daemon startup\n");
-  }
-
-  /* Seed port[0] config to mirror the legacy single-port behavior. */
-  state->port[0].enabled = true;
-  state->port[0].medium = ptp_port_medium_ethernet;
-  state->port[0].peer_delay_source = ptp_port_peer_delay_source_gptp_wire;
-  strncpy(state->port[0].interface_name, interface,
-          sizeof(state->port[0].interface_name) - 1);
-  state->port[0].interface_name[sizeof(state->port[0].interface_name) - 1] =
-      '\0';
-
-  /* Populate the topology attributes (host_if, type, wifi_mode,
-   * link_speed_mbps) from Kconfig. esp_avb mirrors these via its own
-   * Kconfig and reads them again — esp_ptp's copy is for ptpd's own
-   * judgement calls (timestamp accuracy, sync interval scaling). */
-  ptp_apply_port_topology_kconfig(state);
 
   s_state = state;
 
-  ptpinfo("PTP daemon started in %s mode.\n",
-          ptp_is_gptp(state) ? "gPTP" : "standard");
-
+  ptpinfo("PTP daemon started in %s mode on port %d medium=%s\n",
+          ptp_is_gptp(state) ? "gPTP" : "standard", args->port_index,
+          args->medium == ptp_port_medium_eth_hwts ? "eth_hwts"
+                                                   : "wifi_ftm");
   return OK;
 }
 #else
@@ -1569,6 +1659,95 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   return ret;
 }
 
+#ifdef ESP_PTP
+/* Build the bytes that go into the §12.7 VendorSpecific information
+ * element of an FTM/TM frame (or, in our case, the Beacon Vendor IE
+ * the bridge uses as a workaround carrier — see ptp_beacon_ie.c and
+ * the §12 deviation note in ESP-AVB-Bridge/project.md).
+ *
+ * Per §12.7: "the master state machine communicates an entire
+ * Follow_Up message [i.e., including all the fields of the common
+ * header (see 11.4.2 and 10.6.2), the preciseOriginTimestamp, and
+ * all the fields of the Follow_Up information TLV (see 11.4.4)]
+ * using this mechanism." The wire bytes match a normal 802.1AS
+ * Follow_Up frame body (76 bytes): 34-byte common header + 10-byte
+ * preciseOriginTimestamp + 32-byte FollowUpInformation TLV.
+ *
+ * Design choice — regenerate, don't forward.
+ * The standard time-aware bridge model (§11.2.13) FORWARDS the
+ * upstream Sync: keeps the upstream preciseOriginTimestamp,
+ * accumulates residence time into correctionField. We instead
+ * REGENERATE: preciseOriginTimestamp = ptpd_now() (our local
+ * PTP-disciplined clock, which the wired-side PI servo has already
+ * brought into the GM time domain). Equivalent under perfect lock —
+ * both give the STA the same effective GM time — but simpler and
+ * doesn't need separate residence-time accounting. The corollary
+ * fields all carry zero by design:
+ *   - correctionField = 0: the preciseOriginTimestamp is already
+ *     GM-time (corrected by our local servo), no residence-time
+ *     accumulation needed.
+ *   - cumulativeScaledRateOffset = 0: our published time advances
+ *     at GM rate (our local clock's drift is absorbed by the servo
+ *     before we publish), so the rate offset is nominally zero.
+ *   - gmTimeBaseIndicator / lastGmPhaseChange / scaledLastGmFreqChange
+ *     = 0: ptpd doesn't yet track GM-reselection events. Add when
+ *     BTCA reselection plumbing exists.
+ *   - sequenceId = 0: the §12 model on Wi-Fi doesn't pair-match
+ *     Sync/Follow_Up like the wired path (no separate Sync frame).
+ *     STAs that want beacon-loss tracking can add a per-marshal
+ *     counter.
+ *
+ * GM identity:
+ *   The header's sourceClockIdentity is the upstream BTC's
+ *   clockIdentity (state->selected_source.btc_identity) when we are
+ *   synced upstream, so STAs see the wired GM in Hive; falls back
+ *   to our own identity when we are the GM. */
+static void ptp_marshal_follow_up_for_beacon_ie(
+    FAR struct ptp_state_s *state, FAR struct ptp_follow_up_s *out) {
+  memset(out, 0, sizeof(*out));
+
+  /* Common header — start from cached own_identity template */
+  out->header = state->own_identity.header;
+  out->header.messagetype = PTP_MSGTYPE_FOLLOW_UP;
+  out->header.controlfield = 2; /* IEEE 1588 Follow_Up controlfield */
+  out->header.logmessageinterval =
+      msec_to_log_period(CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS);
+  out->header.messagelength[0] = 0;
+  out->header.messagelength[1] = sizeof(struct ptp_follow_up_s);
+  out->header.flags[0] = 0; /* 2-step bit lives on Sync, cleared on Follow_Up */
+  if (ptp_is_gptp(state)) {
+    out->header.messagetype |= PTP_MSGTYPE_SDOID_GPTP;
+    out->header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
+  }
+
+  /* sourceClockIdentity: upstream BTC if we are synced, else our own.
+   * Without this override STAs see the bridge's MAC as the GM, which
+   * Hive shows as `grandmaster_id` and the user-facing graph misses
+   * the actual upstream BTC (e.g. MOTU 8D). */
+  if (state->selected_source_valid) {
+    memcpy(out->header.sourceidentity,
+           state->selected_source.btc_identity,
+           sizeof(out->header.sourceidentity));
+  }
+
+  /* preciseOriginTimestamp — current PTP-disciplined time */
+  struct timespec ts;
+  ptp_gettime(state, &ts);
+  timespec_to_ptp_format(&ts, out->origintimestamp);
+
+  /* FollowUpInformation TLV — §11.4.4.3. TLV header constants are
+   * always populated; data fields are all zero by design (see
+   * design-choice notes above). */
+  struct ptp_info_tlv_s *tlv = (struct ptp_info_tlv_s *)out->informationtlv;
+  tlv->type[1] = 3;                  /* Organization extension */
+  tlv->length[1] = 0x1c;             /* 28 bytes of value */
+  tlv->orgidentity[0] = 0x00;
+  tlv->orgidentity[1] = 0x80;
+  tlv->orgidentity[2] = 0xc2;        /* IEEE 802.1 OUI */
+  tlv->orgsubtype[2] = 1;            /* FollowUp Information per §11.4.4.3 */
+}
+#endif /* ESP_PTP */
+
 /* Send PTP server synchronization packet */
 
 static int ptp_send_sync(FAR struct ptp_state_s *state) {
@@ -1823,7 +2002,17 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
   /* If there is no better timetransmitter clock on the network,
    * act as the reference source and send server packets. */
 
-  if (!state->selected_source_valid) {
+  /* The "I am GM" path emits Announce + Sync via port[0]'s L2TAP socket
+   * (ptp_send_announce / ptp_send_sync both write to
+   * state->port[0].ptp_socket). That socket only exists on an eth_hwts
+   * port. Skip this whole block if port[0] isn't socket-backed —
+   * otherwise sendto returns EBADF on every cadence tick. wifi_ftm
+   * ports advertise time via the §12.7 Vendor IE through the
+   * sync_egress_cb loop further down, which has its own gating. */
+  if (!state->selected_source_valid &&
+      state->port[0].enabled &&
+      state->port[0].medium == ptp_port_medium_eth_hwts &&
+      state->port[0].ptp_socket >= 0) {
     struct timespec time_now;
     struct timespec delta;
 
@@ -1844,10 +2033,48 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
   }
 #endif /* CONFIG_NETUTILS_PTPD_SERVER */
 
+#ifdef ESP_PTP
+  /* Sync emission on wifi_ftm ports. Independent of selected_source_valid:
+   * on a transparent time-aware bridge the wifi_ftm AP port republishes
+   * upstream Sync at the configured cadence; when we are the GM the same
+   * cadence applies and the payload reflects our own clock. Skipped when
+   * no egress callback is registered.
+   *
+   * Payload is the §12.7 VendorSpecific IE "FollowUpInformation" — which
+   * per §12.7 is the entire Follow_Up message (header + preciseOrigin-
+   * Timestamp + FollowUpInformation TLV, 76 bytes), packed in exactly
+   * the same format as the wired Follow_Up frame. */
+  for (int p = 0; p < CONFIG_ESP_PTP_NUM_PORTS; p++) {
+    struct ptp_port_s *port = &state->port[p];
+    if (!port->enabled) continue;
+    if (port->medium != ptp_port_medium_wifi_ftm) continue;
+    if (port->sync_egress_cb == NULL) continue;
+
+    struct timespec time_now, delta;
+    clock_gettime(CLOCK_MONOTONIC, &time_now);
+    clock_timespec_subtract(&time_now, &port->last_transmitted_sync, &delta);
+    if (timespec_to_ms(&delta) <= CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS) {
+      continue;
+    }
+    port->last_transmitted_sync = time_now;
+
+    struct ptp_follow_up_s fu;
+    ptp_marshal_follow_up_for_beacon_ie(state, &fu);
+    port->sync_egress_cb(p, (const uint8_t *)&fu, sizeof(fu),
+                         port->sync_egress_ctx);
+  }
+#endif /* ESP_PTP */
+
 #if defined(CONFIG_NETUTILS_PTPD_SEND_DELAYREQ) ||                             \
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
-  if (ptp_is_gptp(state) ||
-      (state->selected_source_valid && state->port[0].can_send_delayreq)) {
+  /* Delay_Req / Pdelay_Req TX also writes through port[0]'s L2TAP
+   * socket. Skip on wifi_ftm-only deployments — peer-delay there is
+   * out-of-band via FTM + ptpd_inject_peer_delay, not on-wire. */
+  if ((ptp_is_gptp(state) ||
+       (state->selected_source_valid && state->port[0].can_send_delayreq)) &&
+      state->port[0].enabled &&
+      state->port[0].medium == ptp_port_medium_eth_hwts &&
+      state->port[0].ptp_socket >= 0) {
     struct timespec time_now;
     struct timespec delta;
 
@@ -1875,7 +2102,11 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
    * §2.2 evaluation window so any peer's window is guaranteed to overlap
    * at least one beacon. */
 
-  if (state->gptp_fallback_done && state->ptp_profile == ptp_profile_standard) {
+  /* Endpoint-fallback beacon — only on eth_hwts with a socket. */
+  if (state->gptp_fallback_done && state->ptp_profile == ptp_profile_standard &&
+      state->port[0].enabled &&
+      state->port[0].medium == ptp_port_medium_eth_hwts &&
+      state->port[0].ptp_socket >= 0) {
     struct timespec time_now;
     struct timespec delta;
     clock_gettime(CLOCK_MONOTONIC, &time_now);
@@ -2738,11 +2969,12 @@ static void ptp_daemon(void *task_param)
 static int ptp_daemon(int argc, FAR char **argv)
 #endif // ESP_PTP
 {
-  FAR const char *interface = "eth0";
   FAR struct ptp_state_s *state;
 #ifdef ESP_PTP
   struct pollfd pollfds[1]; // everything is received over one socket at L2
+  struct ptp_bootstrap_args_s *args = (struct ptp_bootstrap_args_s *)task_param;
 #else
+  FAR const char *interface = "eth0";
   struct pollfd pollfds[2];
   struct msghdr rxhdr;
   struct iovec rxiov;
@@ -2756,17 +2988,19 @@ static int ptp_daemon(int argc, FAR char **argv)
 
   state = calloc(1, sizeof(struct ptp_state_s));
 
-#ifdef ESP_PTP
-  if (task_param != NULL) {
-    interface = task_param;
-  }
-#else
+#ifndef ESP_PTP
   if (argc > 1) {
     interface = argv[1];
   }
-#endif // ESP_PTP
+#endif // !ESP_PTP
 
+#ifdef ESP_PTP
+  int init_rc = ptp_initialize_state(state, args);
+  free(args); /* heap struct from ptpd_start / ptpd_start_port */
+  if (init_rc != OK) {
+#else
   if (ptp_initialize_state(state, interface) != OK) {
+#endif // ESP_PTP
     ptperr("Failed to initialize PTP state, exiting\n");
 
     ptp_destroy_state(state);
@@ -2890,46 +3124,209 @@ err:
  ****************************************************************************/
 
 int ptpd_start_port(int port_index, FAR const char *interface,
-                    ptp_port_medium_e medium,
-                    ptp_port_peer_delay_source_e peer_delay_source) {
+                    ptp_port_medium_e medium) {
 #ifdef ESP_PTP
-  /* Only the legacy port-0 / ethernet / gptp_wire combination is
-   * wired through today. Other ports / media / sources are accepted
-   * by the API surface but not yet by the daemon. */
-  if (port_index != 0 || medium != ptp_port_medium_ethernet ||
-      peer_delay_source != ptp_port_peer_delay_source_gptp_wire) {
-    ESP_LOGE(TAG,
-             "ptpd_start_port: only (port=0, medium=ethernet, "
-             "source=gptp_wire) is supported in this build; got "
-             "(port=%d, medium=%d, source=%d)",
-             port_index, (int)medium, (int)peer_delay_source);
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    ESP_LOGE(TAG, "ptpd_start_port: port_index %d out of range [0,%d)",
+             port_index, CONFIG_ESP_PTP_NUM_PORTS);
+    return -EINVAL;
+  }
+  if (medium != ptp_port_medium_eth_hwts &&
+      medium != ptp_port_medium_wifi_ftm) {
+    ESP_LOGE(TAG, "ptpd_start_port: medium %d not supported", (int)medium);
     return -ENOSYS;
   }
-  return ptpd_start(interface);
+
+  /* The branch is decided by whether the daemon is already running,
+   * not by port_index. Either branch handles either medium.
+   *
+   * Bootstrap branch (s_state == NULL): spawn the daemon task with a
+   * heap-allocated ptp_bootstrap_args_s. ptp_initialize_state on the
+   * task side dispatches to the per-medium init helper for the
+   * addressed port.
+   *
+   * Attach branch (s_state != NULL): call the per-medium init helper
+   * directly on the running daemon. For eth_hwts this opens an
+   * additional L2TAP socket; for wifi_ftm it reads the radio MAC and
+   * leaves the Sync transport for the egress callback to drive. */
+  if (s_state == NULL) {
+    struct ptp_bootstrap_args_s *args = calloc(1, sizeof(*args));
+    if (args == NULL) {
+      ESP_LOGE(TAG, "ptpd_start_port: out of memory");
+      return -ENOMEM;
+    }
+    args->port_index = port_index;
+    args->medium = medium;
+    if (interface != NULL) {
+      strncpy(args->interface, interface, sizeof(args->interface) - 1);
+    }
+    if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
+                    args, 6, NULL) != pdPASS) {
+      free(args);
+      ESP_LOGE(TAG, "ptpd_start_port: xTaskCreate failed");
+      return -1;
+    }
+    return 1;
+  }
+
+  /* Attach to running daemon. */
+  struct ptp_port_s *p = &s_state->port[port_index];
+  p->enabled = true;
+  p->medium = medium;
+  if (interface != NULL) {
+    strncpy(p->interface_name, interface, sizeof(p->interface_name) - 1);
+    p->interface_name[sizeof(p->interface_name) - 1] = '\0';
+  } else {
+    p->interface_name[0] = '\0';
+  }
+
+  int rc;
+  switch (medium) {
+  case ptp_port_medium_eth_hwts:
+    rc = ptp_port_init_eth_hwts(s_state, port_index, p->interface_name);
+    break;
+  case ptp_port_medium_wifi_ftm:
+    rc = ptp_port_init_wifi_ftm(s_state, port_index, p->interface_name);
+    break;
+  default:
+    rc = -ENOSYS;
+    break;
+  }
+  if (rc != OK) {
+    p->enabled = false;
+    return rc;
+  }
+
+  ESP_LOGI(TAG,
+           "ptpd_start_port: port=%d iface=\"%s\" medium=%s attached "
+           "(wifi_mode=%s)",
+           port_index, p->interface_name,
+           medium == ptp_port_medium_eth_hwts ? "eth_hwts" : "wifi_ftm",
+           p->wifi_mode == ptp_port_wifi_mode_ap    ? "ap"
+           : p->wifi_mode == ptp_port_wifi_mode_sta ? "sta"
+                                                   : "none");
+  return port_index;
 #else
   UNUSED(port_index);
   UNUSED(medium);
-  UNUSED(peer_delay_source);
   return ptpd_start(interface);
 #endif
 }
 
 int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
-  /* Stub: ftm_external ports are not wired yet. The eventual
-   * implementation feeds peer_delay_ns into the same averaging path
-   * that ptp_process_delay_resp uses on gptp_wire ports. */
+#ifdef ESP_PTP
+  if (s_state == NULL) {
+    return -ESRCH;
+  }
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    return -EINVAL;
+  }
+  /* Sanity-bound — single Wi-Fi RTT/2 is typically tens of µs; values
+   * outside the standard wired bound suggest a measurement anomaly
+   * (multipath, association handoff). Discard. */
+  if (peer_delay_ns < 0 ||
+      peer_delay_ns >= CONFIG_NETUTILS_PTPD_MAX_PEER_DELAY_NS) {
+    return -ERANGE;
+  }
+  struct ptp_port_s *p = &s_state->port[port_index];
+
+  /* Running average — same shape as the wired Pdelay handler at
+   * ptp_process_delay_resp_followup (~line 2728). Caps the average
+   * window at CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT samples, which
+   * lets ptp_update_local_clock read a smoothed value via
+   * port->peer_delay_ns without each FTM burst's jitter showing up
+   * as a clock-jump. */
+  if (p->peer_delay_avgcount < CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT) {
+    p->peer_delay_avgcount++;
+  }
+  p->peer_delay_ns += (long)(peer_delay_ns - p->peer_delay_ns) /
+                      p->peer_delay_avgcount;
+  return OK;
+#else
   UNUSED(port_index);
   UNUSED(peer_delay_ns);
   return -ENOSYS;
+#endif
 }
 
 int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
                      size_t len) {
-  /* Stub: out-of-band Sync ingest pending. */
+#ifdef ESP_PTP
+  if (s_state == NULL) {
+    return -ESRCH;
+  }
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    return -EINVAL;
+  }
+  if (follow_up_info == NULL || len < sizeof(struct ptp_follow_up_s)) {
+    return -EINVAL;
+  }
+
+  /* The §12.7 IE payload IS an entire 802.1AS Follow_Up message —
+   * header + preciseOriginTimestamp + FollowUpInformation TLV. We
+   * receive it via the on-air carrier (Beacon Vendor IE, per the
+   * carrier deviation documented in ESP-AVB-Bridge/project.md) at
+   * some point AFTER the actual master TX. The receive instant is
+   * "now" — t2 in §12.1.2 terms — and the FollowUpInformation
+   * carries t1 (preciseOriginTimestamp). Peer-delay correction is
+   * applied inside ptp_update_local_clock from port->peer_delay_ns,
+   * which FTM injection will populate once the STA-side FTM client
+   * is wired up. */
+  const struct ptp_follow_up_s *fu =
+      (const struct ptp_follow_up_s *)follow_up_info;
+
+  /* Validate messagetype (low nibble = Follow_Up = 0x08; high nibble
+   * carries gPTP majorSdoId on gPTP messages). */
+  if ((fu->header.messagetype & PTP_MSGTYPE_MASK) != PTP_MSGTYPE_FOLLOW_UP) {
+    return -EINVAL;
+  }
+
+  struct ptp_port_s *p = &s_state->port[port_index];
+
+  /* Synthesise a selected_source on first injection so the rest of
+   * the daemon (status APIs, BTCA "are we slave" tests) sees a valid
+   * upstream. The Follow_Up doesn't carry the full Announce content,
+   * but on Wi-Fi §12.1.2 there is no separate Announce stream — the
+   * §12.7 IE flow is the only timing info. Mirror the Follow_Up's
+   * sourceidentity into selected_source so identity-tracking works;
+   * leave priority/quality at defaults (we accept whatever sends
+   * us beacon-IE timing). */
+  if (!s_state->selected_source_valid ||
+      memcmp(s_state->selected_source.header.sourceidentity,
+             fu->header.sourceidentity, 8) != 0) {
+    memset(&s_state->selected_source, 0, sizeof(s_state->selected_source));
+    s_state->selected_source.header = fu->header;
+    memcpy(s_state->selected_source.btc_identity,
+           fu->header.sourceidentity,
+           sizeof(s_state->selected_source.btc_identity));
+    s_state->selected_source_valid = true;
+    ptpinfo("inject_sync port=%d: locked onto GM "
+            "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+            port_index, fu->header.sourceidentity[0],
+            fu->header.sourceidentity[1], fu->header.sourceidentity[2],
+            fu->header.sourceidentity[3], fu->header.sourceidentity[4],
+            fu->header.sourceidentity[5], fu->header.sourceidentity[6],
+            fu->header.sourceidentity[7]);
+  }
+
+  /* Decode preciseOriginTimestamp (10 B, 6 sec + 4 nsec). */
+  struct timespec remote_time;
+  ptp_format_to_timespec(fu->origintimestamp, &remote_time);
+
+  /* Local RX instant — best we can do without HW timestamping the
+   * beacon (a bounded penalty, see §12 carrier-deviation note). */
+  struct timespec local_rxtime;
+  ptp_gettime(s_state, &local_rxtime);
+
+  clock_gettime(CLOCK_MONOTONIC, &p->last_received_sync);
+
+  return ptp_update_local_clock(s_state, &remote_time, &local_rxtime);
+#else
   UNUSED(port_index);
   UNUSED(follow_up_info);
   UNUSED(len);
   return -ENOSYS;
+#endif
 }
 
 int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
@@ -2974,13 +3371,27 @@ int ptpd_now(FAR struct timespec *ts) {
 
 int ptpd_start(FAR const char *interface) {
 #ifdef ESP_PTP
-  if (s_state == NULL) {
-    xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
-                (void *)interface, 6, NULL);
-    return 1;
+  if (s_state != NULL) {
+    ESP_LOGE(TAG, "Other instance of PTP is already running");
+    return -1;
   }
-  ESP_LOGE(TAG, "Other instance of PTP is already running");
-  return -1;
+  struct ptp_bootstrap_args_s *args = calloc(1, sizeof(*args));
+  if (args == NULL) {
+    ESP_LOGE(TAG, "ptpd_start: out of memory");
+    return -ENOMEM;
+  }
+  args->port_index = 0;
+  args->medium = ptp_port_medium_eth_hwts;
+  if (interface != NULL) {
+    strncpy(args->interface, interface, sizeof(args->interface) - 1);
+  }
+  if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
+                  args, 6, NULL) != pdPASS) {
+    free(args);
+    ESP_LOGE(TAG, "ptpd_start: xTaskCreate failed");
+    return -1;
+  }
+  return 1;
 #else
   int pid;
   FAR char *task_argv[] = {(FAR char *)interface, NULL};

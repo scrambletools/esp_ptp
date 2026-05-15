@@ -56,16 +56,27 @@ typedef enum
     ptp_profile_gptp = 1,
   } ptp_profile_e;
 
-/* Per-port physical medium. ETHERNET runs the standard 802.1AS
- * pdelay_req/resp protocol on an L2TAP-bound socket. WIFI_BEACON_IE is
- * for time-aware-bridge configurations where the port participates in
- * gPTP semantics but the on-wire transport for peer-delay (and
- * optionally for FollowUpInformation) does not use 802.1AS frames. */
+/* Per-port medium and timing mechanism, named together because they
+ * determine the on-wire protocol the daemon runs for this port.
+ *
+ *   eth_hwts — Ethernet medium with IEEE 1588 hardware timestamping
+ *              and on-wire 802.1AS Sync / Follow_Up / Pdelay. The
+ *              port owns an L2TAP socket bound to its interface and
+ *              participates in the standard gPTP exchange.
+ *
+ *   wifi_ftm — Wi-Fi medium with peer-delay measured via IEEE
+ *              802.11mc FTM and Sync transported in the SoftAP's
+ *              802.11 Beacon Vendor IE. No L2TAP socket; the daemon
+ *              dispatches FollowUpInformation through the registered
+ *              sync_egress_cb on the AP side and accepts peer-delay
+ *              samples via ptpd_inject_peer_delay() on the STA side.
+ *              Whether this port measures FTM or just responds is
+ *              derived from wifi_mode (STA initiates; AP responds). */
 
 typedef enum
   {
-    ptp_port_medium_ethernet = 0,
-    ptp_port_medium_wifi_beacon_ie = 1,
+    ptp_port_medium_eth_hwts = 0,
+    ptp_port_medium_wifi_ftm = 1,
   } ptp_port_medium_e;
 
 /* Port-host-interface taxonomy. How the port is physically attached to
@@ -106,20 +117,6 @@ typedef enum
     ptp_port_wifi_mode_ap   = 1,    /* hosts SoftAP */
     ptp_port_wifi_mode_none = 0xFF, /* port is not wifi */
   } ptp_port_wifi_mode_e;
-
-/* How peer-delay is measured on a port. GPTP_WIRE is the protocol-driven
- * Pdelay_Req/Resp exchange. FTM_EXTERNAL means the daemon does not
- * generate or process Pdelay frames on this port; instead the
- * application drives ptpd_inject_peer_delay() with values derived from
- * out-of-band measurements (e.g. 802.11 FTM). NONE disables peer-delay
- * on this port entirely. */
-
-typedef enum
-  {
-    ptp_port_peer_delay_source_gptp_wire = 0,
-    ptp_port_peer_delay_source_ftm_external = 1,
-    ptp_port_peer_delay_source_none = 2,
-  } ptp_port_peer_delay_source_e;
 
 typedef struct
   {
@@ -235,16 +232,18 @@ int ptpd_start(FAR const char *interface);
  * Name: ptpd_start_port
  *
  * Description:
- *   Multi-port variant of ptpd_start(). Starts (or augments) the PTP
- *   daemon, configuring the addressed port with the given medium and
- *   peer-delay source. The legacy ptpd_start() is equivalent to:
- *     ptpd_start_port(0, interface,
- *                     ptp_port_medium_ethernet,
- *                     ptp_port_peer_delay_source_gptp_wire)
+ *   Multi-port variant of ptpd_start(). Bootstraps the daemon if it
+ *   isn't running yet (only an eth_hwts port can bootstrap today —
+ *   the wifi_ftm path needs an existing daemon to attach to) and
+ *   configures the addressed port with the given medium. The legacy
+ *   ptpd_start() is equivalent to:
+ *     ptpd_start_port(0, interface, ptp_port_medium_eth_hwts)
  *
- *   Today this is a thin wrapper that supports only the legacy
- *   port 0 / ethernet / gptp_wire combination — other combinations
- *   return -ENOSYS until they are wired through the daemon.
+ *   The medium determines the peer-delay mechanism: eth_hwts runs the
+ *   on-wire Pdelay protocol, wifi_ftm derives peer-delay from FTM
+ *   (STA-side, automatic) or operates as an FTM responder (AP-side,
+ *   no peer-delay measurement). The choice is taken from
+ *   port[port_index].wifi_mode set via Kconfig.
  *
  * Returned Value:
  *   On success, the non-negative task ID of the PTP daemon is returned;
@@ -254,17 +253,16 @@ int ptpd_start(FAR const char *interface);
 
 int ptpd_start_port(int port_index,
                     FAR const char *interface,
-                    ptp_port_medium_e medium,
-                    ptp_port_peer_delay_source_e peer_delay_source);
+                    ptp_port_medium_e medium);
 
 /****************************************************************************
  * Name: ptpd_inject_peer_delay
  *
  * Description:
  *   Push an externally-measured peer-delay sample into the running
- *   daemon for a port whose peer_delay_source is FTM_EXTERNAL. The
- *   value feeds the same averaging path that the on-wire pdelay
- *   handler uses on GPTP_WIRE ports.
+ *   daemon for a wifi_ftm port operating as STA. The value feeds the
+ *   same averaging path that the on-wire pdelay handler uses on
+ *   eth_hwts ports.
  *
  ****************************************************************************/
 

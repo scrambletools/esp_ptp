@@ -290,19 +290,19 @@ menu "PTP Daemon Configuration"
 
         choice ESP_PTP_PORT0_MEDIUM
             prompt "Port 0 medium"
-            default ESP_PTP_PORT0_MEDIUM_ETHERNET
+            default ESP_PTP_PORT0_MEDIUM_ETH_HWTS
             depends on NETUTILS_PTPD
 
-            config ESP_PTP_PORT0_MEDIUM_ETHERNET
-                bool "ethernet"
-            config ESP_PTP_PORT0_MEDIUM_WIFI
-                bool "wifi"
+            config ESP_PTP_PORT0_MEDIUM_ETH_HWTS
+                bool "eth_hwts (ethernet + IEEE 1588 HW timestamping)"
+            config ESP_PTP_PORT0_MEDIUM_WIFI_FTM
+                bool "wifi_ftm (wifi + IEEE 802.11mc FTM)"
         endchoice
 
         choice ESP_PTP_PORT0_HOST_IF
             prompt "Port 0 host interface"
-            default ESP_PTP_PORT0_HOST_IF_EMAC if ESP_PTP_PORT0_MEDIUM_ETHERNET
-            default ESP_PTP_PORT0_HOST_IF_AHB  if ESP_PTP_PORT0_MEDIUM_WIFI
+            default ESP_PTP_PORT0_HOST_IF_EMAC if ESP_PTP_PORT0_MEDIUM_ETH_HWTS
+            default ESP_PTP_PORT0_HOST_IF_AHB  if ESP_PTP_PORT0_MEDIUM_WIFI_FTM
             depends on NETUTILS_PTPD
 
             config ESP_PTP_PORT0_HOST_IF_EMAC
@@ -338,7 +338,7 @@ menu "PTP Daemon Configuration"
             prompt "Port 0 wifi mode"
             default ESP_PTP_PORT0_WIFI_MODE_STA
             depends on NETUTILS_PTPD
-            depends on ESP_PTP_PORT0_MEDIUM_WIFI
+            depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM
 
             config ESP_PTP_PORT0_WIFI_MODE_AP
                 bool "ap"
@@ -348,25 +348,25 @@ menu "PTP Daemon Configuration"
 
         config ESP_PTP_PORT0_LINK_SPEED_MBPS
             int "Port 0 nominal link speed (Mbps)"
-            default 1000 if ESP_PTP_PORT0_MEDIUM_ETHERNET
-            default 150  if ESP_PTP_PORT0_MEDIUM_WIFI
+            default 1000 if ESP_PTP_PORT0_MEDIUM_ETH_HWTS
+            default 150  if ESP_PTP_PORT0_MEDIUM_WIFI_FTM
             depends on NETUTILS_PTPD
 
         choice ESP_PTP_PORT1_MEDIUM
             prompt "Port 1 medium"
-            default ESP_PTP_PORT1_MEDIUM_WIFI
+            default ESP_PTP_PORT1_MEDIUM_WIFI_FTM
             depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
 
-            config ESP_PTP_PORT1_MEDIUM_ETHERNET
-                bool "ethernet"
-            config ESP_PTP_PORT1_MEDIUM_WIFI
-                bool "wifi"
+            config ESP_PTP_PORT1_MEDIUM_ETH_HWTS
+                bool "eth_hwts (ethernet + IEEE 1588 HW timestamping)"
+            config ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+                bool "wifi_ftm (wifi + IEEE 802.11mc FTM)"
         endchoice
 
         choice ESP_PTP_PORT1_HOST_IF
             prompt "Port 1 host interface"
-            default ESP_PTP_PORT1_HOST_IF_SDIO if ESP_PTP_PORT1_MEDIUM_WIFI
-            default ESP_PTP_PORT1_HOST_IF_EMAC if ESP_PTP_PORT1_MEDIUM_ETHERNET
+            default ESP_PTP_PORT1_HOST_IF_SDIO if ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+            default ESP_PTP_PORT1_HOST_IF_EMAC if ESP_PTP_PORT1_MEDIUM_ETH_HWTS
             depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
 
             config ESP_PTP_PORT1_HOST_IF_EMAC
@@ -400,7 +400,7 @@ menu "PTP Daemon Configuration"
             prompt "Port 1 wifi mode"
             default ESP_PTP_PORT1_WIFI_MODE_AP
             depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
-            depends on ESP_PTP_PORT1_MEDIUM_WIFI
+            depends on ESP_PTP_PORT1_MEDIUM_WIFI_FTM
 
             config ESP_PTP_PORT1_WIFI_MODE_AP
                 bool "ap"
@@ -410,8 +410,8 @@ menu "PTP Daemon Configuration"
 
         config ESP_PTP_PORT1_LINK_SPEED_MBPS
             int "Port 1 nominal link speed (Mbps)"
-            default 150  if ESP_PTP_PORT1_MEDIUM_WIFI
-            default 1000 if ESP_PTP_PORT1_MEDIUM_ETHERNET
+            default 150  if ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+            default 1000 if ESP_PTP_PORT1_MEDIUM_ETH_HWTS
             depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
 
         # Derived: at least one port is Wi-Fi-AP reached via a coprocessor
@@ -420,8 +420,8 @@ menu "PTP Daemon Configuration"
         # API rather than the native esp_wifi one).
         config ESP_PTP_HAS_AP_VIA_COPROCESSOR
             bool
-            default y if (ESP_PTP_PORT0_MEDIUM_WIFI && ESP_PTP_PORT0_WIFI_MODE_AP && (ESP_PTP_PORT0_HOST_IF_SDIO || ESP_PTP_PORT0_HOST_IF_SPI))
-            default y if (ESP_PTP_PORT1_MEDIUM_WIFI && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
+            default y if (ESP_PTP_PORT0_MEDIUM_WIFI_FTM && ESP_PTP_PORT0_WIFI_MODE_AP && (ESP_PTP_PORT0_HOST_IF_SDIO || ESP_PTP_PORT0_HOST_IF_SPI))
+            default y if (ESP_PTP_PORT1_MEDIUM_WIFI_FTM && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
             default n
 
     endif # NETUTILS_PTPD

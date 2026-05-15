@@ -52,16 +52,16 @@ participates as a time-aware bridge (BRIDGED+BRIDGED).
 
 - **gPTP on Ethernet** — standard 802.1AS Pdelay_Req/Resp + Sync on an
   L2TAP-bound socket. The default and most precise path.
-- **Beacon Vendor IE on Wi-Fi** — for wireless endpoints that cannot
-  carry 802.1AS frames natively, the AP publishes the IEEE 802.1AS-2020
-  §12.7 `FollowUpInformation` TLV in its 802.11 Beacon Vendor IE
-  (Path C of the AVB-over-Wi-Fi plan; byte-identical to the FTM-frame
-  Vendor IE so a future carrier swap stays wire-compatible). Publish is
-  internal to this component (`ptp_beacon_ie.c`, auto-fires on
-  `WIFI_EVENT_AP_START`) when at least one port is `wifi_cp` + AP role.
-- **External peer-delay** — applications can push out-of-band peer-delay
-  measurements (e.g. from 802.11 FTM) via `ptpd_inject_peer_delay()` on
-  ports configured with `peer_delay_source = ftm_external`.
+- **Beacon Vendor IE on Wi-Fi** — for `wifi_ftm` ports operating as
+  AP, the daemon publishes the IEEE 802.1AS-2020 §12.7
+  `FollowUpInformation` TLV in the 802.11 Beacon Vendor IE
+  (byte-identical to the FTM-frame Vendor IE so a future carrier
+  swap stays wire-compatible). Publish is internal to this component
+  (`ptp_beacon_ie.c`, auto-fires on `WIFI_EVENT_AP_START`) when at
+  least one port is `wifi_ftm` + AP-mode reached via a coprocessor.
+- **External peer-delay** — applications can push out-of-band
+  peer-delay measurements (e.g. from 802.11 FTM) via
+  `ptpd_inject_peer_delay()` on `wifi_ftm` ports operating as STA.
 
 ## Clock backends
 
@@ -77,8 +77,8 @@ participates as a time-aware bridge (BRIDGED+BRIDGED).
 
 | Function | Purpose |
 | --- | --- |
-| `ptpd_start(iface)` | Start daemon on a single Ethernet port (legacy convenience). |
-| `ptpd_start_port(port, iface, medium, peer_delay_source)` | Multi-port start — configures medium and peer-delay source per port. |
+| `ptpd_start(iface)` | Start daemon on a single eth_hwts port (legacy convenience). |
+| `ptpd_start_port(port, iface, medium)` | Multi-port start. `medium` ∈ {`eth_hwts`, `wifi_ftm`}. Peer-delay mechanism is derived from medium + the port's `wifi_mode` (set via Kconfig). |
 | `ptpd_now(ts)` | Read PTP-disciplined system time (HW or SW backend). |
 | `ptpd_inject_peer_delay(port, ns)` | Push externally-measured peer-delay (FTM). |
 | `ptpd_inject_sync(port, fup_info, len)` | Push out-of-band Sync/FollowUp (beacon-IE consumer side). |
