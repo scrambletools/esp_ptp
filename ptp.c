@@ -26,14 +26,9 @@
  *
  ****************************************************************************/
 
-#define ESP_PTP 1
-
 /****************************************************************************
  * Included Files
  ****************************************************************************/
-#ifndef ESP_PTP
-#include <nuttx/config.h>
-#endif
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -48,25 +43,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#ifndef ESP_PTP
-#include <debug.h>
-#endif
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#ifndef ESP_PTP
-#include <netutils/ipmsfilter.h>
-#endif
 
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
-#ifndef ESP_PTP
-#include <netutils/ptpd.h>
-#include <nuttx/net/netconfig.h>
-#endif
 
 #include "ptp.h"
 #include "ptp_clock_sw.h"
@@ -80,7 +65,6 @@
 /* servo can actually move the local clock rate on those chips.        */
 static bool s_use_sw_clock = false;
 
-#ifdef ESP_PTP
 #include "esp_err.h"
 #include "esp_eth_driver.h"
 #include "esp_event.h"
@@ -257,20 +241,17 @@ static void ptpd_lateness_tick(void) {
 #define clock_timespec_subtract(ts1, ts2, ts3) timespecsub(ts1, ts2, ts3)
 #define clock_timespec_add(ts1, ts2, ts3) timespecadd(ts1, ts2, ts3)
 
-#endif // ESP_PTP
 
 /****************************************************************************
  * Private Data
  ****************************************************************************/
 
-#ifdef ESP_PTP
 #define ADJ_FREQ_MAX 512000 // TODO tuneup
 typedef struct {
   int32_t kp;
   int32_t ki;
   int32_t drift_acc;
 } pi_cntrl_t;
-#endif // ESP_PTP
 
 typedef union {
   struct ptp_header_s header;
@@ -334,10 +315,8 @@ struct ptp_port_s {
   FAR void *sync_egress_ctx;
 
   /* Per-port runtime state. */
-#ifdef ESP_PTP
   uint8_t intf_hw_addr[ETH_ADDR_LEN];
   int ptp_socket;
-#endif
 
   /* Last received packet timestamps (CLOCK_MONOTONIC). */
   struct timespec last_received_multicast;
@@ -404,7 +383,6 @@ struct ptp_state_s {
 
   struct ptp_port_s port[CONFIG_ESP_PTP_NUM_PORTS];
 
-#ifdef ESP_PTP
   ptp_profile_e ptp_profile;
 
   int64_t remote_time_ns_prev;
@@ -414,21 +392,6 @@ struct ptp_state_s {
   double correction_ns;
 
   pi_cntrl_t offset_pi;
-#else
-  /* Address of network interface we are operating on */
-
-  struct sockaddr_in interface_addr;
-
-  /* Socket bound to interface for transmission */
-
-  int tx_socket;
-
-  /* Sockets for PTP event and information ports */
-
-  int event_socket;
-
-  int info_socket;
-#endif // ESP_PTP
 
   /* Our own identity as a clock source */
 
@@ -465,9 +428,6 @@ struct ptp_state_s {
   bool gptp_fallback_done;
   bool eth_event_handler_registered;
 
-#ifndef ESP_PTP
-  uint8_t rxcmsg[CMSG_LEN(sizeof(struct timeval))];
-#endif // ESP_PTP
 };
 
 #ifdef CONFIG_NETUTILS_PTPD_SERVER
@@ -481,31 +441,16 @@ struct ptp_state_s {
  * debugging without having excessive amount of logging from net.
  */
 
-#ifdef ESP_PTP
 static const char *TAG = "ptpd";
 #define ptpinfo(format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
 #define ptpwarn(format, ...) ESP_LOGW(TAG, format, ##__VA_ARGS__)
 #define ptperr(format, ...) ESP_LOGE(TAG, format, ##__VA_ARGS__)
-#else
-#ifdef CONFIG_NETUTILS_PTPD_DEBUG
-#define ptpinfo _info
-#define ptpwarn _warn
-#define ptperr _err
-#else
-#define ptpinfo ninfo
-#define ptpwarn nwarn
-#define ptperr nerr
-#endif
-#endif // ESP_PTP
 
-#ifdef ESP_PTP
 static struct ptp_state_s *s_state;
-#endif
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
-#ifdef ESP_PTP
 static void ptp_clean_after_step(FAR struct ptp_state_s *state);
 
 static inline bool ptp_is_gptp(FAR const struct ptp_state_s *state) {
@@ -739,7 +684,6 @@ static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg,
 static int64_t timespec_to_ns(FAR const struct timespec *ts) {
   return ts->tv_sec * NSEC_PER_SEC + (ts->tv_nsec);
 }
-#endif // ESP_PTP
 
 /* Convert from timespec to PTP format */
 
@@ -882,9 +826,7 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
                           &delta);
 
   if (timespec_to_ms(&delta) > CONFIG_NETUTILS_PTPD_TIMEOUT_MS) {
-#ifdef ESP_PTP
     ESP_LOGD(TAG, "Too long time since received packet\n");
-#endif            // ESP_PTP
     return false; /* Too long time since received packet */
   }
 
@@ -932,7 +874,6 @@ static int ptp_settime(FAR struct ptp_state_s *state, FAR struct timespec *ts) {
 /* Smoothly adjust timestamp. */
 
 static int ptp_adjtime(FAR struct ptp_state_s *state, int64_t delta_ns) {
-#ifdef ESP_PTP
   if (s_use_sw_clock) {
     return ptp_clock_sw_adjtime_offset(delta_ns);
   }
@@ -941,46 +882,8 @@ static int ptp_adjtime(FAR struct ptp_state_s *state, int64_t delta_ns) {
       .offset = (long)delta_ns,
   };
   return clock_adjtime(PTPD_CLOCK_ID, &tx);
-#else
-  struct timeval delta;
-  delta.tv_sec = delta_ns / NSEC_PER_SEC;
-  delta_ns -= (int64_t)delta.tv_sec * NSEC_PER_SEC;
-  delta.tv_usec = delta_ns / NSEC_PER_USEC;
-  return adjtime(&delta, NULL);
-#endif
 }
 
-#ifndef ESP_PTP
-/* Get timestamp of latest received packet */
-
-static int ptp_getrxtime(FAR struct ptp_state_s *state,
-                         FAR struct msghdr *rxhdr, FAR struct timespec *ts) {
-  /* Get hardware or kernel timestamp if available */
-
-#ifdef CONFIG_NET_TIMESTAMP
-  struct cmsghdr *cmsg;
-
-  for_each_cmsghdr(cmsg, rxhdr) {
-    if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP &&
-        cmsg->cmsg_len == CMSG_LEN(sizeof(struct timeval))) {
-      TIMEVAL_TO_TIMESPEC((FAR struct timeval *)CMSG_DATA(cmsg), ts);
-
-      /* Sanity-check the value */
-
-      if (ts->tv_sec > 0 || ts->tv_nsec > 0) {
-        return OK;
-      }
-    }
-  }
-
-  ptpwarn("CONFIG_NET_TIMESTAMP enabled but did not get packet timestamp\n");
-#endif
-
-  /* Fall back to current timestamp */
-
-  return ptp_gettime(state, ts);
-}
-#endif // !ESP_PTP
 
 /* Translate the per-port Kconfig topology knobs (MEDIUM / HOST_IF /
  * TYPE / WIFI_MODE / LINK_SPEED_MBPS) into the runtime ptp_port_s.
@@ -989,7 +892,6 @@ static int ptp_getrxtime(FAR struct ptp_state_s *state,
  * own mirror — esp_ptp keeps its copy so internal decisions (timestamp
  * source, sync-interval scaling for non-EMAC ports) can use them
  * without depending on esp_avb. */
-#ifdef ESP_PTP
 static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
   /* ---- Port 0 ---- */
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS)
@@ -1071,9 +973,7 @@ static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
 #endif
 #endif /* CONFIG_ESP_PTP_NUM_PORTS > 1 */
 }
-#endif /* ESP_PTP */
 
-#ifdef ESP_PTP
 
 /* Per-medium port initialisation. Each helper assumes the caller has
  * already filled the port's enabled/medium/interface_name/wifi_mode
@@ -1297,149 +1197,10 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
                                                    : "wifi_ftm");
   return OK;
 }
-#else
-static int ptp_initialize_state(FAR struct ptp_state_s *state,
-                                FAR const char *interface) {
-  int ret;
-  struct ifreq req;
-  struct sockaddr_in bind_addr;
-
-#ifdef CONFIG_NET_TIMESTAMP
-  int arg;
-#endif
-
-  /* Create sockets */
-
-  state->tx_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  if (state->tx_socket < 0) {
-    ptperr("Failed to create tx socket: %d\n", errno);
-    return ERROR;
-  }
-
-  state->event_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  if (state->event_socket < 0) {
-    ptperr("Failed to create event socket: %d\n", errno);
-    return ERROR;
-  }
-
-  state->info_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  if (state->info_socket < 0) {
-    ptperr("Failed to create info socket: %d\n", errno);
-    return ERROR;
-  }
-
-  /* Get address information of the specified interface for binding socket
-   * Only supports IPv4 currently.
-   */
-
-  memset(&req, 0, sizeof(req));
-  strncpy(req.ifr_name, interface, sizeof(req.ifr_name));
-
-  if (ioctl(state->event_socket, SIOCGIFADDR, (unsigned long)&req) < 0) {
-    ptperr("Failed to get IP address information for interface %s\n",
-           interface);
-    return ERROR;
-  }
-
-  state->interface_addr = *(struct sockaddr_in *)&req.ifr_ifru.ifru_addr;
-
-  /* Get hardware address to initialize the identity field in header.
-   * Clock identity is EUI-64, which we make from EUI-48.
-   */
-
-  if (ioctl(state->event_socket, SIOCGIFHWADDR, (unsigned long)&req) < 0) {
-    ptperr("Failed to get HW address information for interface %s\n",
-           interface);
-    return ERROR;
-  }
-
-  state->own_identity.header.version = 2;
-  state->own_identity.header.domain = CONFIG_NETUTILS_PTPD_DOMAIN;
-  state->own_identity.header.sourceidentity[0] = req.ifr_hwaddr.sa_data[0];
-  state->own_identity.header.sourceidentity[1] = req.ifr_hwaddr.sa_data[1];
-  state->own_identity.header.sourceidentity[2] = req.ifr_hwaddr.sa_data[2];
-  state->own_identity.header.sourceidentity[3] = 0xff;
-  state->own_identity.header.sourceidentity[4] = 0xfe;
-  state->own_identity.header.sourceidentity[5] = req.ifr_hwaddr.sa_data[3];
-  state->own_identity.header.sourceidentity[6] = req.ifr_hwaddr.sa_data[4];
-  state->own_identity.header.sourceidentity[7] = req.ifr_hwaddr.sa_data[5];
-  state->own_identity.header.sourceportindex[0] = 0;
-  state->own_identity.header.sourceportindex[1] = 1;
-  state->own_identity.btc_priority1 = CONFIG_NETUTILS_PTPD_PRIORITY1;
-  state->own_identity.btc_quality[0] = CONFIG_NETUTILS_PTPD_CLASS;
-  state->own_identity.btc_quality[1] = CONFIG_NETUTILS_PTPD_ACCURACY;
-  state->own_identity.btc_quality[2] = 0xff; /* No variance estimate */
-  state->own_identity.btc_quality[3] = 0xff;
-  state->own_identity.btc_priority2 = CONFIG_NETUTILS_PTPD_PRIORITY2;
-  memcpy(state->own_identity.btc_identity,
-         state->own_identity.header.sourceidentity,
-         sizeof(state->own_identity.btc_identity));
-  state->own_identity.timesource = CONFIG_NETUTILS_PTPD_CLOCKSOURCE;
-
-  /* Subscribe to PTP multicast address */
-
-  bind_addr.sin_family = AF_INET;
-  bind_addr.sin_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-
-  clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_multicast);
-
-  ret = ipmsfilter(&state->interface_addr.sin_addr, &bind_addr.sin_addr,
-                   MCAST_INCLUDE);
-  if (ret < 0) {
-    ptperr("Failed to bind multicast address: %d\n", errno);
-    return ERROR;
-  }
-
-  /* Bind socket for events */
-
-  bind_addr.sin_port = HTONS(PTP_UDP_PORT_EVENT);
-  ret = bind(state->event_socket, (struct sockaddr *)&bind_addr,
-             sizeof(bind_addr));
-  if (ret < 0) {
-    ptperr("Failed to bind to udp port %d\n", bind_addr.sin_port);
-    return ERROR;
-  }
-
-#ifdef CONFIG_NET_TIMESTAMP
-  arg = 1;
-  ret = setsockopt(state->event_socket, SOL_SOCKET, SO_TIMESTAMP, &arg,
-                   sizeof(arg));
-
-  if (ret < 0) {
-    ptperr("Failed to enable SO_TIMESTAMP: %s\n", strerror(errno));
-
-    /* PTPD can operate without, but with worse accuracy */
-  }
-#endif
-
-  /* Bind socket for announcements */
-
-  bind_addr.sin_port = HTONS(PTP_UDP_PORT_INFO);
-  ret = bind(state->info_socket, (struct sockaddr *)&bind_addr,
-             sizeof(bind_addr));
-  if (ret < 0) {
-    ptperr("Failed to bind to udp port %d\n", bind_addr.sin_port);
-    return ERROR;
-  }
-
-  /* Bind TX socket to interface address (local addr cannot be multicast) */
-
-  bind_addr.sin_addr = state->interface_addr.sin_addr;
-  ret =
-      bind(state->tx_socket, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
-  if (ret < 0) {
-    ptperr("Failed to bind tx to port %d\n", bind_addr.sin_port);
-    return ERROR;
-  }
-
-  return OK;
-}
-#endif // ESP_PTP
 
 /* Unsubscribe multicast and destroy sockets */
 
 static int ptp_destroy_state(FAR struct ptp_state_s *state) {
-#ifdef ESP_PTP
   if (state->eth_event_handler_registered) {
     esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID,
                                  ptp_eth_event_handler);
@@ -1462,65 +1223,9 @@ static int ptp_destroy_state(FAR struct ptp_state_s *state) {
     close(state->port[0].ptp_socket);
     state->port[0].ptp_socket = -1;
   }
-#else
-  struct in_addr mcast_addr;
-
-  mcast_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-  ipmsfilter(&state->interface_addr.sin_addr, &mcast_addr, MCAST_EXCLUDE);
-
-  if (state->tx_socket > 0) {
-    close(state->tx_socket);
-    state->tx_socket = -1;
-  }
-
-  if (state->event_socket > 0) {
-    close(state->event_socket);
-    state->event_socket = -1;
-  }
-
-  if (state->info_socket > 0) {
-    close(state->info_socket);
-    state->info_socket = -1;
-  }
-#endif // ESP_PTP
   return OK;
 }
 
-#ifndef ESP_PTP
-/* Re-subscribe multicast address.
- * This can become necessary if Ethernet interface gets reset or if external
- * IGMP-compliant Ethernet switch gets plugged in.
- */
-
-static int ptp_check_multicast_status(FAR struct ptp_state_s *state) {
-#if CONFIG_NETUTILS_PTPD_MULTICAST_TIMEOUT_MS > 0
-  struct in_addr mcast_addr;
-  struct timespec time_now;
-  struct timespec delta;
-
-  clock_gettime(CLOCK_MONOTONIC, &time_now);
-  clock_timespec_subtract(&time_now, &state->port[0].last_received_multicast,
-                          &delta);
-
-  if (timespec_to_ms(&delta) > CONFIG_NETUTILS_PTPD_MULTICAST_TIMEOUT_MS) {
-    /* Remove and re-add the multicast group */
-
-    state->port[0].last_received_multicast = time_now;
-
-    mcast_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-    ipmsfilter(&state->interface_addr.sin_addr, &mcast_addr, MCAST_EXCLUDE);
-
-    return ipmsfilter(&state->interface_addr.sin_addr, &mcast_addr,
-                      MCAST_INCLUDE);
-  }
-
-#else
-  UNUSED(state);
-#endif /* CONFIG_NETUTILS_PTPD_MULTICAST_TIMEOUT_MS */
-
-  return OK;
-}
-#endif // !ESP_PTP
 
 /* Track the source clockIdentity of a received Pdelay_Resp; if the count of
  * distinct responders crosses 2, latch pdelay_multi_responder.
@@ -1638,17 +1343,9 @@ static bool ptp_msg_has_endpoint_decl_tlv(FAR const uint8_t *msg_buf,
 
 static int ptp_send_announce(FAR struct ptp_state_s *state) {
   struct ptp_announce_s msg;
-#ifndef ESP_PTP
-  struct sockaddr_in addr;
-#endif // !ESP_PTP
   struct timespec ts;
   int ret;
 
-#ifndef ESP_PTP
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-  addr.sin_port = HTONS(PTP_UDP_PORT_INFO);
-#endif // !ESP_PTP
 
   memset(&msg, 0, sizeof(msg));
   msg = state->own_identity;
@@ -1675,12 +1372,7 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
          sizeof(state->own_identity.btc_identity));
   msg.pathtracetlv = pathtrace_tlv;
 
-#ifdef ESP_PTP
   ret = ptp_net_send(state, &msg, sizeof(msg), NULL);
-#else
-  ret = sendto(state->tx_socket, &msg, sizeof(msg), 0, (struct sockaddr *)&addr,
-               sizeof(addr));
-#endif // ESP_PTP
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
@@ -1691,7 +1383,6 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   return ret;
 }
 
-#ifdef ESP_PTP
 /* Build the bytes that go into the §12.7 VendorSpecific information
  * element of an FTM/TM frame (or, in our case, the Beacon Vendor IE
  * the bridge uses as a workaround carrier — see ptp_beacon_ie.c and
@@ -1778,33 +1469,14 @@ static void ptp_marshal_follow_up_for_beacon_ie(
   tlv->orgidentity[2] = 0xc2;        /* IEEE 802.1 OUI */
   tlv->orgsubtype[2] = 1;            /* FollowUp Information per §11.4.4.3 */
 }
-#endif /* ESP_PTP */
 
 /* Send PTP server synchronization packet */
 
 static int ptp_send_sync(FAR struct ptp_state_s *state) {
-#ifndef ESP_PTP
-  struct msghdr txhdr;
-  struct iovec txiov;
-#endif            // !ESP_PTP
   ptp_msgbuf msg; // using generic msgbuf to allow for larger follow-up size
-#ifndef ESP_PTP
-  struct sockaddr_in addr;
-#endif // !ESP_PTP
   struct timespec ts;
-#ifndef ESP_PTP
-  uint8_t controlbuf[64];
-#endif // !ESP_PTP
   int ret;
 
-#ifndef ESP_PTP
-  memset(&txhdr, 0, sizeof(txhdr));
-  memset(&txiov, 0, sizeof(txiov));
-
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-  addr.sin_port = HTONS(PTP_UDP_PORT_EVENT);
-#endif // !ESP_PTP
 
   memset(&msg, 0, sizeof(msg));
   msg.header = state->own_identity.header;
@@ -1823,16 +1495,6 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
     msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
   }
 
-#ifndef ESP_PTP
-  txhdr.msg_name = &addr;
-  txhdr.msg_namelen = sizeof(addr);
-  txhdr.msg_iov = &txiov;
-  txhdr.msg_iovlen = 1;
-  txhdr.msg_control = controlbuf;
-  txhdr.msg_controllen = sizeof(controlbuf);
-  txiov.iov_base = &msg;
-  txiov.iov_len = sizeof(msg);
-#endif //! ESP_PTP
 
   /* Timestamp and send the sync message */
 
@@ -1840,11 +1502,7 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
   ptp_gettime(state, &ts);
   timespec_to_ptp_format(&ts, msg.sync.origintimestamp);
 
-#ifdef ESP_PTP
   ret = ptp_net_send(state, &msg, sizeof(struct ptp_sync_s), &ts);
-#else
-  ret = sendmsg(state->tx_socket, &txhdr, 0);
-#endif // ESP_PTP
   if (ret < 0) {
     ptperr("sendmsg for sync message failed: %d\n", errno);
     return ret;
@@ -1856,14 +1514,6 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
 
   /* Send the follow up message */
 
-#ifndef ESP_PTP
-  /* Get timestamp after send completes and send follow-up message
-   *
-   * TODO: Implement SO_TIMESTAMPING and use the actual tx timestamp here.
-   */
-
-  ptp_gettime(state, &ts);
-#endif // !ESP_PTP
   timespec_to_ptp_format(&ts, msg.follow_up.origintimestamp);
   msg.header.messagetype = PTP_MSGTYPE_FOLLOW_UP;
   msg.header.messagelength[1] = sizeof(struct ptp_follow_up_s);
@@ -1885,14 +1535,7 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
   info_tlv.orgsubtype[2] = 1; // gPTP required value
   memcpy(msg.follow_up.informationtlv, &info_tlv, sizeof(info_tlv));
 
-#ifndef ESP_PTP
-  addr.sin_port = HTONS(PTP_UDP_PORT_INFO);
-
-  ret = sendto(state->tx_socket, &msg, sizeof(msg), 0, (struct sockaddr *)&addr,
-               sizeof(addr));
-#else
   ret = ptp_net_send(state, &msg, sizeof(struct ptp_follow_up_s), NULL);
-#endif // !ESP_PTP
   if (ret < 0) {
     ptperr("sendto for follow-up message failed: %d\n", errno);
     return ret;
@@ -1911,17 +1554,9 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
 
 static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
   ptp_msgbuf req;
-#ifndef ESP_PTP
-  struct sockaddr_in addr;
-#endif // !ESP_PTP
   int ret;
   size_t req_len;
 
-#ifndef ESP_PTP
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-  addr.sin_port = HTONS(PTP_UDP_PORT_EVENT);
-#endif // !ESP_PTP
 
   memset(&req, 0, sizeof(req));
   req.header = state->own_identity.header;
@@ -1951,20 +1586,8 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
 
   ptp_increment_sequence(&state->delay_req_seq, &req.header);
 
-#ifdef ESP_PTP
   ret = ptp_net_send(state, &req, req_len, &state->port[0].delayreq_time);
-#else
-  ret = sendto(state->tx_socket, &req, req_len, 0, (FAR struct sockaddr *)&addr,
-               sizeof(addr));
-#endif // ESP_PTP
 
-#ifndef ESP_PTP
-  /* Get timestamp after send completes.
-   * TODO: Implement SO_TIMESTAMPING and use the actual tx timestamp here.
-   */
-
-  ptp_gettime(state, &state->port[0].delayreq_time);
-#endif // !ESP_PTP
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
@@ -2065,7 +1688,6 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
   }
 #endif /* CONFIG_NETUTILS_PTPD_SERVER */
 
-#ifdef ESP_PTP
   /* Sync emission on wifi_ftm ports. Independent of selected_source_valid:
    * on a transparent time-aware bridge the wifi_ftm AP port republishes
    * upstream Sync at the configured cadence; when we are the GM the same
@@ -2095,7 +1717,6 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     port->sync_egress_cb(p, (const uint8_t *)&fu, sizeof(fu),
                          port->sync_egress_ctx);
   }
-#endif /* ESP_PTP */
 
 #if defined(CONFIG_NETUTILS_PTPD_SEND_DELAYREQ) ||                             \
     defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
@@ -2179,7 +1800,6 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
   return OK;
 }
 
-#ifdef ESP_PTP
 static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
                                       FAR struct timespec *remote_timestamp,
                                       FAR struct timespec *local_timestamp) {
@@ -2268,7 +1888,6 @@ static void ptp_clean_after_step(FAR struct ptp_state_s *state) {
   state->offset_pi.drift_acc = 0;
   state->last_offset_ns = 0;
 }
-#endif // ESP_PTP
 
 /* Update local clock either by smooth adjustment or by jumping.
  * Remote time was remote_timestamp at local_timestamp.
@@ -2314,9 +1933,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
     state->drift_avg_total_ms = 0;
     state->drift_ppb = 0;
 
-#ifdef ESP_PTP
     ptp_clean_after_step(state);
-#endif // ESP_PTP
 
     if (ret == OK) {
       ptpinfo("Jumped to timestamp %lld.%09ld s\n", (long long)new_time.tv_sec,
@@ -2325,106 +1942,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
       ptperr("ptp_settime() failed: %d\n", errno);
     }
   } else {
-#ifdef ESP_PTP
     ptp_lock_local_clock_freq(state, remote_timestamp, local_timestamp);
-#else
-    /* Track drift rate based on two consecutive measurements and
-     * the adjustment that was made previously.
-     */
-
-    int64_t drift_ppb;
-    struct timespec interval;
-    int interval_ms;
-    int max_avg_period_ms;
-    int64_t adjustment_ns;
-
-    clock_timespec_subtract(local_timestamp, &state->last_delta_timestamp,
-                            &interval);
-    interval_ms = timespec_to_ms(&interval);
-
-    if (interval_ms > 0 && interval_ms < CONFIG_NETUTILS_PTPD_TIMEOUT_MS) {
-      drift_ppb =
-          (delta_ns - state->last_delta_ns) * MSEC_PER_SEC / interval_ms;
-    } else {
-      ptpwarn("Measurement interval out of range: %d ms\n", interval_ms);
-      drift_ppb = 0;
-      interval_ms = 1;
-    }
-
-    /* Account for the adjustment previously made */
-
-    drift_ppb +=
-        state->last_adjtime_ns * MSEC_PER_SEC / CONFIG_CLOCK_ADJTIME_PERIOD_MS;
-
-    if (drift_ppb > CONFIG_CLOCK_ADJTIME_SLEWLIMIT_PPM * 1000 ||
-        drift_ppb < -CONFIG_CLOCK_ADJTIME_SLEWLIMIT_PPM * 1000) {
-      ptpwarn("Drift estimate out of range: %lld\n", (long long)drift_ppb);
-      drift_ppb = state->drift_ppb;
-    }
-
-    /* Take direct average of drift estimate for first measurements,
-     * after that update the exponential sliding average.
-     * Measurements are weighted according to the interval, because
-     * drift estimate is more accurate over longer timespan.
-     */
-
-    state->drift_avg_total_ms += interval_ms;
-    max_avg_period_ms = CONFIG_NETUTILS_PTPD_DRIFT_AVERAGE_S * MSEC_PER_SEC;
-    if (state->drift_avg_total_ms > max_avg_period_ms) {
-      state->drift_avg_total_ms = max_avg_period_ms;
-    }
-
-    state->drift_ppb += (drift_ppb - state->drift_ppb) * interval_ms /
-                        state->drift_avg_total_ms;
-
-    /* Compute the value we need to give to adjtime() to match the
-     * drift rate.
-     */
-
-    adjustment_ns =
-        state->drift_ppb * CONFIG_CLOCK_ADJTIME_PERIOD_MS / MSEC_PER_SEC;
-
-    /* Drift estimation ensures local clock runs at same rate as remote.
-     *
-     * Adding the current clock offset to adjustment brings the clocks
-     * to match. To avoid individual outliers from causing jitter, we
-     * take the larger signed value of two previous deltas. This is based
-     * on the logic that packets can get delayed in transit, but do not
-     * travel backwards in time.
-     *
-     * Clock offset is applied over ADJTIME_PERIOD. If there is significant
-     * noise in measurements, increasing ADJTIME_PERIOD will reduce its
-     * effect on the local clock run rate.
-     */
-
-    if (state->last_delta_ns > delta_ns) {
-      adjustment_ns += state->last_delta_ns;
-    } else {
-      adjustment_ns += delta_ns;
-    }
-
-    /* Apply adjustment and store information for next time */
-
-    state->last_delta_ns = delta_ns;
-    state->last_delta_timestamp = *local_timestamp;
-    state->last_adjtime_ns = adjustment_ns;
-
-    ptpinfo("Delta: %+lld ns, adjustment %+lld ns, drift rate %+lld ppb\n",
-            (long long)delta_ns, (long long)state->last_adjtime_ns,
-            (long long)state->drift_ppb);
-
-    ret = ptp_adjtime(state, adjustment_ns);
-
-    if (ret != OK) {
-      ptperr("ptp_adjtime() failed: %d\n", errno);
-    }
-
-    /* Check if clock is stable enough for sending delay requests */
-
-    if (absdelta_ns < CONFIG_NETUTILS_PTPD_MAX_PATH_DELAY_NS) {
-      state->port[0].can_send_delayreq = true;
-    }
-#endif // ESP_PTP
   }
 
   return ret;
@@ -2440,9 +1958,7 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
              state->selected_source.header.sourceidentity,
              sizeof(msg->header.sourceidentity)) != 0) {
     /* This packet wasn't from the currently selected source */
-#ifdef ESP_PTP
     ESP_LOGD(TAG, "This packet wasn't from the currently selected source");
-#endif // ESP_PTP
     return OK;
   }
 
@@ -2499,9 +2015,6 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
   ptp_msgbuf
       resp; // using generic message buffer to allow for larger follow-up size
   struct timespec ts;
-#ifndef ESP_PTP
-  struct sockaddr_in addr;
-#endif // !ESP_PTP
   int ret;
 
   if (!ptp_is_gptp(state) && state->selected_source_valid) {
@@ -2510,11 +2023,6 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
     return OK;
   }
 
-#ifndef ESP_PTP
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = HTONL(PTP_MULTICAST_ADDR);
-  addr.sin_port = HTONS(PTP_UDP_PORT_INFO);
-#endif // !ESP_PTP
 
   memset(&resp, 0, sizeof(resp));
   resp.header = state->own_identity.header;
@@ -2554,12 +2062,7 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
 
   /* Send the response message */
 
-#ifdef ESP_PTP
   ret = ptp_net_send(state, &resp, resp_len, &ts);
-#else
-  ret = sendto(state->tx_socket, &resp, sizeof(resp), 0,
-               (FAR struct sockaddr *)&addr, sizeof(addr));
-#endif // ESP_PTP
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
@@ -2587,9 +2090,7 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
     /* Send the response follow-up message, currently only for ESP as it
      * requires hw timestamp data */
 
-#ifdef ESP_PTP
     ret = ptp_net_send(state, &resp, fup_len, NULL);
-#endif // ESP_PTP
 
     if (ret < 0) {
       ptperr("sendto for delay response follow-up message failed: %d\n", errno);
@@ -2883,31 +2384,6 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 }
 
 /* Signal handler for status / stop requests */
-#ifndef ESP_PTP
-static void ptp_signal_handler(int signo, FAR siginfo_t *siginfo,
-                               FAR void *context) {
-  FAR struct ptp_state_s *state = (FAR struct ptp_state_s *)siginfo->si_user;
-
-  if (signo == SIGHUP) {
-    state->stop = true;
-  } else if (signo == SIGUSR1 && siginfo->si_value.sival_ptr) {
-    state->status_req =
-        *(FAR struct ptpd_statusreq_s *)siginfo->si_value.sival_ptr;
-  }
-}
-
-static void ptp_setup_sighandlers(FAR struct ptp_state_s *state) {
-  struct sigaction act;
-
-  act.sa_sigaction = ptp_signal_handler;
-  sigfillset(&act.sa_mask);
-  act.sa_flags = SA_SIGINFO;
-  act.sa_user = state;
-
-  sigaction(SIGHUP, &act, NULL);
-  sigaction(SIGUSR1, &act, NULL);
-}
-#endif // !ESP_PTP
 
 /* Process status information request */
 
@@ -3000,129 +2476,52 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
 }
 
 /* Main PTPD task */
-#ifdef ESP_PTP
 static void ptp_daemon(void *task_param)
-#else
-static int ptp_daemon(int argc, FAR char **argv)
-#endif // ESP_PTP
 {
   FAR struct ptp_state_s *state;
-#ifdef ESP_PTP
   struct pollfd pollfds[1]; // everything is received over one socket at L2
   struct ptp_bootstrap_args_s *args = (struct ptp_bootstrap_args_s *)task_param;
-#else
-  FAR const char *interface = "eth0";
-  struct pollfd pollfds[2];
-  struct msghdr rxhdr;
-  struct iovec rxiov;
-#endif // ESP_PTP
   int ret;
 
-#ifndef ESP_PTP
-  memset(&rxhdr, 0, sizeof(rxhdr));
-  memset(&rxiov, 0, sizeof(rxiov));
-#endif // !ESP_PTP
 
   state = calloc(1, sizeof(struct ptp_state_s));
 
-#ifndef ESP_PTP
-  if (argc > 1) {
-    interface = argv[1];
-  }
-#endif // !ESP_PTP
 
-#ifdef ESP_PTP
   int init_rc = ptp_initialize_state(state, args);
   free(args); /* heap struct from ptpd_start / ptpd_start_port */
   if (init_rc != OK) {
-#else
-  if (ptp_initialize_state(state, interface) != OK) {
-#endif // ESP_PTP
     ptperr("Failed to initialize PTP state, exiting\n");
 
     ptp_destroy_state(state);
     free(state);
 
-#ifdef ESP_PTP
     goto err;
-#else
-    return ERROR;
-#endif // ESP_PTP
   }
-#ifndef ESP_PTP
-  ptp_setup_sighandlers(state);
-#endif // !ESP_PTP
 
   pollfds[0].events = POLLIN;
-#ifdef ESP_PTP
   pollfds[0].fd = state->port[0].ptp_socket;
-#else
-  pollfds[0].fd = state->event_socket;
-  pollfds[1].events = POLLIN;
-  pollfds[1].fd = state->info_socket;
-#endif // ESP_PTP
 
   while (!state->stop) {
     ptpd_lateness_tick();
     state->port[0].can_send_delayreq = ptp_is_gptp(state);
 
-#ifndef ESP_PTP
-    rxhdr.msg_name = NULL;
-    rxhdr.msg_namelen = 0;
-    rxhdr.msg_iov = &rxiov;
-    rxhdr.msg_iovlen = 1;
-    rxhdr.msg_control = &state->rxcmsg;
-    rxhdr.msg_controllen = sizeof(state->rxcmsg);
-    rxhdr.msg_flags = 0;
-    rxiov.iov_base = &state->port[0].rxbuf;
-    rxiov.iov_len = sizeof(state->port[0].rxbuf);
-#endif // !ESP_PTP
 
     pollfds[0].revents = 0;
-#ifndef ESP_PTP
-    pollfds[1].revents = 0;
-    ret = poll(pollfds, 2, PTPD_POLL_INTERVAL);
-#else
     ret = poll(pollfds, 1, PTPD_POLL_INTERVAL);
-#endif // !ESP_PTP
 
     if (pollfds[0].revents) {
       /* Receive time-critical packet, potentially with cmsg
        * indicating the timestamp.
        */
 
-#ifdef ESP_PTP
       ret = ptp_net_recv(state, &state->port[0].rxbuf,
                          sizeof(state->port[0].rxbuf), &state->port[0].rxtime);
-#else
-      ret = recvmsg(state->event_socket, &rxhdr, MSG_DONTWAIT);
-#endif // ESP_PTP
 
-      if (ret > 0) {
-#ifndef ESP_PTP
-        ptp_getrxtime(state, &rxhdr, &state->port[0].rxtime);
-#endif
-        ptp_process_rx_packet(state, ret);
-      }
-    }
-
-#ifndef ESP_PTP
-    if (pollfds[1].revents) {
-      /* Receive non-time-critical packet. */
-
-      ret = recv(state->info_socket, &state->port[0].rxbuf,
-                 sizeof(state->port[0].rxbuf), MSG_DONTWAIT);
       if (ret > 0) {
         ptp_process_rx_packet(state, ret);
       }
     }
 
-    if (pollfds[0].revents == 0 && pollfds[1].revents == 0) {
-      /* No packets received, check for multicast timeout */
-
-      ptp_check_multicast_status(state);
-    }
-#endif // !ESP_PTP
     ptp_periodic_send(state);
     ptp_check_profile_fallback(state);
 
@@ -3132,13 +2531,9 @@ static int ptp_daemon(int argc, FAR char **argv)
   ptp_destroy_state(state);
   free(state);
 
-#ifdef ESP_PTP
 err:
   s_state = NULL;
   vTaskDelete(NULL);
-#else
-  return 0;
-#endif // ESP_PTP
 }
 
 /****************************************************************************
@@ -3162,7 +2557,6 @@ err:
 
 int ptpd_start_port(int port_index, FAR const char *interface,
                     ptp_port_medium_e medium) {
-#ifdef ESP_PTP
   if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
     ESP_LOGE(TAG, "ptpd_start_port: port_index %d out of range [0,%d)",
              port_index, CONFIG_ESP_PTP_NUM_PORTS);
@@ -3243,15 +2637,9 @@ int ptpd_start_port(int port_index, FAR const char *interface,
            : p->wifi_mode == ptp_port_wifi_mode_sta ? "sta"
                                                    : "none");
   return port_index;
-#else
-  UNUSED(port_index);
-  UNUSED(medium);
-  return ptpd_start(interface);
-#endif
 }
 
 int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
-#ifdef ESP_PTP
   if (s_state == NULL) {
     return -ESRCH;
   }
@@ -3279,16 +2667,10 @@ int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
   p->peer_delay_ns += (long)(peer_delay_ns - p->peer_delay_ns) /
                       p->peer_delay_avgcount;
   return OK;
-#else
-  UNUSED(port_index);
-  UNUSED(peer_delay_ns);
-  return -ENOSYS;
-#endif
 }
 
 int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
                      size_t len) {
-#ifdef ESP_PTP
   if (s_state == NULL) {
     return -ESRCH;
   }
@@ -3358,17 +2740,10 @@ int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
   clock_gettime(CLOCK_MONOTONIC, &p->last_received_sync);
 
   return ptp_update_local_clock(s_state, &remote_time, &local_rxtime);
-#else
-  UNUSED(port_index);
-  UNUSED(follow_up_info);
-  UNUSED(len);
-  return -ENOSYS;
-#endif
 }
 
 int ptpd_inject_sync_pair(int port_index, int64_t remote_ns,
                           int64_t local_ns) {
-#ifdef ESP_PTP
   if (s_state == NULL) {
     return -ESRCH;
   }
@@ -3396,17 +2771,10 @@ int ptpd_inject_sync_pair(int port_index, int64_t remote_ns,
   clock_gettime(CLOCK_MONOTONIC, &p->last_received_sync);
 
   return ptp_update_local_clock(s_state, &remote_ts, &local_ts);
-#else
-  UNUSED(port_index);
-  UNUSED(remote_ns);
-  UNUSED(local_ns);
-  return -ENOSYS;
-#endif
 }
 
 int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
                                  FAR void *ctx) {
-#ifdef ESP_PTP
   if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
     return -EINVAL;
   }
@@ -3416,12 +2784,6 @@ int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
   s_state->port[port_index].sync_egress_cb = cb;
   s_state->port[port_index].sync_egress_ctx = ctx;
   return OK;
-#else
-  UNUSED(port_index);
-  UNUSED(cb);
-  UNUSED(ctx);
-  return -ENOTSUP;
-#endif
 }
 
 /* Software-clock indirection. When ptp_clock_sw_init() registers a
@@ -3445,7 +2807,6 @@ int ptpd_now(FAR struct timespec *ts) {
 }
 
 int ptpd_start(FAR const char *interface) {
-#ifdef ESP_PTP
   if (s_state != NULL) {
     ESP_LOGE(TAG, "Other instance of PTP is already running");
     return -1;
@@ -3467,24 +2828,6 @@ int ptpd_start(FAR const char *interface) {
     return -1;
   }
   return 1;
-#else
-  int pid;
-  FAR char *task_argv[] = {(FAR char *)interface, NULL};
-
-  pid = task_create("PTPD", CONFIG_NETUTILS_PTPD_SERVERPRIO,
-                    CONFIG_NETUTILS_PTPD_STACKSIZE, ptp_daemon, task_argv);
-
-  /* Use kill with signal 0 to check if the process is still alive
-   * after initialization.
-   */
-
-  usleep(USEC_PER_TICK);
-  if (kill(pid, 0) != OK) {
-    return ERROR;
-  } else {
-    return pid;
-  }
-#endif // ESP_PTP
 }
 
 /****************************************************************************
@@ -3509,7 +2852,6 @@ int ptpd_start(FAR const char *interface) {
  ****************************************************************************/
 
 int ptpd_set_profile(int pid, ptp_profile_e profile) {
-#ifdef ESP_PTP
   UNUSED(pid);
 
   if (profile != ptp_profile_standard && profile != ptp_profile_gptp) {
@@ -3531,15 +2873,9 @@ int ptpd_set_profile(int pid, ptp_profile_e profile) {
   }
 
   return OK;
-#else
-  UNUSED(pid);
-  UNUSED(profile);
-  return -ENOTSUP;
-#endif
 }
 
 int ptpd_status(int pid, FAR struct ptpd_status_s *status) {
-#ifdef ESP_PTP
   int ret = 0;
   sem_t donesem;
   struct ptpd_statusreq_s req;
@@ -3576,7 +2912,6 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status) {
   sem_destroy(&donesem);
 
   return ret;
-#endif
 #ifndef CONFIG_BUILD_FLAT
 
   /* TODO: Use SHM memory to pass the status information if processes
@@ -3634,14 +2969,6 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status) {
  ****************************************************************************/
 
 int ptpd_stop(int pid) {
-#ifdef ESP_PTP
   s_state->stop = true;
   return OK;
-#else
-  if (kill(pid, SIGHUP) == OK) {
-    return OK;
-  } else {
-    return -errno;
-  }
-#endif
 }

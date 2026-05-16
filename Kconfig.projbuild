@@ -1,6 +1,6 @@
 #
 # For a description of the syntax of this configuration file,
-# see the file kconfig-language.txt in the NuttX tools repository.
+# see the ESP-IDF Kconfig docs.
 #
 menu "PTP Daemon Configuration"
 
@@ -35,19 +35,19 @@ menu "PTP Daemon Configuration"
             bool "Enable client support"
             default y
             help
-                Act as a PTP client, synchronizing the NuttX clock to a remote master
-                clock.
+                Act as a PTP client, synchronizing the local clock to a remote
+                timetransmitter clock.
 
         config NETUTILS_PTPD_SERVER
             bool "Enable server support"
             default n
             help
-                Act as a PTP server, providing NuttX clock time to other systems.
+                Act as a PTP server, providing local clock time to other systems.
 
-                Both server and client can be simultaneously enabled. NuttX will then
-                synchronize to a higher priority timetransmitter clock, or act as a
-                timetransmitter clock itself if it has the highest priority.
-                Refer to the BTCA in IEEE-1588 for details.
+                Both server and client can be simultaneously enabled. The daemon
+                will then synchronize to a higher priority timetransmitter clock,
+                or act as a timetransmitter clock itself if it has the highest
+                priority. Refer to the BTCA in IEEE-1588 for details.
 
         config NETUTILS_PTPD_STACKSIZE
             int "PTP daemon stack stack size"

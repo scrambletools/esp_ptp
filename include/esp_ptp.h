@@ -29,7 +29,6 @@
 #ifndef __APPS_INCLUDE_NETUTILS_PTPD_H
 #define __APPS_INCLUDE_NETUTILS_PTPD_H
 
-// ESP_PTP
 #include <time.h>
 #include <stdint.h>
 #include <stddef.h>
