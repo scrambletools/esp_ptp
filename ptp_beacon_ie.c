@@ -64,13 +64,9 @@ extern esp_err_t esp_hosted_register_custom_callback(
 
 static const char *TAG = "ptp_beacon_ie";
 
-/* OUI: locally-administered placeholder (02:00:00) until Scramble
- * Tools obtains a registered OUI. Type field follows §12.7 Table 12-4
- * (0 = FollowUpInformation). */
-#define AVB_VENDOR_IE_OUI0     0x02
-#define AVB_VENDOR_IE_OUI1     0x00
-#define AVB_VENDOR_IE_OUI2     0x00
-#define AVB_VENDOR_IE_OUI_TYPE 0x00 /* §12.7 Type 0 = FollowUpInformation */
+/* OUI / sub-types are shared with the coprocessor RPC handler and
+ * STA parser via ptp_rpc_proto.h. See that header for the rationale
+ * and the FOLLOWUP / TSF_MAPPING split. */
 
 /* Which port is the wifi_ftm AP we publish for. CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
  * gates this whole file, so exactly one of these branches matches in any
@@ -137,10 +133,10 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
   uint8_t *ie = buf + sizeof(*hdr);
   ie[0] = WIFI_VENDOR_IE_ELEMENT_ID; /* 0xDD */
   ie[1] = (uint8_t)(4 + fu_info_len);
-  ie[2] = AVB_VENDOR_IE_OUI0;
-  ie[3] = AVB_VENDOR_IE_OUI1;
-  ie[4] = AVB_VENDOR_IE_OUI2;
-  ie[5] = AVB_VENDOR_IE_OUI_TYPE;
+  ie[2] = PTP_VND_IE_OUI0;
+  ie[3] = PTP_VND_IE_OUI1;
+  ie[4] = PTP_VND_IE_OUI2;
+  ie[5] = PTP_VND_IE_OUI_TYPE_FOLLOWUP;
   if (fu_info != NULL && fu_info_len > 0) {
     memcpy(ie + 6, fu_info, fu_info_len);
   }
@@ -155,9 +151,38 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
              "Beacon Vendor IE publish dispatched on port %d "
              "(OUI %02x:%02x:%02x type %d, payload %zu B). Subsequent "
              "publishes are silent unless an error occurs.",
-             PTP_BEACON_IE_PORT, AVB_VENDOR_IE_OUI0, AVB_VENDOR_IE_OUI1,
-             AVB_VENDOR_IE_OUI2, AVB_VENDOR_IE_OUI_TYPE, fu_info_len);
+             PTP_BEACON_IE_PORT, PTP_VND_IE_OUI0, PTP_VND_IE_OUI1,
+             PTP_VND_IE_OUI2, PTP_VND_IE_OUI_TYPE_FOLLOWUP, fu_info_len);
     s_acked_at_least_once = true;
+  }
+
+  /* Plan A: also publish the (gPTP, AP-TSF) mapping IE in slot 1 of
+   * the same beacon. The 8 bytes of TSF payload are placeholder zeros
+   * here; the coprocessor's RPC handler reads esp_wifi_get_tsf_time
+   * (WIFI_IF_AP) and patches the value in before calling
+   * esp_wifi_set_vendor_ie. The STA pairs this with the §12.7 IE's
+   * preciseOriginTimestamp to convert FTM t1 into GM time. See
+   * espressif.md in the bridge project for the long-term plan. */
+  uint8_t tbuf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 +
+               PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
+  memset(tbuf, 0, sizeof(tbuf));
+  ptp_rpc_set_vendor_ie_t *thdr = (ptp_rpc_set_vendor_ie_t *)tbuf;
+  thdr->enable = 1;
+  thdr->type = WIFI_VND_IE_TYPE_BEACON;
+  thdr->idx = WIFI_VND_IE_ID_1;
+  thdr->reserved = 0;
+  uint8_t *tie = tbuf + sizeof(*thdr);
+  tie[0] = WIFI_VENDOR_IE_ELEMENT_ID;
+  tie[1] = (uint8_t)(4 + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN);
+  tie[2] = PTP_VND_IE_OUI0;
+  tie[3] = PTP_VND_IE_OUI1;
+  tie[4] = PTP_VND_IE_OUI2;
+  tie[5] = PTP_VND_IE_OUI_TYPE_TSF_MAPPING;
+  /* tie[6..13] left zero; coprocessor patches in TSF µs LE. */
+  esp_err_t r2 = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ,
+                                             tbuf, sizeof(tbuf));
+  if (r2 != ESP_OK) {
+    ESP_LOGE(TAG, "TSF mapping IE dispatch: %s", esp_err_to_name(r2));
   }
 }
 

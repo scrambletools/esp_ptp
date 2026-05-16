@@ -286,6 +286,33 @@ int ptpd_inject_sync(int port_index,
                      size_t len);
 
 /****************************************************************************
+ * Name: ptpd_inject_sync_pair
+ *
+ * Description:
+ *   Push a (remote_time, local_rxtime) pair directly into the servo,
+ *   bypassing the §12.7 Follow_Up byte parser. For FTM-derived sync
+ *   on wifi_ftm STA ports where the caller has already computed
+ *   GM time at frame TX (remote_ns, from t1 + a bridge gPTP↔TSF
+ *   mapping) and STA local-clock time at frame RX (local_ns, from
+ *   the FTM entry's t2 back-projected onto the local SW clock).
+ *
+ *   Both timestamps are in nanoseconds since the PTP epoch on their
+ *   respective clocks. The daemon treats the pair the same way it
+ *   treats any (preciseOriginTimestamp, local_rxtime) drawn from a
+ *   wired sync exchange — runs offset filter, peer-delay correction,
+ *   PI servo, freq adjust.
+ *
+ *   Caller is responsible for choosing the timestamps so that they
+ *   bracket the same wall-clock moment (modulo the propagation
+ *   delay, which the daemon will subtract via port->peer_delay_ns).
+ *
+ ****************************************************************************/
+
+int ptpd_inject_sync_pair(int port_index,
+                          int64_t remote_ns,
+                          int64_t local_ns);
+
+/****************************************************************************
  * Name: ptpd_register_sync_egress_cb
  *
  * Description:

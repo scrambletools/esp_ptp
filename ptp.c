@@ -3366,6 +3366,44 @@ int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
 #endif
 }
 
+int ptpd_inject_sync_pair(int port_index, int64_t remote_ns,
+                          int64_t local_ns) {
+#ifdef ESP_PTP
+  if (s_state == NULL) {
+    return -ESRCH;
+  }
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    return -EINVAL;
+  }
+  struct ptp_port_s *p = &s_state->port[port_index];
+
+  /* Synthesise a selected_source if none yet — without it the daemon's
+   * status APIs and BTCA "are we slave" tests reject the injection.
+   * The caller already validated GM identity at the IE-parse layer
+   * (the §12.7 IE sourcePortIdentity is checked separately via
+   * ptpd_inject_sync's selected_source path); for pair-style FTM
+   * sync where the IE bytes have been consumed elsewhere, we leave
+   * the identity at whatever ptpd_inject_sync set. */
+  if (!s_state->selected_source_valid) {
+    return -ENOENT;
+  }
+
+  struct timespec remote_ts = {.tv_sec = (time_t)(remote_ns / NSEC_PER_SEC),
+                               .tv_nsec = (long)(remote_ns % NSEC_PER_SEC)};
+  struct timespec local_ts = {.tv_sec = (time_t)(local_ns / NSEC_PER_SEC),
+                              .tv_nsec = (long)(local_ns % NSEC_PER_SEC)};
+
+  clock_gettime(CLOCK_MONOTONIC, &p->last_received_sync);
+
+  return ptp_update_local_clock(s_state, &remote_ts, &local_ts);
+#else
+  UNUSED(port_index);
+  UNUSED(remote_ns);
+  UNUSED(local_ns);
+  return -ENOSYS;
+#endif
+}
+
 int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
                                  FAR void *ctx) {
 #ifdef ESP_PTP
