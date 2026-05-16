@@ -125,13 +125,19 @@ int ptp_clock_sw_adjtime_rate(int32_t rate_ppb)
         errno = EINVAL;
         return -1;
     }
-    if (rate_ppb > 100000000 || rate_ppb < -100000000) {
-        errno = ERANGE;
-        return -1;
-    }
-    /* Re-anchor at the current time so the rate change is continuous. */
+    /* RELATIVE adjustment to current rate, matching IDF's
+     * clock_adjtime(CLOCK_PTP_SYSTEM, ADJ_FREQUENCY=ppb) semantics on
+     * EMAC PTP (emac_hal_ptp_adj_freq multiplies current addend by
+     * (1 + ppb/1e9)). The servo's freq_ppb formula relies on this
+     * relative interpretation — passing it through as absolute makes
+     * each call clobber the integrator and the loop oscillates. */
     int64_t now = sw_now_ns();
-    s_rate_ppb = rate_ppb;
+    int64_t cur = s_rate_ppb;
+    int64_t delta = cur * (int64_t)rate_ppb / 1000000000LL + (int64_t)rate_ppb;
+    int64_t new_rate = cur + delta;
+    if (new_rate > 100000000) new_rate = 100000000;
+    if (new_rate < -100000000) new_rate = -100000000;
+    s_rate_ppb = (int32_t)new_rate;
     reanchor_to(now);
     return 0;
 }

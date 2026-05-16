@@ -69,6 +69,16 @@
 #endif
 
 #include "ptp.h"
+#include "ptp_clock_sw.h"
+
+/* Set true after ptp_clock_sw_init() succeeds — routes ptp_gettime /   */
+/* ptp_settime / ptp_adjtime and the freq-adjust path through the SW   */
+/* clock backend instead of POSIX. Chips without EMAC IEEE 1588        */
+/* (e.g. ESP32-C6) have no working clock_adjtime(CLOCK_REALTIME,       */
+/* ADJ_FREQUENCY) in IDF; the SW backend re-anchors against            */
+/* esp_timer_get_time() with a rate offset and is the only way the     */
+/* servo can actually move the local clock rate on those chips.        */
+static bool s_use_sw_clock = false;
 
 #ifdef ESP_PTP
 #include "esp_err.h"
@@ -903,6 +913,9 @@ static uint16_t ptp_get_sequence(FAR const struct ptp_header_s *hdr) {
 
 static int ptp_gettime(FAR struct ptp_state_s *state, FAR struct timespec *ts) {
   UNUSED(state);
+  if (s_use_sw_clock) {
+    return ptp_clock_sw_now(ts);
+  }
   return clock_gettime(PTPD_CLOCK_ID, ts);
 }
 
@@ -910,6 +923,9 @@ static int ptp_gettime(FAR struct ptp_state_s *state, FAR struct timespec *ts) {
 
 static int ptp_settime(FAR struct ptp_state_s *state, FAR struct timespec *ts) {
   UNUSED(state);
+  if (s_use_sw_clock) {
+    return ptp_clock_sw_settime(ts);
+  }
   return clock_settime(PTPD_CLOCK_ID, ts);
 }
 
@@ -917,6 +933,9 @@ static int ptp_settime(FAR struct ptp_state_s *state, FAR struct timespec *ts) {
 
 static int ptp_adjtime(FAR struct ptp_state_s *state, int64_t delta_ns) {
 #ifdef ESP_PTP
+  if (s_use_sw_clock) {
+    return ptp_clock_sw_adjtime_offset(delta_ns);
+  }
   struct timex tx = {
       .modes = ADJ_OFFSET | ADJ_NANO,
       .offset = (long)delta_ns,
@@ -1223,6 +1242,19 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   if (rc != OK) {
     return ERROR;
   }
+
+#if !SOC_EMAC_SUPPORTED
+  /* No EMAC IEEE-1588 hardware — bring up the software clock backend
+   * so the servo's frequency adjustment actually moves the local rate.
+   * Seed with current CLOCK_REALTIME so the very first inject_sync
+   * sees a familiar offset and goes through the standard jump path. */
+  struct timespec sw_init_ts;
+  clock_gettime(CLOCK_REALTIME, &sw_init_ts);
+  if (ptp_clock_sw_init(&sw_init_ts) == 0) {
+    s_use_sw_clock = true;
+    ptpinfo("SW clock backend active (no EMAC IEEE-1588)\n");
+  }
+#endif
 
   /* Daemon clockIdentity is sourced from the bootstrap port's MAC.
    * EUI-64 mapping per 802.1AS-2020 §8.5.2.2 (insert 0xff:0xfe in the
@@ -2187,11 +2219,16 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   double freq_scale = ((double)(remote_delta_ns /*+ tick_diff*/ + adj)) /
                       (double)local_delta_ns;
   long freq_ppb = (long)((freq_scale - 1.0) * 1e9);
-  struct timex tx = {
-      .modes = ADJ_FREQUENCY,
-      .freq = freq_ppb,
-  };
-  clock_adjtime(PTPD_CLOCK_ID, &tx);
+  if (s_use_sw_clock) {
+    /* SW backend caps at +/- 1e8 ppb; let it clamp by returning -1. */
+    ptp_clock_sw_adjtime_rate((int32_t)freq_ppb);
+  } else {
+    struct timex tx = {
+        .modes = ADJ_FREQUENCY,
+        .freq = freq_ppb,
+    };
+    clock_adjtime(PTPD_CLOCK_ID, &tx);
+  }
 
   state->remote_time_ns_prev = remote_time_ns;
   state->local_time_ns_prev = local_time_ns;
