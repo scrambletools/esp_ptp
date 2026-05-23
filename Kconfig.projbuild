@@ -69,7 +69,7 @@ menu "PTP Daemon Configuration"
 
             config NETUTILS_PTPD_PRIORITY1
                 int "PTP server priority1"
-                default 128
+                default 248
                 range 0 255
                 help
                     Set clock priority to announce when acting as a PTP server.
@@ -80,7 +80,7 @@ menu "PTP Daemon Configuration"
 
             config NETUTILS_PTPD_PRIORITY2
                 int "PTP server priority2"
-                default 128
+                default 248
                 range 0 255
                 help
                     Set clock subpriority to announce when acting as a PTP server.
@@ -139,15 +139,18 @@ menu "PTP Daemon Configuration"
 
             config NETUTILS_PTPD_SYNC_INTERVAL_MS
                 int "PTP server sync transmit interval (ms)"
-                default 1000
+                default 125
                 help
                     How often to transmit sync packets in server mode.
+                    Default 125 ms matches the 802.1AS default (logMessageInterval -3, 8 Hz).
 
             config NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS
                 int "PTP server announce transmit interval (ms)"
-                default 10000
+                default 1000
                 help
                     How often to transmit announce packets in server mode.
+                    Default 1000 ms matches the PreSonus SW5E switch (and the 802.1AS
+                    default of logMessageInterval 0).
 
             config NETUTILS_PTPD_TWOSTEP_SYNC
                 bool "PTP server sends two-step synchronization packets"
@@ -158,12 +161,25 @@ menu "PTP Daemon Configuration"
                     If gPTP profile is enabled, this setting is ignored (acts as y).
 
             config NETUTILS_PTPD_DELAYREQ_INTERVAL_MS
-                int "PTP server suggested interval of delay requests"
+                int "PTP path-delay (E2E) request interval (ms)"
                 default 16000
                 help
-                    When responding to a delay request, the server can inform the client
-                    how often it should test path delay. Default value is 16000 ms.
-                    If gPTP profle is enabled, this setting is ignored (interval = 1000 ms).
+                    Standard PTP path-delay (E2E) request interval. When responding
+                    to a Delay_Req the server uses this value to advertise the
+                    suggested interval back to the client. Used only when the
+                    delay mechanism is end-to-end (E2E).
+                    For peer-delay (P2P) — including the gPTP profile —
+                    see NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS instead.
+
+            config NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS
+                int "PTP peer-delay (P2P) request interval (ms)"
+                default 1000
+                help
+                    Peer-delay (P2P) request interval. Used by the gPTP profile
+                    (which is exclusively peer-delay) and by any standard-PTP
+                    deployment configured for P2P delay mechanism.
+                    Default 1000 ms matches the 802.1AS default
+                    (logMessageInterval 0).
 
         endif # NETUTILS_PTPD_SERVER
 

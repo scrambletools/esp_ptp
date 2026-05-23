@@ -1,30 +1,7 @@
-/*
+/* SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2020-2024 The Apache Software Foundation
- *
- * SPDX-License-Identifier: Apache-2.0
- *
  * SPDX-FileContributor: 2024 Espressif Systems (Shanghai) CO LTD
  */
-
-/****************************************************************************
- * apps/include/netutils/ptpd.h
- *
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.  The
- * ASF licenses this file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance with the
- * License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
- * License for the specific language governing permissions and limitations
- * under the License.
- *
- ****************************************************************************/
 
 #ifndef __APPS_INCLUDE_NETUTILS_PTPD_H
 #define __APPS_INCLUDE_NETUTILS_PTPD_H
@@ -37,40 +14,11 @@
 #define FAR
 #endif
 
-/****************************************************************************
- * Included Files
- ****************************************************************************/
-
-/****************************************************************************
- * Pre-processor Definitions
- ****************************************************************************/
-
-/****************************************************************************
- * Public Types
- ****************************************************************************/
-
 typedef enum
   {
     ptp_profile_standard = 0,
     ptp_profile_gptp = 1,
   } ptp_profile_e;
-
-/* Per-port medium and timing mechanism, named together because they
- * determine the on-wire protocol the daemon runs for this port.
- *
- *   eth_hwts — Ethernet medium with IEEE 1588 hardware timestamping
- *              and on-wire 802.1AS Sync / Follow_Up / Pdelay. The
- *              port owns an L2TAP socket bound to its interface and
- *              participates in the standard gPTP exchange.
- *
- *   wifi_ftm — Wi-Fi medium with peer-delay measured via IEEE
- *              802.11mc FTM and Sync transported in the SoftAP's
- *              802.11 Beacon Vendor IE. No L2TAP socket; the daemon
- *              dispatches FollowUpInformation through the registered
- *              sync_egress_cb on the AP side and accepts peer-delay
- *              samples via ptpd_inject_peer_delay() on the STA side.
- *              Whether this port measures FTM or just responds is
- *              derived from wifi_mode (STA initiates; AP responds). */
 
 typedef enum
   {
@@ -78,27 +26,17 @@ typedef enum
     ptp_port_medium_wifi_ftm = 1,
   } ptp_port_medium_e;
 
-/* Port-host-interface taxonomy. How the port is physically attached to
- * the host SoC — determines timestamp accuracy, latency floor, and
- * per-port admission budget. EMAC is the only category with hardware
- * timestamping; the rest fall back to software timestamping with
- * progressively worse jitter as you move down the list. */
-
 typedef enum
   {
-    ptp_port_host_if_emac  = 0,   /* on-chip MAC, RMII/RGMII; HW TS */
-    ptp_port_host_if_ahb   = 1,   /* on-chip peripheral on AHB (native Wi-Fi) */
-    ptp_port_host_if_sdio  = 2,   /* external coprocessor over SDIO */
-    ptp_port_host_if_spi   = 3,   /* external Eth/Wi-Fi chip over SPI */
-    ptp_port_host_if_usb   = 4,   /* USB-attached */
+    ptp_port_host_if_emac  = 0,
+    ptp_port_host_if_ahb   = 1,
+    ptp_port_host_if_sdio  = 2,
+    ptp_port_host_if_spi   = 3,
+    ptp_port_host_if_usb   = 4,
     ptp_port_host_if_other = 5,
   } ptp_port_host_if_e;
 
-/* Port type — the port's role in the gPTP / AVB topology. PRIMARY and
- * FAILOVER are endpoint-side; BRIDGED ports participate in an L2 bridge
- * with the other BRIDGED port(s) on the same entity. Any port being
- * BRIDGED implies the entity is in bridge mode. */
-
+/* BRIDGED on any port implies the entity is in bridge mode. */
 typedef enum
   {
     ptp_port_type_primary  = 0,
@@ -106,15 +44,12 @@ typedef enum
     ptp_port_type_bridged  = 2,
   } ptp_port_type_e;
 
-/* Wi-Fi mode for ports with medium=wifi. Numeric values match IDF's
- * WIFI_IF_STA=0 / WIFI_IF_AP=1 so the field can be cast directly when
- * calling esp_wifi_internal_tx. NONE is for non-wifi ports. */
-
+/* Values match IDF's WIFI_IF_STA=0 / WIFI_IF_AP=1 for direct casting. */
 typedef enum
   {
-    ptp_port_wifi_mode_sta  = 0,    /* joins external AP */
-    ptp_port_wifi_mode_ap   = 1,    /* hosts SoftAP */
-    ptp_port_wifi_mode_none = 0xFF, /* port is not wifi */
+    ptp_port_wifi_mode_sta  = 0,
+    ptp_port_wifi_mode_ap   = 1,
+    ptp_port_wifi_mode_none = 0xFF,
   } ptp_port_wifi_mode_e;
 
 typedef struct
@@ -194,10 +129,6 @@ struct ptpd_status_s
   struct timespec last_transmitted_delayreq;
 };
 
-/****************************************************************************
- * Public Data
- ****************************************************************************/
-
 #ifdef __cplusplus
 #define EXTERN extern "C"
 extern "C"
@@ -206,123 +137,40 @@ extern "C"
 #define EXTERN extern
 #endif
 
-/****************************************************************************
- * Public Function Prototypes
- ****************************************************************************/
-
-/****************************************************************************
- * Name: ptpd_start
- *
- * Description:
- *   Start the PTP daemon and bind it to specified interface.
- *
- * Input Parameters:
- *   interface - Name of the network interface to bind to, e.g. "eth0"
- *
- * Returned Value:
- *   On success, the non-negative task ID of the PTP daemon is returned;
- *   On failure, a negated errno value is returned.
- *
- ****************************************************************************/
-
+/* Start the PTP daemon on `interface`. Returns task ID or -errno. */
 int ptpd_start(FAR const char *interface);
 
-/****************************************************************************
- * Name: ptpd_start_port
- *
- * Description:
- *   Multi-port variant of ptpd_start(). Bootstraps the daemon if it
- *   isn't running yet (only an eth_hwts port can bootstrap today —
- *   the wifi_ftm path needs an existing daemon to attach to) and
- *   configures the addressed port with the given medium. The legacy
- *   ptpd_start() is equivalent to:
- *     ptpd_start_port(0, interface, ptp_port_medium_eth_hwts)
- *
- *   The medium determines the peer-delay mechanism: eth_hwts runs the
- *   on-wire Pdelay protocol, wifi_ftm derives peer-delay from FTM
- *   (STA-side, automatic) or operates as an FTM responder (AP-side,
- *   no peer-delay measurement). The choice is taken from
- *   port[port_index].wifi_mode set via Kconfig.
- *
- * Returned Value:
- *   On success, the non-negative task ID of the PTP daemon is returned;
- *   On failure, a negated errno value is returned.
- *
- ****************************************************************************/
-
+/* Multi-port variant: bootstraps the daemon on first call (only an
+ * eth_hwts port can bootstrap; wifi_ftm attaches to an existing
+ * daemon) and configures port_index with the given medium. */
 int ptpd_start_port(int port_index,
                     FAR const char *interface,
                     ptp_port_medium_e medium);
 
-/****************************************************************************
- * Name: ptpd_inject_peer_delay
- *
- * Description:
- *   Push an externally-measured peer-delay sample into the running
- *   daemon for a wifi_ftm port operating as STA. The value feeds the
- *   same averaging path that the on-wire pdelay handler uses on
- *   eth_hwts ports.
- *
- ****************************************************************************/
-
+/* Push an externally-measured peer-delay sample (e.g. FTM-derived
+ * on a wifi_ftm STA port) into the running averager. */
 int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns);
 
-/****************************************************************************
- * Name: ptpd_inject_sync
- *
- * Description:
- *   Push a marshalled FollowUpInformation TLV (per IEEE 802.1AS-2020
- *   §11.4.4 / §12.7) into the daemon for a port whose Sync transport
- *   is out-of-band (e.g. carried in an 802.11 beacon Vendor IE).
- *
- *   follow_up_info points to the FollowUpInformation byte buffer; len
- *   is the buffer length. Memory ownership stays with the caller.
- *
- ****************************************************************************/
-
+/* Push a marshalled FollowUpInformation TLV (IEEE 802.1AS-2020 §12.7)
+ * for ports whose Sync transport is out-of-band (e.g. beacon Vendor IE).
+ * Ownership of follow_up_info stays with the caller. */
 int ptpd_inject_sync(int port_index,
                      FAR const uint8_t *follow_up_info,
                      size_t len);
 
-/****************************************************************************
- * Name: ptpd_inject_sync_pair
- *
- * Description:
- *   Push a (remote_time, local_rxtime) pair directly into the servo,
- *   bypassing the §12.7 Follow_Up byte parser. For FTM-derived sync
- *   on wifi_ftm STA ports where the caller has already computed
- *   GM time at frame TX (remote_ns, from t1 + a bridge gPTP↔TSF
- *   mapping) and STA local-clock time at frame RX (local_ns, from
- *   the FTM entry's t2 back-projected onto the local SW clock).
- *
- *   Both timestamps are in nanoseconds since the PTP epoch on their
- *   respective clocks. The daemon treats the pair the same way it
- *   treats any (preciseOriginTimestamp, local_rxtime) drawn from a
- *   wired sync exchange — runs offset filter, peer-delay correction,
- *   PI servo, freq adjust.
- *
- *   Caller is responsible for choosing the timestamps so that they
- *   bracket the same wall-clock moment (modulo the propagation
- *   delay, which the daemon will subtract via port->peer_delay_ns).
- *
- ****************************************************************************/
-
+/* Push (remote_ns, local_ns) directly into the servo, bypassing the
+ * §12.7 byte parser. For FTM-derived sync where the caller has already
+ * resolved BTC time at TX and local time at RX. The pair must bracket
+ * the same wall-clock moment modulo peer_delay_ns (subtracted by the
+ * daemon). */
 int ptpd_inject_sync_pair(int port_index,
                           int64_t remote_ns,
                           int64_t local_ns);
 
-/****************************************************************************
- * Name: ptpd_register_sync_egress_cb
- *
- * Description:
- *   Register a callback invoked by the daemon whenever it would emit a
- *   gPTP Sync/Follow_Up on the addressed port. The callback receives a
- *   marshalled FollowUpInformation TLV; the application then carries
- *   that payload to the wire (e.g. by updating the AP's beacon Vendor
- *   IE on a Wi-Fi port). One callback per port; passing NULL clears.
- *
- ****************************************************************************/
-
+/* Register a callback fired whenever the daemon would emit a gPTP
+ * Sync/Follow_Up on port_index. The callback carries the marshalled
+ * FollowUpInformation TLV to the wire (e.g. beacon Vendor IE update).
+ * One callback per port; NULL clears. */
 typedef void (*ptpd_sync_egress_cb_t)(int port_index,
                                       FAR const uint8_t *follow_up_info,
                                       size_t len,
@@ -332,88 +180,25 @@ int ptpd_register_sync_egress_cb(int port_index,
                                  ptpd_sync_egress_cb_t cb,
                                  FAR void *ctx);
 
-/****************************************************************************
- * Name: ptpd_now
- *
- * Description:
- *   Read the PTP-disciplined system time. This is the primary clock
- *   surface for clients that previously called
- *   clock_gettime(CLOCK_PTP_SYSTEM, ts). On platforms where
- *   CLOCK_PTP_SYSTEM is backed by the EMAC IEEE-1588 hardware clock
- *   (ESP32-P4 with esp_eth_clock), the helper returns the same value
- *   that clockid would. On platforms without 1588 hardware (e.g.
- *   ESP32-C6) the helper sources time from a software-disciplined
- *   clock backed by esp_timer_get_time() — see ptp_clock_sw_init().
- *
- *   esp_ptp must stand alone — the helper is in the ptpd_* namespace,
- *   not avb_*. (esp_avb is the primary consumer; that context is
- *   captured here in the comment only.)
- *
- * Returned Value:
- *   On success returns 0 and writes the current PTP time into *ts.
- *   On failure returns -1 with errno set, matching clock_gettime().
- *
- ****************************************************************************/
-
+/* Read the PTP-disciplined system time. Equivalent to clock_gettime
+ * (CLOCK_PTP_SYSTEM) on platforms with EMAC 1588 hardware; sources
+ * from the software clock (esp_timer-backed) on platforms without. */
 int ptpd_now(FAR struct timespec *ts);
 
-/****************************************************************************
- * Name: ptpd_set_profile
- *
- * Description:
- *   Change the active PTP profile at runtime.
- *
- * Input Parameters:
- *   pid      - Process ID previously returned by ptpd_start()
- *   profile  - New PTP profile.
- *
- * Returned Value:
- *   On success, returns OK.
- *   On failure, a negated errno value is returned.
- *
- ****************************************************************************/
-
+/* Change the active PTP profile at runtime. */
 int ptpd_set_profile(int pid, ptp_profile_e profile);
 
-/****************************************************************************
- * Name: ptpd_status
- *
- * Description:
- *   Query status from a running PTP daemon.
- *
- * Input Parameters:
- *   pid     - Process ID previously returned by ptpd_start()
- *   status  - Pointer to storage for status information.
- *
- * Returned Value:
- *   On success, returns OK.
- *   On failure, a negated errno value is returned.
- *
- * Assumptions/Limitations:
- *   Multiple threads with priority less than CONFIG_NETUTILS_PTPD_SERVERPRIO
- *   can request status simultaneously. If higher priority threads request
- *   status simultaneously, some of the requests may timeout.
- *
- ****************************************************************************/
-
+/* Query daemon status. Threads with priority below
+ * CONFIG_NETUTILS_PTPD_SERVERPRIO may time out if higher-priority
+ * threads request status concurrently. */
 int ptpd_status(int pid, FAR struct ptpd_status_s *status);
 
-/****************************************************************************
- * Name: ptpd_stop
- *
- * Description:
- *   Stop PTP daemon
- *
- * Input Parameters:
- *   pid     - Process ID previously returned by ptpd_start()
- *
- * Returned Value:
- *   On success, returns OK.
- *   On failure, a negated errno value is returned.
- *
- ****************************************************************************/
-
 int ptpd_stop(int pid);
+
+/* True if port_index is enabled and its link/association is up.
+ * Defaults to true on a freshly bootstrapped port so the first TX
+ * cycle isn't dropped before the first link event fires. */
+bool ptpd_port_link_up(int port_index);
 
 #undef EXTERN
 #ifdef __cplusplus

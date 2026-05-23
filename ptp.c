@@ -56,13 +56,9 @@
 #include "ptp.h"
 #include "ptp_clock_sw.h"
 
-/* Set true after ptp_clock_sw_init() succeeds — routes ptp_gettime /   */
-/* ptp_settime / ptp_adjtime and the freq-adjust path through the SW   */
-/* clock backend instead of POSIX. Chips without EMAC IEEE 1588        */
-/* (e.g. ESP32-C6) have no working clock_adjtime(CLOCK_REALTIME,       */
-/* ADJ_FREQUENCY) in IDF; the SW backend re-anchors against            */
-/* esp_timer_get_time() with a rate offset and is the only way the     */
-/* servo can actually move the local clock rate on those chips.        */
+/* True once ptp_clock_sw_init() succeeds; routes time ops through the
+ * SW clock backend. On C6 this is the only path that can actually move
+ * the local clock rate (no working clock_adjtime(ADJ_FREQUENCY)). */
 static bool s_use_sw_clock = false;
 
 #include "esp_err.h"
@@ -99,9 +95,14 @@ static bool s_use_sw_clock = false;
 
 #define ETH_TYPE_PTP 0x88F7
 
-/* Lateness diagnostic — detects when ptpd is starved by higher-priority
- * tasks. If pdelay exchange misses exceed 3 in a row the upstream bridge
- * declares the link asCapable=false and stops forwarding sync. */
+/* Lateness diagnostic: 3+ missed pdelay exchanges in a row makes
+ * strict-1AS upstream bridges drop asCapable. */
+/* Pdelay_Req emission is driven from esp_timer (priority 22, IRAM)
+ * rather than the main poll() loop to keep cadence tight enough for
+ * strict-1AS evaluators. */
+static esp_timer_handle_t s_pdelay_req_timer = NULL;
+static void pdelay_req_timer_cb(void *arg);
+
 static int64_t s_ptpd_last_loop_us = 0;
 static int64_t s_ptpd_loop_max_gap_us = 0;
 static int64_t s_ptpd_last_report_us = 0;
@@ -110,10 +111,7 @@ static uint32_t s_ptpd_tx_req_total = 0;
 static uint32_t s_ptpd_tx_req_late = 0;
 static int64_t s_ptpd_tx_req_late_max_us = 0;
 
-/* Per-message-type RX counters. Incremented in ptp_process_rx_packet for
- * each successfully-dispatched packet. Reset per report window so we can
- * compare against wire captures: expected ~80 syncs + ~80 follow-ups +
- * ~10 announces + ~1 pdelay_req/resp/fup each over a 10 s window. */
+/* Per-message-type RX counters, reset each report window. */
 static uint32_t s_ptpd_rx_sync = 0;
 static uint32_t s_ptpd_rx_followup = 0;
 static uint32_t s_ptpd_rx_announce = 0;
@@ -206,8 +204,6 @@ static void ptpd_lateness_tick(void) {
 #define NSEC_PER_MSEC 1000000ll
 #define NSEC_PER_SEC 1000000000ll
 
-// gPTP required values
-#define GPTP_DELAYREQ_INTERVAL_MS 1000
 #define CONFIG_CLOCK_ADJTIME_PERIOD_MS (CONFIG_ETH_CLOCK_ADJTIME_PERIOD_MS)
 #define CONFIG_CLOCK_ADJTIME_SLEWLIMIT_PPM                                     \
   (CONFIG_ETH_CLOCK_ADJTIME_SLEWLIMIT_PPB / 1000)
@@ -227,6 +223,9 @@ static void ptpd_lateness_tick(void) {
 #endif
 #ifndef CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS
 #define CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS 16000
+#endif
+#ifndef CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS
+#define CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS 1000
 #endif
 #ifndef CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS
 #define CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS 250
@@ -273,25 +272,8 @@ struct ptpd_statusreq_s {
 
 /* Main PTPD state storage */
 
-/* Multi-port scaffolding. Per-port state lives in ptp_port_s; per-port
- * accesses go through state->port[i]. With CONFIG_ESP_PTP_NUM_PORTS=1
- * (the default) the only port is port[0] and its config is fixed to
- * { ethernet, gptp_wire } so historical single-port behavior is
- * preserved.
- *
- * esp_ptp must stand alone — no identifier in this struct refers to any
- * higher-level protocol by name. (The intended consumer is an AVB stack,
- * but that context is captured in comments only.) */
-
 #define PTP_PDELAY_RESP_MAX_TRACKED 4
 
-/* Bootstrap arguments passed from ptpd_start / ptpd_start_port to the
- * daemon task on creation. Heap-allocated by the start function,
- * consumed and freed by ptp_daemon after ptp_initialize_state copies
- * what it needs. Encodes which port the daemon is bootstrapping on,
- * its medium, and the interface label so ptp_initialize_state can
- * dispatch to the correct per-medium init helper without baking in
- * any port-index assumption. */
 struct ptp_bootstrap_args_s {
   int port_index;
   ptp_port_medium_e medium;
@@ -308,9 +290,12 @@ struct ptp_port_s {
   uint32_t link_speed_mbps;         /* nominal PHY-rate cap */
   char interface_name[16];
 
-  /* Egress callback for ports whose Sync transport is out-of-band
-   * (e.g. an AP that publishes FollowUpInformation in a beacon Vendor
-   * IE). NULL on ports that use on-wire IEEE 1588 / 802.1AS frames. */
+  /* Link state, queryable via ptpd_port_link_up(). Defaults true so
+   * the first TX cycle isn't suppressed before the first link event. */
+  bool link_up;
+
+  /* Egress callback for out-of-band Sync transports (e.g. beacon
+   * Vendor IE). NULL on on-wire 802.1AS ports. */
   ptpd_sync_egress_cb_t sync_egress_cb;
   FAR void *sync_egress_ctx;
 
@@ -427,6 +412,7 @@ struct ptp_state_s {
 
   bool gptp_fallback_done;
   bool eth_event_handler_registered;
+  bool wifi_event_handler_registered;
 
 };
 
@@ -480,6 +466,34 @@ static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
   ptpinfo("Armed profile fallback evaluation\n");
 }
 
+/* Find the first port whose medium matches; returns -1 if none. The
+ * event-handler use case currently assumes at most one wired and one
+ * Wi-Fi port on a given device — true for both bridge and endpoint
+ * builds today. Multi-instance ETH or Wi-Fi would need the event
+ * data's handle/interface to disambiguate. */
+static int ptp_find_port_by_medium(FAR struct ptp_state_s *state,
+                                   ptp_port_medium_e medium) {
+  for (int i = 0; i < CONFIG_ESP_PTP_NUM_PORTS; ++i) {
+    if (state->port[i].enabled && state->port[i].medium == medium) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void ptp_set_port_link(FAR struct ptp_state_s *state, int port_index,
+                              bool up) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    return;
+  }
+  struct ptp_port_s *p = &state->port[port_index];
+  if (p->link_up == up) {
+    return;
+  }
+  p->link_up = up;
+  ptpinfo("port %d link %s\n", port_index, up ? "up" : "down");
+}
+
 static void ptp_eth_event_handler(void *arg, esp_event_base_t event_base,
                                   int32_t event_id, void *event_data) {
   UNUSED(event_base);
@@ -490,11 +504,56 @@ static void ptp_eth_event_handler(void *arg, esp_event_base_t event_base,
     return;
   }
 
+  int port = ptp_find_port_by_medium(state, ptp_port_medium_eth_hwts);
+
   if (event_id == ETHERNET_EVENT_CONNECTED) {
+    ptp_set_port_link(state, port, true);
     /* A link-up event starts a new "startup" window. Resume in the current
      * profile; if that profile is gPTP, require one PDelay_Resp again. */
     ptp_arm_profile_fallback(state);
   } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
+    ptp_set_port_link(state, port, false);
+  }
+}
+
+static void ptp_wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                   int32_t event_id, void *event_data) {
+  UNUSED(event_base);
+  UNUSED(event_data);
+  FAR struct ptp_state_s *state = (FAR struct ptp_state_s *)arg;
+  if (!state) {
+    return;
+  }
+  /* STA association drives link_up on STA ports; AP is treated as
+   * always-up once AP_START fires. */
+  int port = ptp_find_port_by_medium(state, ptp_port_medium_wifi_ftm);
+  if (port < 0) {
+    return;
+  }
+  struct ptp_port_s *p = &state->port[port];
+  switch (event_id) {
+  case WIFI_EVENT_STA_CONNECTED:
+    if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+      ptp_set_port_link(state, port, true);
+    }
+    break;
+  case WIFI_EVENT_STA_DISCONNECTED:
+    if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+      ptp_set_port_link(state, port, false);
+    }
+    break;
+  case WIFI_EVENT_AP_START:
+    if (p->wifi_mode == ptp_port_wifi_mode_ap) {
+      ptp_set_port_link(state, port, true);
+    }
+    break;
+  case WIFI_EVENT_AP_STOP:
+    if (p->wifi_mode == ptp_port_wifi_mode_ap) {
+      ptp_set_port_link(state, port, false);
+    }
+    break;
+  default:
+    break;
   }
 }
 
@@ -514,8 +573,10 @@ static void ptp_reset_for_profile(FAR struct ptp_state_s *state) {
   ptp_clean_after_step(state);
 
   if (ptp_is_gptp(state)) {
-    state->port[0].delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
-    state->port[0].next_delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
+    state->port[0].delayreq_interval_ms =
+        CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS;
+    state->port[0].next_delayreq_interval_ms =
+        CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS;
   } else {
     state->port[0].delayreq_interval_ms =
         CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
@@ -885,13 +946,7 @@ static int ptp_adjtime(FAR struct ptp_state_s *state, int64_t delta_ns) {
 }
 
 
-/* Translate the per-port Kconfig topology knobs (MEDIUM / HOST_IF /
- * TYPE / WIFI_MODE / LINK_SPEED_MBPS) into the runtime ptp_port_s.
- * Called from ptp_initialize_state after port[0] has been seeded with
- * interface/socket. esp_avb reads these same Kconfig knobs via its
- * own mirror — esp_ptp keeps its copy so internal decisions (timestamp
- * source, sync-interval scaling for non-EMAC ports) can use them
- * without depending on esp_avb. */
+/* Translate per-port Kconfig topology knobs into runtime ptp_port_s. */
 static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
   /* ---- Port 0 ---- */
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_ETH_HWTS)
@@ -975,14 +1030,9 @@ static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
 }
 
 
-/* Per-medium port initialisation. Each helper assumes the caller has
- * already filled the port's enabled/medium/interface_name/wifi_mode
- * fields (the wifi_mode comes from ptp_apply_port_topology_kconfig).
- * The helper performs medium-specific work — opening sockets and
- * registering driver hooks for eth_hwts, fetching the radio MAC for
- * wifi_ftm — and writes intf_hw_addr. Used by ptp_initialize_state on
- * the bootstrap port AND by ptpd_start_port's attach branch for
- * additional ports added to a running daemon. */
+/* Per-medium port initialisation. Caller has filled
+ * enabled/medium/interface_name/wifi_mode; helper fills intf_hw_addr
+ * and any medium-specific resources. */
 
 static int ptp_port_init_eth_hwts(FAR struct ptp_state_s *state, int port_index,
                                   FAR const char *interface) {
@@ -1035,11 +1085,7 @@ static int ptp_port_init_eth_hwts(FAR struct ptp_state_s *state, int port_index,
   SET_MAC_ADDR(dest_addr, 0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E);
   esp_eth_ioctl(eth_handle, ETH_CMD_ADD_MAC_FILTER, dest_addr);
 
-  /* Eth-link events drive gPTP link-up fallback detection. The
-   * handler is registered once per daemon (re-registration on a
-   * second eth_hwts port would be a no-op or error from the event
-   * loop); the eth_event_handler_registered flag prevents double-
-   * registration when more than one eth_hwts port comes up. */
+  /* Register the ETH_EVENT handler once per daemon. */
   if (!state->eth_event_handler_registered) {
     if (esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
                                    ptp_eth_event_handler, state) == ESP_OK) {
@@ -1081,13 +1127,22 @@ static int ptp_port_init_wifi_ftm(FAR struct ptp_state_s *state, int port_index,
     return ERROR;
   }
 
+  /* Drive link_up from STA_{CONNECTED,DISCONNECTED} and AP_{START,STOP}. */
+  if (!state->wifi_event_handler_registered) {
+    if (esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                   ptp_wifi_event_handler, state) == ESP_OK) {
+      state->wifi_event_handler_registered = true;
+    } else {
+      ptpwarn("port %d: failed to register WIFI_EVENT handler; link_up "
+              "will stay at its default — consumers querying "
+              "ptpd_port_link_up() may not back off TX during outages\n",
+              port_index);
+    }
+  }
+
   return OK;
 }
 
-/* Initialise daemon-wide state and bootstrap the addressed port. The
- * port_index, medium and interface come from the heap-allocated
- * ptp_bootstrap_args_s the caller (ptpd_start / ptpd_start_port)
- * handed to the daemon task. */
 static int ptp_initialize_state(FAR struct ptp_state_s *state,
                                 FAR const struct ptp_bootstrap_args_s *args) {
   if (args->port_index < 0 ||
@@ -1111,17 +1166,15 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
 #endif
   ptp_reset_for_profile(state);
 
-  /* Per-port topology (host_if, type, wifi_mode, link_speed_mbps) for
-   * ALL ports from Kconfig. esp_avb mirrors these knobs; esp_ptp's
-   * copy informs ptpd's own decisions (timestamp accuracy, sync
-   * cadence). Runs before per-medium init so the helpers can read
-   * wifi_mode etc. on the bootstrap port. */
+  /* Per-port topology from Kconfig; runs before per-medium init so
+   * helpers can read wifi_mode etc. on the bootstrap port. */
   ptp_apply_port_topology_kconfig(state);
 
   /* Seed the bootstrap port's API-level config — the runtime fields
    * (intf_hw_addr, ptp_socket) are filled by the medium helper. */
   struct ptp_port_s *p = &state->port[args->port_index];
   p->enabled = true;
+  p->link_up = true; /* updated by event handlers below */
   p->medium = args->medium;
   strncpy(p->interface_name, args->interface,
           sizeof(p->interface_name) - 1);
@@ -1191,6 +1244,25 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
 
   s_state = state;
 
+  /* Run Pdelay_Req from esp_timer so the main poll loop can't starve
+   * it; strict-1AS evaluators reject the resulting jitter. */
+  if (ptp_is_gptp(state) &&
+      args->medium == ptp_port_medium_eth_hwts) {
+    esp_timer_create_args_t timer_args = {
+        .callback = pdelay_req_timer_cb,
+        .arg = state,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pdelay_req",
+    };
+    if (esp_timer_create(&timer_args, &s_pdelay_req_timer) == ESP_OK) {
+      /* First fire in 100 ms; the callback re-arms with the current
+       * next_delayreq_interval_ms after each emission. */
+      esp_timer_start_once(s_pdelay_req_timer, 100 * 1000);
+    } else {
+      ESP_LOGW(TAG, "esp_timer_create failed for pdelay_req");
+    }
+  }
+
   ptpinfo("PTP daemon started in %s mode on port %d medium=%s\n",
           ptp_is_gptp(state) ? "gPTP" : "standard", args->port_index,
           args->medium == ptp_port_medium_eth_hwts ? "eth_hwts"
@@ -1201,6 +1273,11 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
 /* Unsubscribe multicast and destroy sockets */
 
 static int ptp_destroy_state(FAR struct ptp_state_s *state) {
+  if (s_pdelay_req_timer != NULL) {
+    esp_timer_stop(s_pdelay_req_timer);
+    esp_timer_delete(s_pdelay_req_timer);
+    s_pdelay_req_timer = NULL;
+  }
   if (state->eth_event_handler_registered) {
     esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID,
                                  ptp_eth_event_handler);
@@ -1383,48 +1460,15 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   return ret;
 }
 
-/* Build the bytes that go into the §12.7 VendorSpecific information
- * element of an FTM/TM frame (or, in our case, the Beacon Vendor IE
- * the bridge uses as a workaround carrier — see ptp_beacon_ie.c and
- * the §12 deviation note in ESP-AVB-Bridge/project.md).
+/* Marshal a 76-byte §12.7 FollowUpInformation: 34-byte common
+ * header + 10-byte preciseOriginTimestamp + 32-byte FU TLV.
  *
- * Per §12.7: "the master state machine communicates an entire
- * Follow_Up message [i.e., including all the fields of the common
- * header (see 11.4.2 and 10.6.2), the preciseOriginTimestamp, and
- * all the fields of the Follow_Up information TLV (see 11.4.4)]
- * using this mechanism." The wire bytes match a normal 802.1AS
- * Follow_Up frame body (76 bytes): 34-byte common header + 10-byte
- * preciseOriginTimestamp + 32-byte FollowUpInformation TLV.
- *
- * Design choice — regenerate, don't forward.
- * The standard time-aware bridge model (§11.2.13) FORWARDS the
- * upstream Sync: keeps the upstream preciseOriginTimestamp,
- * accumulates residence time into correctionField. We instead
- * REGENERATE: preciseOriginTimestamp = ptpd_now() (our local
- * PTP-disciplined clock, which the wired-side PI servo has already
- * brought into the GM time domain). Equivalent under perfect lock —
- * both give the STA the same effective GM time — but simpler and
- * doesn't need separate residence-time accounting. The corollary
- * fields all carry zero by design:
- *   - correctionField = 0: the preciseOriginTimestamp is already
- *     GM-time (corrected by our local servo), no residence-time
- *     accumulation needed.
- *   - cumulativeScaledRateOffset = 0: our published time advances
- *     at GM rate (our local clock's drift is absorbed by the servo
- *     before we publish), so the rate offset is nominally zero.
- *   - gmTimeBaseIndicator / lastGmPhaseChange / scaledLastGmFreqChange
- *     = 0: ptpd doesn't yet track GM-reselection events. Add when
- *     BTCA reselection plumbing exists.
- *   - sequenceId = 0: the §12 model on Wi-Fi doesn't pair-match
- *     Sync/Follow_Up like the wired path (no separate Sync frame).
- *     STAs that want beacon-loss tracking can add a per-marshal
- *     counter.
- *
- * GM identity:
- *   The header's sourceClockIdentity is the upstream BTC's
- *   clockIdentity (state->selected_source.btc_identity) when we are
- *   synced upstream, so STAs see the wired GM in Hive; falls back
- *   to our own identity when we are the GM. */
+ * We REGENERATE rather than forward (the §11.2.13 bridge model):
+ * preciseOriginTimestamp = ptpd_now(), which the wired-side servo
+ * has already brought into the BTC time domain. Equivalent under
+ * lock; avoids residence-time accounting. Corollary fields
+ * (correctionField, cumulativeScaledRateOffset, gmTimeBaseIndicator,
+ * lastGmPhaseChange, scaledLastGmFreqChange, sequenceId) are zero. */
 static void ptp_marshal_follow_up_for_beacon_ie(
     FAR struct ptp_state_s *state, FAR struct ptp_follow_up_s *out) {
   memset(out, 0, sizeof(*out));
@@ -1443,10 +1487,7 @@ static void ptp_marshal_follow_up_for_beacon_ie(
     out->header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
   }
 
-  /* sourceClockIdentity: upstream BTC if we are synced, else our own.
-   * Without this override STAs see the bridge's MAC as the GM, which
-   * Hive shows as `grandmaster_id` and the user-facing graph misses
-   * the actual upstream BTC (e.g. MOTU 8D). */
+  /* sourceClockIdentity: upstream BTC if synced, else our own. */
   if (state->selected_source_valid) {
     memcpy(out->header.sourceidentity,
            state->selected_source.btc_identity,
@@ -1560,16 +1601,23 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
 
   memset(&req, 0, sizeof(req));
   req.header = state->own_identity.header;
-  req.header.logmessageinterval =
-      msec_to_log_period(state->port[0].delayreq_interval_ms);
+  /* gPTP: 0x7F "no change / unspecified" sentinel per 802.1AS
+   * §11.4.5.3 + IEEE 1588-2008 §7.7.2.1. */
+  if (ptp_is_gptp(state)) {
+    req.header.logmessageinterval = 0x7F;
+  } else {
+    req.header.logmessageinterval =
+        msec_to_log_period(state->port[0].delayreq_interval_ms);
+  }
 
   if (ptp_is_gptp(state)) {
     req.header.messagetype = PTP_MSGTYPE_PDELAY_REQ | PTP_MSGTYPE_SDOID_GPTP;
     req.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
     req.header.controlfield = 5;
     req_len = sizeof(struct ptp_pdelay_req_s);
-    /* Append AVB Lite Endpoint Declaration TLV (profiles/avb_lite.md §2.1) */
-    req_len += ptp_append_endpoint_decl_tlv(req.raw, req_len);
+    /* Skip AVB Lite Endpoint Declaration TLV: strict 1AS evaluators
+     * (PreSonus SW5E) refuse asCapable on TLV-bearing pdelay frames. */
+    /* req_len += ptp_append_endpoint_decl_tlv(req.raw, req_len); */
     /* Reset per-cycle responder set so the §2.2 cond 3 (cardinality) check
      * sees only the responders for this single Pdelay_Req. */
     state->port[0].pdelay_resp_responder_count = 0;
@@ -1601,6 +1649,44 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
   }
 
   return ret;
+}
+
+/* Timer callback: send one Pdelay_Req then re-arm at the current
+ * next_delayreq_interval_ms. Runs in esp_timer task (priority 22, in
+ * IRAM) so the cadence is independent of PTPD main-loop scheduling. */
+static IRAM_ATTR void pdelay_req_timer_cb(void *arg) {
+  FAR struct ptp_state_s *state = (FAR struct ptp_state_s *)arg;
+  if (state == NULL || state->stop) {
+    return;
+  }
+  /* Only emit Pdelay_Req if conditions match the original loop check. */
+  if (state->port[0].enabled &&
+      state->port[0].medium == ptp_port_medium_eth_hwts &&
+      state->port[0].ptp_socket >= 0 &&
+      (ptp_is_gptp(state) ||
+       (state->selected_source_valid && state->port[0].can_send_delayreq))) {
+    /* Record lateness against the planned interval for the diagnostic. */
+    if (state->port[0].last_transmitted_delayreq.tv_sec != 0) {
+      struct timespec time_now;
+      struct timespec delta;
+      clock_gettime(CLOCK_MONOTONIC, &time_now);
+      clock_timespec_subtract(&time_now,
+                              &state->port[0].last_transmitted_delayreq, &delta);
+      int64_t late_ms = (int64_t)timespec_to_ms(&delta) -
+                        (int64_t)state->port[0].next_delayreq_interval_ms;
+      if (late_ms > 0) {
+        ptpd_lateness_record_tx(late_ms * 1000LL);
+      }
+    }
+    ptp_send_delay_req(state);
+  }
+  /* Re-arm with the current interval (updated when Pdelay_Resp arrives). */
+  uint32_t interval_us =
+      (uint32_t)state->port[0].next_delayreq_interval_ms * 1000U;
+  if (interval_us < 100000U) {
+    interval_us = 1000000U; /* fallback if uninitialised */
+  }
+  esp_timer_start_once(s_pdelay_req_timer, interval_us);
 }
 
 static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
@@ -1657,13 +1743,8 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
   /* If there is no better timetransmitter clock on the network,
    * act as the reference source and send server packets. */
 
-  /* The "I am GM" path emits Announce + Sync via port[0]'s L2TAP socket
-   * (ptp_send_announce / ptp_send_sync both write to
-   * state->port[0].ptp_socket). That socket only exists on an eth_hwts
-   * port. Skip this whole block if port[0] isn't socket-backed —
-   * otherwise sendto returns EBADF on every cadence tick. wifi_ftm
-   * ports advertise time via the §12.7 Vendor IE through the
-   * sync_egress_cb loop further down, which has its own gating. */
+  /* "I am BTC" Announce + Sync via port[0]'s L2TAP socket; only valid
+   * on an eth_hwts port. wifi_ftm uses the egress-cb path below. */
   if (!state->selected_source_valid &&
       state->port[0].enabled &&
       state->port[0].medium == ptp_port_medium_eth_hwts &&
@@ -1688,16 +1769,9 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
   }
 #endif /* CONFIG_NETUTILS_PTPD_SERVER */
 
-  /* Sync emission on wifi_ftm ports. Independent of selected_source_valid:
-   * on a transparent time-aware bridge the wifi_ftm AP port republishes
-   * upstream Sync at the configured cadence; when we are the GM the same
-   * cadence applies and the payload reflects our own clock. Skipped when
-   * no egress callback is registered.
-   *
-   * Payload is the §12.7 VendorSpecific IE "FollowUpInformation" — which
-   * per §12.7 is the entire Follow_Up message (header + preciseOrigin-
-   * Timestamp + FollowUpInformation TLV, 76 bytes), packed in exactly
-   * the same format as the wired Follow_Up frame. */
+  /* Sync emission on wifi_ftm ports via the §12.7 FollowUpInformation
+   * IE. Runs regardless of selected_source_valid (bridge republishes
+   * upstream; BTC publishes own). */
   for (int p = 0; p < CONFIG_ESP_PTP_NUM_PORTS; p++) {
     struct ptp_port_s *port = &state->port[p];
     if (!port->enabled) continue;
@@ -1718,42 +1792,10 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
                          port->sync_egress_ctx);
   }
 
-#if defined(CONFIG_NETUTILS_PTPD_SEND_DELAYREQ) ||                             \
-    defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
-  /* Delay_Req / Pdelay_Req TX also writes through port[0]'s L2TAP
-   * socket. Skip on wifi_ftm-only deployments — peer-delay there is
-   * out-of-band via FTM + ptpd_inject_peer_delay, not on-wire. */
-  if ((ptp_is_gptp(state) ||
-       (state->selected_source_valid && state->port[0].can_send_delayreq)) &&
-      state->port[0].enabled &&
-      state->port[0].medium == ptp_port_medium_eth_hwts &&
-      state->port[0].ptp_socket >= 0) {
-    struct timespec time_now;
-    struct timespec delta;
-
-    clock_gettime(CLOCK_MONOTONIC, &time_now);
-    clock_timespec_subtract(&time_now,
-                            &state->port[0].last_transmitted_delayreq, &delta);
-    if (timespec_to_ms(&delta) > state->port[0].next_delayreq_interval_ms) {
-      /* Skip the first tx (last_transmitted_delayreq == 0) so startup
-       * isn't counted as "late". */
-      if (state->port[0].last_transmitted_delayreq.tv_sec != 0) {
-        int64_t late_ms = (int64_t)timespec_to_ms(&delta) -
-                          (int64_t)state->port[0].next_delayreq_interval_ms;
-        ptpd_lateness_record_tx(late_ms * 1000LL);
-      }
-      ptp_send_delay_req(state);
-    }
-  }
-#endif // CONFIG_NETUTILS_PTPD_SEND_DELAYREQ ||
-       // CONFIG_NETUTILS_PTPD_GPTP_PROFILE
-
-  /* Post-fallback endpoint beacon (profiles/avb_lite.md §2.3): once we've
-   * fallen back to standard PTP, periodically emit a Pdelay_Req-with-TLV
-   * to the gPTP bridge-group MAC so peers still in gPTP can detect us and
-   * follow us into the standard profile. Cadence is 3 s, matching the
-   * §2.2 evaluation window so any peer's window is guaranteed to overlap
-   * at least one beacon. */
+  /* Post-fallback endpoint beacon (profiles/avb_lite.md §2.3): after
+   * fallback to standard PTP, periodically emit Pdelay_Req-with-TLV to
+   * the gPTP bridge-group MAC so gPTP peers can detect us and follow.
+   * 3 s cadence matches the §2.2 evaluation window. */
 
   /* Endpoint-fallback beacon — only on eth_hwts with a socket. */
   if (state->gptp_fallback_done && state->ptp_profile == ptp_profile_standard &&
@@ -2049,15 +2091,22 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
          sizeof(resp.delay_resp.reqportindex));
   memcpy(resp.header.sequenceid, req->header.sequenceid,
          sizeof(resp.header.sequenceid));
-  // this is typically ignored in a response, except in the case of gPTP
-  resp.header.logmessageinterval =
-      msec_to_log_period(CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS);
-
-  /* Append AVB Lite Endpoint Declaration TLV to gPTP Pdelay_Resp
-   * (profiles/avb_lite.md §2.1) */
+  /* gPTP requires the 0x7F "no change" sentinel here per IEEE
+   * 1588-2008 §13.6.2.2 and 802.1AS-2011 §11.4.5.4 / §11.4.5.5;
+   * neither message dictates the requester's Pdelay_Req cadence.
+   * Pdelay_Resp_Follow_Up inherits the value from this header. */
   if (ptp_is_gptp(state)) {
-    resp_len += ptp_append_endpoint_decl_tlv(resp.raw, resp_len);
+    resp.header.logmessageinterval = 0x7F;
+  } else {
+    resp.header.logmessageinterval =
+        msec_to_log_period(CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS);
   }
+
+  /* Skip TLV on Pdelay_Resp emitted to the bridge multicast — SW5E
+   * asCapable rejects non-standard wire shape. */
+  /* if (ptp_is_gptp(state)) {
+   *   resp_len += ptp_append_endpoint_decl_tlv(resp.raw, resp_len);
+   * } */
   resp.header.messagelength[1] = resp_len;
 
   /* Send the response message */
@@ -2083,9 +2132,12 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
     resp.header.messagetype = PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP;
     resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
     size_t fup_len = sizeof(struct ptp_delay_resp_follow_up_s);
-    fup_len += ptp_append_endpoint_decl_tlv(resp.raw, fup_len);
+    /* Skip TLV on FUp — see Pdelay_Resp rationale above. */
+    /* fup_len += ptp_append_endpoint_decl_tlv(resp.raw, fup_len); */
     resp.header.messagelength[1] = fup_len;
-    resp.header.flags[0] = 0; // Reset 2-step flag
+    /* Clear PTP_TWO_STEP — nothing follows the Pdelay_Resp_Follow_Up
+     * (IEEE 1588-2008 §13.3.2.6). */
+    resp.header.flags[0] = 0;
 
     /* Send the response follow-up message, currently only for ESP as it
      * requires hw timestamp data */
@@ -2181,13 +2233,14 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
     }
   }
 
-  /* Calculate interval until next packet */
-  if (msg->header.logmessageinterval <= 12) {
-    state->port[0].delayreq_interval_ms =
-        log_period_to_msec(msg->header.logmessageinterval);
-  } else {
-    state->port[0].delayreq_interval_ms =
-        CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
+  /* logmessageinterval is signed int8, log2(seconds). Valid per IEEE
+   * 1588-2008 Annex F.4 is -8..+8. The 0x7F sentinel ("no change") and
+   * any other out-of-range value leave the per-profile default
+   * unchanged (set by ptp_initialize_state from PDELAYREQ/DELAYREQ
+   * Kconfig). */
+  int8_t logmsg = (int8_t)msg->header.logmessageinterval;
+  if (logmsg >= -8 && logmsg <= 8) {
+    state->port[0].delayreq_interval_ms = log_period_to_msec(logmsg);
   }
 
   /* Randomize delay for next interval */
@@ -2229,24 +2282,7 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
     return OK;
   }
 
-  /* In gPTP (802.1AS), delay is measured between peers, not
-  * between the server and the client. It is calculated as follows:
-
-     Peer A                          Peer B
-     |                                    |
-     |          Peer delay_req            |
-  t1 |----------------------------------->| t2
-     |                                    |
-     |        Peer delay_resp (t2)        |
-  t4 |<-----------------------------------| t3
-     |                                    |
-     |   Peer delay_resp_follow_up (t3)   |
-     |<-----------------------------------|
-
-    Peer A calculates peer_delay = ((t4 - t1) - (t3 - t2))/2
-  */
-
-  /* Calculate peer delay */
+  /* gPTP peer_delay = ((t4 - t1) - (t3 - t2)) / 2 */
 
   peer_delay_roundtrip = timespec_delta_ns(
       &state->port[0].twostep_delay_resp_rxtime, &state->port[0].delayreq_time);
@@ -2603,6 +2639,7 @@ int ptpd_start_port(int port_index, FAR const char *interface,
   /* Attach to running daemon. */
   struct ptp_port_s *p = &s_state->port[port_index];
   p->enabled = true;
+  p->link_up = true; /* updated by event handlers */
   p->medium = medium;
   if (interface != NULL) {
     strncpy(p->interface_name, interface, sizeof(p->interface_name) - 1);
@@ -2646,21 +2683,15 @@ int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
   if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
     return -EINVAL;
   }
-  /* Sanity-bound — single Wi-Fi RTT/2 is typically tens of µs; values
-   * outside the standard wired bound suggest a measurement anomaly
-   * (multipath, association handoff). Discard. */
+  /* Discard out-of-band samples (multipath / handoff). */
   if (peer_delay_ns < 0 ||
       peer_delay_ns >= CONFIG_NETUTILS_PTPD_MAX_PEER_DELAY_NS) {
     return -ERANGE;
   }
   struct ptp_port_s *p = &s_state->port[port_index];
 
-  /* Running average — same shape as the wired Pdelay handler at
-   * ptp_process_delay_resp_followup (~line 2728). Caps the average
-   * window at CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT samples, which
-   * lets ptp_update_local_clock read a smoothed value via
-   * port->peer_delay_ns without each FTM burst's jitter showing up
-   * as a clock-jump. */
+  /* Running average over DELAYREQ_AVGCOUNT samples; smoothed value
+   * read via port->peer_delay_ns. */
   if (p->peer_delay_avgcount < CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT) {
     p->peer_delay_avgcount++;
   }
@@ -2681,16 +2712,8 @@ int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
     return -EINVAL;
   }
 
-  /* The §12.7 IE payload IS an entire 802.1AS Follow_Up message —
-   * header + preciseOriginTimestamp + FollowUpInformation TLV. We
-   * receive it via the on-air carrier (Beacon Vendor IE, per the
-   * carrier deviation documented in ESP-AVB-Bridge/project.md) at
-   * some point AFTER the actual master TX. The receive instant is
-   * "now" — t2 in §12.1.2 terms — and the FollowUpInformation
-   * carries t1 (preciseOriginTimestamp). Peer-delay correction is
-   * applied inside ptp_update_local_clock from port->peer_delay_ns,
-   * which FTM injection will populate once the STA-side FTM client
-   * is wired up. */
+  /* The §12.7 IE payload IS an entire 802.1AS Follow_Up message.
+   * RX instant is "now" (t2); preciseOriginTimestamp is t1. */
   const struct ptp_follow_up_s *fu =
       (const struct ptp_follow_up_s *)follow_up_info;
 
@@ -2702,14 +2725,9 @@ int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
 
   struct ptp_port_s *p = &s_state->port[port_index];
 
-  /* Synthesise a selected_source on first injection so the rest of
-   * the daemon (status APIs, BTCA "are we slave" tests) sees a valid
-   * upstream. The Follow_Up doesn't carry the full Announce content,
-   * but on Wi-Fi §12.1.2 there is no separate Announce stream — the
-   * §12.7 IE flow is the only timing info. Mirror the Follow_Up's
-   * sourceidentity into selected_source so identity-tracking works;
-   * leave priority/quality at defaults (we accept whatever sends
-   * us beacon-IE timing). */
+  /* Synthesise selected_source on first injection — there is no
+   * Announce stream on §12.1.2 Wi-Fi, so mirror the Follow_Up's
+   * sourceidentity. Priority/quality stay at defaults. */
   if (!s_state->selected_source_valid ||
       memcmp(s_state->selected_source.header.sourceidentity,
              fu->header.sourceidentity, 8) != 0) {
@@ -2752,13 +2770,9 @@ int ptpd_inject_sync_pair(int port_index, int64_t remote_ns,
   }
   struct ptp_port_s *p = &s_state->port[port_index];
 
-  /* Synthesise a selected_source if none yet — without it the daemon's
-   * status APIs and BTCA "are we slave" tests reject the injection.
-   * The caller already validated GM identity at the IE-parse layer
-   * (the §12.7 IE sourcePortIdentity is checked separately via
-   * ptpd_inject_sync's selected_source path); for pair-style FTM
-   * sync where the IE bytes have been consumed elsewhere, we leave
-   * the identity at whatever ptpd_inject_sync set. */
+  /* Synthesise a selected_source if none yet — without it the
+   * timereceiver-role tests reject the injection. Identity was
+   * validated upstream at the §12.7 IE parse layer. */
   if (!s_state->selected_source_valid) {
     return -ENOENT;
   }
@@ -2786,14 +2800,8 @@ int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
   return OK;
 }
 
-/* Software-clock indirection. When ptp_clock_sw_init() registers a
- * software clock backend (used on chips without IEEE 1588 hardware,
- * e.g. ESP32-C6), s_sw_clock_now is set to the backend's reader and
- * ptpd_now() routes through it instead of clock_gettime().
- *
- * On P4 wired builds nothing initializes the software clock and
- * ptpd_now() is a thin wrapper around clock_gettime(CLOCK_PTP_SYSTEM)
- * with no added cost. */
+/* When ptp_clock_sw_init() registers a backend, ptpd_now() routes
+ * through it; otherwise falls back to clock_gettime(). */
 typedef int (*ptpd_sw_clock_now_fn)(struct timespec *ts);
 static ptpd_sw_clock_now_fn s_sw_clock_now = NULL;
 
@@ -2914,10 +2922,6 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status) {
   return ret;
 #ifndef CONFIG_BUILD_FLAT
 
-  /* TODO: Use SHM memory to pass the status information if processes
-   * do not share the same memory space.
-   */
-
   return -ENOTSUP;
 
 #else
@@ -2971,4 +2975,18 @@ int ptpd_status(int pid, FAR struct ptpd_status_s *status) {
 int ptpd_stop(int pid) {
   s_state->stop = true;
   return OK;
+}
+
+bool ptpd_port_link_up(int port_index) {
+  if (!s_state) {
+    /* Daemon not started yet — treat as up so callers do not block TX
+     * during their own bring-up window. The first link event after
+     * ptpd_start will correct any divergence. */
+    return true;
+  }
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    return false;
+  }
+  const struct ptp_port_s *p = &s_state->port[port_index];
+  return p->enabled && p->link_up;
 }

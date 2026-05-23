@@ -1,47 +1,14 @@
-/*
+/* SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2020-2024 The Apache Software Foundation
- *
- * SPDX-License-Identifier: Apache-2.0
- *
  * SPDX-FileContributor: 2024 Espressif Systems (Shanghai) CO LTD
  */
-
-/****************************************************************************
- * apps/netutils/ptpd/ptpv2.h
- *
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.  The
- * ASF licenses this file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance with the
- * License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
- * License for the specific language governing permissions and limitations
- * under the License.
- *
- ****************************************************************************/
 
 #ifndef __APPS_NETUTILS_PTPD_PTPV2_H
 #define __APPS_NETUTILS_PTPD_PTPV2_H
 
-/****************************************************************************
- * Included Files
- ****************************************************************************/
-
 #include <stdint.h>
 
-/****************************************************************************
- * Pre-processor Definitions
- ****************************************************************************/
-
-/* Time-critical messages (id < 8) are sent to port 319,
- * other messages to port 320.
- */
+/* Time-critical messages (id < 8) go to port 319, others to 320. */
 
 #define PTP_UDP_PORT_EVENT 319
 #define PTP_UDP_PORT_INFO 320
@@ -52,12 +19,11 @@
 
 /* Multicast MAC addresses for PTP */
 
+/* gPTP uses LLDP nearest-bridge; non-gPTP uses the standard PTP group. */
 #define LLDP_MULTICAST_ADDR                                                    \
-  (uint8_t[6]){0x01, 0x80, 0xC2, 0x00, 0x00, 0x0e}                             \
-  // for all messages in case of gPTP
+  (uint8_t[6]){0x01, 0x80, 0xC2, 0x00, 0x00, 0x0e}
 #define PTP4L_MULTICAST_ADDR                                                   \
-  (uint8_t[6]){0x01, 0x1B, 0x19, 0x00, 0x00, 0x00}                             \
-  // for sync, announce, follow_up (non-gPTP)
+  (uint8_t[6]){0x01, 0x1B, 0x19, 0x00, 0x00, 0x00}
 
 /* Message types */
 
@@ -67,25 +33,18 @@
 #define PTP_MSGTYPE_ANNOUNCE 0x0b
 #define PTP_MSGTYPE_DELAY_REQ 0x01
 #define PTP_MSGTYPE_DELAY_RESP 0x09
-#define PTP_MSGTYPE_PDELAY_REQ 0x02            // only used in gPTP
-#define PTP_MSGTYPE_PDELAY_RESP 0x03           // only used in gPTP
-#define PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP 0x0a // only used in gPTP
+#define PTP_MSGTYPE_PDELAY_REQ 0x02
+#define PTP_MSGTYPE_PDELAY_RESP 0x03
+#define PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP 0x0a
 
 /* Message flags */
 
-#define PTP_FLAGS0_TWOSTEP                                                     \
-  (1 << 1) // flag indicating there will be a follow-up message
-#define PTP_FLAGS1_PTP_TIMESCALE                                               \
-  (1 << 3) // flag indicating use of PTP timescale (gPTP required)
-#define PTP_MSGTYPE_SDOID_GPTP (1 << 4) // flag indicating a gPTP message
+#define PTP_FLAGS0_TWOSTEP (1 << 1)
+#define PTP_FLAGS1_PTP_TIMESCALE (1 << 3)
+#define PTP_MSGTYPE_SDOID_GPTP (1 << 4)
 
-/****************************************************************************
- * Public Types
- ****************************************************************************/
-
-/* Defined in IEEE 1588-2019 Precision Time Protocol and IEEE 802.1AS-2020
- * All multi-byte fields are big-endian.
- */
+/* Wire format per IEEE 1588-2019 / IEEE 802.1AS-2020. Multi-byte
+ * fields are big-endian. */
 
 /* Path trace TLV for gPTP follow up messages */
 
@@ -211,11 +170,11 @@ struct ptp_pdelay_req_s
 
 struct ptp_endpoint_decl_tlv_s
 {
-  uint8_t type[2];          // 0x0003 = ORGANIZATION_EXTENSION
-  uint8_t length[2];        // 0x0007 = 7 bytes (orgid + orgsubtype + data)
-  uint8_t orgidentity[3];   // 0x8C 0x1F 0x64
-  uint8_t orgsubtype[3];    // 0x36 0xC0 0x01 (Endpoint Declaration)
-  uint8_t data;             // 0x01
+  uint8_t type[2];
+  uint8_t length[2];
+  uint8_t orgidentity[3];
+  uint8_t orgsubtype[3];
+  uint8_t data;
 };
 
 #endif /* __APPS_NETUTILS_PTPD_PTPV2_H */

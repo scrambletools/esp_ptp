@@ -1,20 +1,10 @@
 /* SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * esp_ptp software clock backend.
- *
- * For chips without IEEE 1588 hardware (e.g. ESP32-C6) where
- * CLOCK_PTP_SYSTEM is not pluggable from application code, the daemon
- * disciplines a software clock backed by esp_timer_get_time() and a
- * pair of (offset_ns, rate_ppb) tunables. ptpd_now() routes through
- * this backend when ptp_clock_sw_init() has been called.
- *
- * On platforms with EMAC 1588 (ESP32-P4) this file is unused; the
- * legacy esp_eth_clock path remains the source of truth.
- *
- * esp_ptp must stand alone — every identifier here is in the
- * ptp_clock_sw_* namespace, not avb_*. (esp_avb is the eventual
- * primary consumer; that context is captured here in comments only.)
+ * Software clock backend used when CLOCK_PTP_SYSTEM is not pluggable
+ * (e.g. ESP32-C6). Disciplines (offset_ns, rate_ppb) over
+ * esp_timer_get_time(). ptpd_now() routes through this once
+ * ptp_clock_sw_init() runs; on EMAC 1588 platforms it is unused.
  */
 
 #ifndef ESP_PTP_CLOCK_SW_H

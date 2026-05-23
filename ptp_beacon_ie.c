@@ -1,34 +1,14 @@
-/*
- * Copyright 2026 Scramble Tools
- * License: MIT
+/* SPDX-License-Identifier: MIT
+ * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * Host-side beacon Vendor IE publisher for gPTP FollowUpInformation
- * on a wifi_ftm port operating as AP. The daemon's TX loop drives the
- * publish cadence: on each Sync interval it invokes the registered
- * sync_egress_cb with the marshalled FollowUpInformation bytes; this
- * callback packs them into the Vendor IE and ships them to the
- * coprocessor via the esp_ptp_rpc custom-RPC channel for the radio's
- * esp_wifi_set_vendor_ie() to consume.
+ * Beacon Vendor IE publisher for gPTP FollowUpInformation on a
+ * wifi_ftm AP port. The byte layout matches 802.1AS-2020 §12.7 so
+ * a future swap to FTM action frames is wire-compatible.
  *
- * The IEEE 802.1AS-2020 §12.7 FollowUpInformation TLV lives in the
- * 802.11 Beacon Vendor IE rather than in an FTM action-frame Vendor
- * IE (the latter is not reachable through the public ESP-IDF Wi-Fi
- * API). The byte layout inside the Vendor IE matches §12.7 verbatim
- * so a future carrier swap to FTM frames is wire-compatible.
- *
- * Why this lives in esp_ptp. The wire payload IS gPTP. The on-radio
- * carrier is just transport, like Pdelay frames on Ethernet. Owning
- * the publisher here keeps gPTP-state ↔ on-air-transport in one
- * component and lets the host application stay transport-agnostic.
- *
- * Why a custom RPC. esp_wifi_set_vendor_ie() linked locally on the
- * host is a silent no-op — the host-side esp_wifi_remote stub is
- * commented out in upstream esp-hosted-mcu and the host's local
- * libnet80211 has no radio. We use the additive Custom RPC channel
- * (esp_hosted_send_custom_data) instead; the coprocessor's
- * esp_ptp_rpc handler unpacks the buffer and calls
- * esp_wifi_set_vendor_ie() locally on the coprocessor where the
- * radio actually lives. See esp_ptp_rpc/src/ptp_custom_rpc.c.
+ * Dispatched via esp_hosted custom RPC because the host's local
+ * esp_wifi_set_vendor_ie() is a no-op (no radio on this side);
+ * esp_ptp_rpc on the coprocessor calls it locally where the radio
+ * actually lives.
  */
 
 #include "sdkconfig.h"
@@ -46,14 +26,9 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types_generic.h"
 
-/* Forward declarations of the host-side ESP-Hosted custom-RPC API.
- * Declared in espressif__esp_hosted's esp_hosted_misc.h, which we
- * intentionally don't #include here so esp_ptp does not gain a hard
- * dependency on espressif__esp_hosted (projects without an ESP-Hosted
- * coprocessor won't have that component). The symbols only need to
- * resolve at link time for builds that actually use this code path
- * (CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y), and those builds always link
- * espressif__esp_hosted from elsewhere. */
+/* Forward-declared instead of #included so we don't pull in a hard
+ * dependency on espressif__esp_hosted; symbols only need to resolve
+ * in builds gated by CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR. */
 extern esp_err_t esp_hosted_send_custom_data(uint32_t msg_id,
                                              const uint8_t *data,
                                              size_t data_len);
@@ -65,12 +40,8 @@ extern esp_err_t esp_hosted_register_custom_callback(
 static const char *TAG = "ptp_beacon_ie";
 
 /* OUI / sub-types are shared with the coprocessor RPC handler and
- * STA parser via ptp_rpc_proto.h. See that header for the rationale
- * and the FOLLOWUP / TSF_MAPPING split. */
+ * STA parser via ptp_rpc_proto.h. */
 
-/* Which port is the wifi_ftm AP we publish for. CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
- * gates this whole file, so exactly one of these branches matches in any
- * build that compiles us in. */
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) && \
     defined(CONFIG_ESP_PTP_PORT0_WIFI_MODE_AP)
 #define PTP_BEACON_IE_PORT 0
@@ -94,33 +65,18 @@ static void on_set_vendor_ie_ack(uint32_t msg_id, const uint8_t *data,
   if (ack->esp_err != 0) {
     ESP_LOGE(TAG, "ACK: coprocessor returned %ld", (long)ack->esp_err);
   }
-  /* Successful ACK is logged once at startup (see s_acked_at_least_once
-   * tracking in the egress callback) — we don't spam INFO every Sync
-   * interval. */
+  /* Successful ACKs are logged once at startup; errors log every time. */
 }
 
-/* Tracking flag for one-shot startup log: only INFO-log the first
- * successful ACK; thereafter the publish is silent. Errors still
- * log every time. */
 static bool s_acked_at_least_once = false;
 
-/* Sync egress callback fired by ptp_periodic_send on every Sync
- * interval for our wifi_ftm AP port. fu_info points at the daemon-
- * marshalled FollowUpInformation bytes; we pack them into a Vendor
- * IE and dispatch to the coprocessor. */
 static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
                            size_t fu_info_len, FAR void *ctx) {
   (void)port_index;
   (void)ctx;
 
-  /* Wire frame: 4-byte ptp_rpc_set_vendor_ie_t header followed by the
-   * vendor_ie_data_t buffer the coprocessor will hand to
-   * esp_wifi_set_vendor_ie(). Vendor IE layout per 802.11 9.4.2.25 +
-   * 802.1AS §12.7 Figure 12-8:
-   *   element_id (1) | length (1) | OUI (3) | OUI type (1) | payload
-   * The struct mapped onto this is `vendor_ie_data_t` in
-   * esp_wifi_types_generic.h — first 6 bytes match. Stack-allocated;
-   * the framework copies before transport. */
+  /* Wire frame: ptp_rpc_set_vendor_ie_t header + vendor_ie_data_t.
+   * Vendor IE layout per 802.11 9.4.2.25 + 802.1AS §12.7 Figure 12-8. */
   uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + fu_info_len];
   memset(buf, 0, sizeof(buf));
 
@@ -156,13 +112,11 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
     s_acked_at_least_once = true;
   }
 
-  /* Plan A: also publish the (gPTP, AP-TSF) mapping IE in slot 1 of
-   * the same beacon. The 8 bytes of TSF payload are placeholder zeros
-   * here; the coprocessor's RPC handler reads esp_wifi_get_tsf_time
-   * (WIFI_IF_AP) and patches the value in before calling
-   * esp_wifi_set_vendor_ie. The STA pairs this with the §12.7 IE's
-   * preciseOriginTimestamp to convert FTM t1 into GM time. See
-   * espressif.md in the bridge project for the long-term plan. */
+  /* Companion (gPTP, AP-TSF) mapping IE in slot 1. TSF payload bytes
+   * are placeholder zeros; the coprocessor RPC handler patches in the
+   * live esp_wifi_get_tsf_time(WIFI_IF_AP) value before publishing.
+   * STA pairs this with the §12.7 preciseOriginTimestamp to convert
+   * FTM t1 into BTC time. */
   uint8_t tbuf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 +
                PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
   memset(tbuf, 0, sizeof(tbuf));
@@ -186,14 +140,10 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
   }
 }
 
-/* Fires when the coprocessor's SoftAP comes up. At this moment
- * esp_wifi_set_vendor_ie() will actually take effect on the radio
- * (firing earlier would race against AP-mode init), AND s_state is
- * guaranteed non-NULL because the bridge waits for ptpd to be up
- * before bringing the AP up. Register the sync_egress_cb here. The
- * daemon's per-port loop already skips ports without an enabled
- * flag, so it's safe to register before ptpd_start_port(port=AP)
- * has been called — the cb won't fire until the port is enabled. */
+/* Fires when the coprocessor's SoftAP is up — earliest moment
+ * esp_wifi_set_vendor_ie() takes effect on the radio. Safe to
+ * register the egress cb before ptpd_start_port(port=AP) since
+ * disabled ports skip dispatch. */
 static void on_wifi_ap_start(void *arg, esp_event_base_t base, int32_t id,
                              void *event_data) {
   (void)arg;
@@ -216,21 +166,10 @@ static void on_wifi_ap_start(void *arg, esp_event_base_t base, int32_t id,
   }
 }
 
-/* Self-init at startup. Constructor runs before app_main while the
- * heap and log layer are live but before the FreeRTOS scheduler. We:
- *
- *   1. Ensure the default event loop exists. esp_event_loop_create_default
- *      is idempotent (returns ESP_ERR_INVALID_STATE if already created),
- *      so the host's later call from its own init path is a no-op.
- *
- *   2. Register on_wifi_ap_start for WIFI_EVENT_AP_START. The host
- *      will create+start the SoftAP somewhere in app_main; when that
- *      event fires our handler registers the sync_egress_cb.
- *
- *   3. Register the SET_VENDOR_IE_ACK callback so the coprocessor's
- *      reply isn't dropped as "no handler". Safe to call early —
- *      esp_hosted_register_custom_callback lazy-initializes its mutex
- *      and the dispatch table is BSS-allocated. */
+/* Constructor runs before app_main (heap + log layer live, scheduler
+ * not yet running). Ensures the default event loop exists (idempotent),
+ * arms the AP_START handler, and registers the ACK callback so the
+ * coprocessor's reply isn't dropped. */
 __attribute__((constructor)) static void ptp_beacon_ie_autoreg(void) {
   (void)esp_event_loop_create_default();
   (void)esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,
