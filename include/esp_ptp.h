@@ -147,38 +147,15 @@ int ptpd_start_port(int port_index,
                     FAR const char *interface,
                     ptp_port_medium_e medium);
 
-/* Push an externally-measured peer-delay sample (e.g. FTM-derived
- * on a wifi_ftm STA port) into the running averager. */
-int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns);
+/* Peer-delay / sync / sync-pair injection are internal to esp_ptp.
+ * Per-medium transport modules (e.g. ptp_wifi_sta.c) call them
+ * directly. Applications bring a port up via ptpd_start_port and
+ * leave timing entirely to esp_ptp. */
 
-/* Push a marshalled FollowUpInformation TLV (IEEE 802.1AS-2020 §12.7)
- * for ports whose Sync transport is out-of-band (e.g. beacon Vendor IE).
- * Ownership of follow_up_info stays with the caller. */
-int ptpd_inject_sync(int port_index,
-                     FAR const uint8_t *follow_up_info,
-                     size_t len);
-
-/* Push (remote_ns, local_ns) directly into the servo, bypassing the
- * §12.7 byte parser. For FTM-derived sync where the caller has already
- * resolved BTC time at TX and local time at RX. The pair must bracket
- * the same wall-clock moment modulo peer_delay_ns (subtracted by the
- * daemon). */
-int ptpd_inject_sync_pair(int port_index,
-                          int64_t remote_ns,
-                          int64_t local_ns);
-
-/* Register a callback fired whenever the daemon would emit a gPTP
- * Sync/Follow_Up on port_index. The callback carries the marshalled
- * FollowUpInformation TLV to the wire (e.g. beacon Vendor IE update).
- * One callback per port; NULL clears. */
-typedef void (*ptpd_sync_egress_cb_t)(int port_index,
-                                      FAR const uint8_t *follow_up_info,
-                                      size_t len,
-                                      FAR void *ctx);
-
-int ptpd_register_sync_egress_cb(int port_index,
-                                 ptpd_sync_egress_cb_t cb,
-                                 FAR void *ctx);
+/* Sync-egress callback registration is internal to esp_ptp.
+ * ptp_beacon_ie.c registers itself via a constructor and carries
+ * marshalled FollowUpInformation TLVs to the wire (e.g. beacon
+ * Vendor IE update). Applications don't see this transport. */
 
 /* Read the PTP-disciplined system time. Equivalent to clock_gettime
  * (CLOCK_PTP_SYSTEM) on platforms with EMAC 1588 hardware; sources

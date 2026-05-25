@@ -880,11 +880,23 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
 
   /* Note: this uses monotonic clock to track the timeout even when
    *       system clock is adjusted.
-   */
-
+   *
+   * Use the more recent of last_received_sync and last_received_announce.
+   * Wired endpoints get Sync at 8 Hz and refresh last_received_sync
+   * continuously; Wi-Fi STAs receiving §12.2 Announces (no Sync on the
+   * 0x88f7 socket) refresh last_received_announce continuously, while
+   * last_received_sync is only updated on BTCA *switch* events. Looking
+   * at both prevents the Wi-Fi case from spuriously timing out after
+   * CONFIG_NETUTILS_PTPD_TIMEOUT_MS while a stable source is still
+   * being announced. */
   clock_gettime(CLOCK_MONOTONIC, &time_now);
-  clock_timespec_subtract(&time_now, &state->port[0].last_received_sync,
-                          &delta);
+  struct timespec last_evt = state->port[0].last_received_sync;
+  if (state->port[0].last_received_announce.tv_sec > last_evt.tv_sec ||
+      (state->port[0].last_received_announce.tv_sec == last_evt.tv_sec &&
+       state->port[0].last_received_announce.tv_nsec > last_evt.tv_nsec)) {
+    last_evt = state->port[0].last_received_announce;
+  }
+  clock_timespec_subtract(&time_now, &last_evt, &delta);
 
   if (timespec_to_ms(&delta) > CONFIG_NETUTILS_PTPD_TIMEOUT_MS) {
     ESP_LOGD(TAG, "Too long time since received packet\n");
@@ -1136,6 +1148,19 @@ static int ptp_port_init_wifi_ftm(FAR struct ptp_state_s *state, int port_index,
       ptpwarn("port %d: failed to register WIFI_EVENT handler; link_up "
               "will stay at its default — consumers querying "
               "ptpd_port_link_up() may not back off TX during outages\n",
+              port_index);
+    }
+  }
+
+  /* STA-mode wifi_ftm port: hand off the §12.7 beacon-IE parser, the
+   * FTM initiator loop, and the FTM_REPORT handler to the dedicated
+   * Wi-Fi STA transport module. Application code (e.g.
+   * ESP-AVB-Endpoint) no longer needs to know about §12.7 IE bytes or
+   * FTM cadence — bringing the port up is the only integration call. */
+  if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+    if (ptp_wifi_sta_start(port_index) != 0) {
+      ptpwarn("port %d (wifi_ftm STA): ptp_wifi_sta_start failed — "
+              "Sync via beacon-IE / FTM pair injection will not run\n",
               port_index);
     }
   }
@@ -1694,6 +1719,14 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
     return;
   }
 
+  /* AVB Lite fallback is endpoint-only (profiles/avb_lite.md §2:
+   * "An AVB endpoint that also supports AVB Lite must automatically
+   * fall back..."). A bridge port relays timing between AVB domains
+   * and must remain in gPTP regardless of transient Pdelay losses. */
+  if (state->port[0].type == ptp_port_type_bridged) {
+    return;
+  }
+
   /* AVB Lite fallback condition 1 (profiles/avb_lite.md §2.2):
    * a Pdelay_{Req,Resp,Resp_Follow_Up} arrived carrying the Endpoint
    * Declaration TLV — the peer is an endpoint, no AVB-aware bridge between us.
@@ -1790,6 +1823,63 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     ptp_marshal_follow_up_for_beacon_ie(state, &fu);
     port->sync_egress_cb(p, (const uint8_t *)&fu, sizeof(fu),
                          port->sync_egress_ctx);
+  }
+
+  /* §12.2 Announce emission on wifi_ftm/AP ports. The bridge re-emits
+   * the selected upstream BTC's Announce (or own_identity if we ARE
+   * the BTC) as unicast to each associated STA so the STA's BMCA path
+   * sees real GM priority / clockQuality (§12.7 IE only carries Sync
+   * timing). Cadence matches the wired Announce interval. */
+  for (int p = 0; p < CONFIG_ESP_PTP_NUM_PORTS; p++) {
+    struct ptp_port_s *port = &state->port[p];
+    if (!port->enabled) continue;
+    if (port->medium != ptp_port_medium_wifi_ftm) continue;
+    if (port->wifi_mode != ptp_port_wifi_mode_ap) continue;
+
+    struct timespec time_now, delta;
+    clock_gettime(CLOCK_MONOTONIC, &time_now);
+    clock_timespec_subtract(&time_now, &port->last_transmitted_announce,
+                            &delta);
+    if (timespec_to_ms(&delta) <= CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS) {
+      continue;
+    }
+    port->last_transmitted_announce = time_now;
+
+    /* Build Announce body. Prefer the selected upstream source's
+     * identity/quality if we have one (bridge relay case); otherwise
+     * publish our own (we are the BTC). Matches ptp_send_announce's
+     * layout (header + body + path-trace TLV). */
+    struct ptp_announce_s msg;
+    memset(&msg, 0, sizeof(msg));
+    if (state->selected_source_valid) {
+      msg = state->selected_source;
+    } else {
+      msg = state->own_identity;
+    }
+    msg.header.messagetype = PTP_MSGTYPE_ANNOUNCE;
+    msg.header.messagelength[1] = sizeof(msg);
+    msg.header.logmessageinterval =
+        msec_to_log_period(CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS);
+    if (ptp_is_gptp(state)) {
+      msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP;
+      msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
+    }
+    ptp_increment_sequence(&state->announce_seq, &msg.header);
+    struct timespec origin_ts;
+    ptp_gettime(state, &origin_ts);
+    timespec_to_ptp_format(&origin_ts, msg.origintimestamp);
+    struct ptp_pathtrace_tlv_s pathtrace_tlv;
+    memset(&pathtrace_tlv, 0, sizeof(pathtrace_tlv));
+    pathtrace_tlv.type[1] = 8;
+    pathtrace_tlv.length[1] = 8;
+    memcpy(pathtrace_tlv.pathsequence,
+           state->selected_source_valid
+               ? state->selected_source.btc_identity
+               : state->own_identity.btc_identity,
+           sizeof(pathtrace_tlv.pathsequence));
+    msg.pathtracetlv = pathtrace_tlv;
+
+    ptp_wifi_ap_send_announce(p, port->intf_hw_addr, &msg, sizeof(msg));
   }
 
   /* Post-fallback endpoint beacon (profiles/avb_lite.md §2.3): after
@@ -2537,13 +2627,24 @@ static void ptp_daemon(void *task_param)
   pollfds[0].events = POLLIN;
   pollfds[0].fd = state->port[0].ptp_socket;
 
+  /* Wi-Fi-medium ports have no L2TAP socket (ptp_socket = -1); sync
+   * arrives asynchronously via ptpd_inject_sync from the beacon-IE
+   * handler. poll() on fd<0 just waits the full timeout, so we cap it
+   * to PTPD_NOSOCK_POLL_MS to keep periodic work — including
+   * ptp_process_statusreq — responsive. With the default 10 s
+   * interval, ptpd_status() (1 s timeout) would otherwise always time
+   * out and AVB_INTERFACE / CLOCK_SOURCE descriptors never refresh. */
+  #define PTPD_NOSOCK_POLL_MS 100
+  int poll_timeout =
+      (pollfds[0].fd < 0) ? PTPD_NOSOCK_POLL_MS : PTPD_POLL_INTERVAL;
+
   while (!state->stop) {
     ptpd_lateness_tick();
     state->port[0].can_send_delayreq = ptp_is_gptp(state);
 
 
     pollfds[0].revents = 0;
-    ret = poll(pollfds, 1, PTPD_POLL_INTERVAL);
+    ret = poll(pollfds, 1, poll_timeout);
 
     if (pollfds[0].revents) {
       /* Receive time-critical packet, potentially with cmsg
@@ -2627,8 +2728,21 @@ int ptpd_start_port(int port_index, FAR const char *interface,
     if (interface != NULL) {
       strncpy(args->interface, interface, sizeof(args->interface) - 1);
     }
-    if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE,
-                    args, 6, NULL) != pdPASS) {
+    /* On dual-core targets (e.g. ESP32-P4), pin PTPD to core 1 at
+     * priority 22 (same band as esp_timer/emac_rx, below sdio/rpc/wifi
+     * at 23). Core 1 is otherwise near-idle on the bridge build, so
+     * PTPD never competes with the SoftAP/SDIO storm on core 0 —
+     * keeps Pdelay_Resp turnaround sub-millisecond. On single-core
+     * targets (ESP32-C6), use tskNO_AFFINITY since core 1 doesn't
+     * exist and xTaskCreatePinnedToCore would assert. */
+#if portNUM_PROCESSORS > 1
+    const BaseType_t ptpd_core = 1;
+#else
+    const BaseType_t ptpd_core = tskNO_AFFINITY;
+#endif
+    if (xTaskCreatePinnedToCore(ptp_daemon, "PTPD",
+                                CONFIG_NETUTILS_PTPD_STACKSIZE,
+                                args, 22, NULL, ptpd_core) != pdPASS) {
       free(args);
       ESP_LOGE(TAG, "ptpd_start_port: xTaskCreate failed");
       return -1;
@@ -2700,6 +2814,43 @@ int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
   return OK;
 }
 
+/* Push a Wi-Fi-received PTP frame (Ethernet header already stripped)
+ * into the daemon's RX path. Used by per-medium modules that don't
+ * have an L2TAP socket — esp_ptp's ptp_wifi_sta hooks esp_avb's
+ * dispatcher and feeds 0x88f7 frames here. The frame is copied into
+ * port[0]'s rxbuf and routed through the same ptp_process_rx_packet
+ * the EMAC RX loop uses, so received Announce / Sync / Follow_Up
+ * messages flow into the existing BMCA / servo state machine. */
+int ptp_inject_received_frame(int port_index, const uint8_t *frame,
+                              uint16_t len) {
+  if (s_state == NULL) {
+    return -ESRCH;
+  }
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
+    return -EINVAL;
+  }
+  if (len < sizeof(struct ptp_header_s) ||
+      len > sizeof(s_state->port[port_index].rxbuf.raw)) {
+    return -EINVAL;
+  }
+  /* Quick gate: only forward PTP frames whose profile matches ours.
+   * Avoids waking BMCA on stray non-gPTP traffic. Returns +1 to
+   * distinguish "filtered by profile mismatch" from "processed OK". */
+  uint8_t mt = frame[0];
+  bool msg_is_gptp = (mt & PTP_MSGTYPE_SDOID_GPTP) != 0;
+  if (msg_is_gptp != ptp_is_gptp(s_state)) {
+    return 1;
+  }
+  memcpy(s_state->port[0].rxbuf.raw, frame, len);
+  /* Wi-Fi RX has no MAC-layer hardware timestamp surfaced to user
+   * space — best we can do is "now" in the local PTP-disciplined
+   * clock. Announce processing doesn't use rxtime, so this is only
+   * relevant if Sync / Follow_Up arrive on this path (rare on a
+   * §12.1.2 Wi-Fi link where Sync rides the beacon IE instead). */
+  ptp_gettime(s_state, &s_state->port[0].rxtime);
+  return ptp_process_rx_packet(s_state, len);
+}
+
 int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
                      size_t len) {
   if (s_state == NULL) {
@@ -2725,9 +2876,10 @@ int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,
 
   struct ptp_port_s *p = &s_state->port[port_index];
 
-  /* Synthesise selected_source on first injection — there is no
-   * Announce stream on §12.1.2 Wi-Fi, so mirror the Follow_Up's
-   * sourceidentity. Priority/quality stay at defaults. */
+  /* Synthesise selected_source on first injection from the Follow_Up
+   * alone — the real BTC priority / clockQuality arrives separately
+   * via §12.2 unicast Announce frames (handled by the normal
+   * ptp_process_announce path through ptp_inject_received_frame). */
   if (!s_state->selected_source_valid ||
       memcmp(s_state->selected_source.header.sourceidentity,
              fu->header.sourceidentity, 8) != 0) {

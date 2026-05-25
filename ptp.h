@@ -177,4 +177,64 @@ struct ptp_endpoint_decl_tlv_s
   uint8_t data;
 };
 
+/* Internal API — visible only within the esp_ptp component, not part
+ * of the public esp_ptp.h surface. */
+
+/* Defined in ptp.c. Pushed by the per-medium transport modules into
+ * the daemon. Kept here (not in include/esp_ptp.h) so applications
+ * can't reach into the protocol guts — they only call
+ * ptpd_start_port() and let esp_ptp own the wire. */
+int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns);
+int ptpd_inject_sync(int port_index,
+                     const uint8_t *follow_up_info,
+                     size_t len);
+int ptpd_inject_sync_pair(int port_index,
+                          int64_t remote_ns,
+                          int64_t local_ns);
+
+/* Feed a Wi-Fi-received PTP message (Ethernet header stripped) into
+ * the daemon's RX state machine. frame[0..len-1] is the PTP body
+ * starting at messagetype. The §12.2 unicast Announce path on
+ * Wi-Fi-medium STA ports uses this to feed received Announces into
+ * the existing BMCA / process_announce code. */
+int ptp_inject_received_frame(int port_index, const uint8_t *frame,
+                              uint16_t len);
+
+/* Defined in ptp_wifi_sta.c. Spun up by ptp_port_init_wifi_ftm when
+ * wifi_mode == sta. Owns the §12.7 beacon-IE parser, the FTM
+ * initiator burst loop, and the FTM_REPORT handler that feeds
+ * inject_peer_delay + inject_sync_pair. Idempotent. */
+int ptp_wifi_sta_start(int port_index);
+
+/* Defined in ptp_wifi_ap.c. Emits one unicast 802.1AS Announce per
+ * currently-associated STA on a wifi_ftm/AP port. Per IEEE 802.1AS-
+ * 2020 §12.2, media-independent messages (Announce, Signaling) are
+ * sent as unicast to each STA on Wi-Fi rather than the group address.
+ * ptp_msg is the already-marshalled Announce body (header + body +
+ * path-trace TLV); src_mac is the AP port's MAC; the helper wraps
+ * the body in Ethernet (dst = STA MAC, src = src_mac, ethertype
+ * 0x88f7) and pushes it via esp_wifi_internal_tx(WIFI_IF_AP, ...). */
+int ptp_wifi_ap_send_announce(int port_index,
+                              const uint8_t src_mac[6],
+                              void *ptp_msg,
+                              uint16_t ptp_msg_len);
+
+/* Defined in ptp.c. Register a callback fired whenever the daemon
+ * would emit a gPTP Sync/Follow_Up on port_index. The callback
+ * carries the marshalled FollowUpInformation TLV to the wire (e.g.
+ * beacon Vendor IE update). One callback per port; NULL clears.
+ *
+ * Kept here (not in include/esp_ptp.h) so applications can't reach
+ * into the protocol guts — the only consumer is ptp_beacon_ie.c
+ * (autoregistered via constructor), which carries the bytes to the
+ * coprocessor via esp_hosted RPC. */
+typedef void (*ptpd_sync_egress_cb_t)(int port_index,
+                                      const uint8_t *follow_up_info,
+                                      size_t len,
+                                      void *ctx);
+
+int ptpd_register_sync_egress_cb(int port_index,
+                                 ptpd_sync_egress_cb_t cb,
+                                 void *ctx);
+
 #endif /* __APPS_NETUTILS_PTPD_PTPV2_H */

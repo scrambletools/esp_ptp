@@ -16,6 +16,7 @@
 #ifdef CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
 
 #include "esp_ptp.h"
+#include "ptp.h"
 #include "ptp_rpc_proto.h"
 
 #include <stddef.h>
