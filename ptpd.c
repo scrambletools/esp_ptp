@@ -244,7 +244,9 @@ static void ptpd_lateness_tick(void) {
  ****************************************************************************/
 
 #ifdef ESP_PTP
-#define ADJ_FREQ_MAX 512000 // TODO tuneup
+#define ADJ_FREQ_MAX 512000
+#define PTP_FREQ_P_DIV 100
+#define PTP_FREQ_I_DIV 1000
 typedef struct
 {
   int32_t kp;
@@ -383,6 +385,7 @@ struct ptp_state_s
   double correction_ns;
 
   pi_cntrl_t offset_pi;
+  int32_t freq_trim_ppb;
 #else
   /* Address of network interface we are operating on */
 
@@ -713,9 +716,20 @@ static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg, uint16_t p
       *ts = *(struct timespec *)ts_info->data;
     }
 
-  memcpy(ptp_msg, &eth_frame[ETH_HEADER_LEN], ret);
+  if (ret <= ETH_HEADER_LEN)
+    {
+      return ERROR;
+    }
 
-  return ret;
+  size_t payload_len = (size_t)ret - ETH_HEADER_LEN;
+  if (payload_len > ptp_msg_len)
+    {
+      payload_len = ptp_msg_len;
+    }
+
+  memcpy(ptp_msg, &eth_frame[ETH_HEADER_LEN], payload_len);
+
+  return (int)payload_len;
 }
 
 static int64_t timespec_to_ns(FAR const struct timespec *ts)
@@ -1703,8 +1717,8 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state)
     req.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
     req.header.controlfield = 5;
     req_len = sizeof(struct ptp_pdelay_req_s);
-    /* Append AVB Lite Endpoint Declaration TLV (profiles/avb_lite.md §2.1) */
-    req_len += ptp_append_endpoint_decl_tlv(req.raw, req_len);
+    /* Keep standard wired gPTP peer-delay messages bridge-interoperable.
+     * AVB Lite discovery uses the explicit post-fallback beacon only. */
     /* Reset per-cycle responder set so the §2.2 cond 3 (cardinality) check
      * sees only the responders for this single Pdelay_Req. */
     state->port[0].pdelay_resp_responder_count = 0;
@@ -1927,41 +1941,47 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   }
   // TODO add offset filter
 
-  // Execute PI controller to elimitate the offset
-  // compute I component
-  state->offset_pi.drift_acc += offset_ns / state->offset_pi.ki;
-  // clamp the accumulator to ADJ_FREQ_MAX for sanity
+  /* The ESP-IDF hardware clock applies ADJ_FREQUENCY relative to its current
+   * addend. Keep the PI output as an absolute trim and apply only its delta;
+   * applying the complete output every Sync accumulates rate error. */
+  state->offset_pi.drift_acc += offset_ns / PTP_FREQ_I_DIV;
   if (state->offset_pi.drift_acc > ADJ_FREQ_MAX){
     state->offset_pi.drift_acc = ADJ_FREQ_MAX;
   } else if (state->offset_pi.drift_acc < -ADJ_FREQ_MAX) {
     state->offset_pi.drift_acc = -ADJ_FREQ_MAX;
   }
-  // compute P component and the whole controller
-  int32_t adj = offset_ns / state->offset_pi.kp + state->offset_pi.drift_acc;
+  int64_t target_trim = offset_ns / PTP_FREQ_P_DIV + state->offset_pi.drift_acc;
+  if (target_trim > ADJ_FREQ_MAX) {
+    target_trim = ADJ_FREQ_MAX;
+  } else if (target_trim < -ADJ_FREQ_MAX) {
+    target_trim = -ADJ_FREQ_MAX;
+  }
+  int32_t trim_delta = (int32_t)target_trim - state->freq_trim_ppb;
 
-  // Compute difference between number of ticks in slave and master over sync period. This is used to lock the frequency with the master.
-  // However, it never catch-up the offset by itself, hence also add `adj` at the end
+  /* Record interval diagnostics; these values are not an adjustment input
+   * because short Sync-to-Sync measurements contain scheduling jitter. */
   int64_t remote_time_ns = timespec_to_ns(remote_timestamp);
   int64_t local_time_ns = timespec_to_ns(local_timestamp);
   int64_t remote_delta_ns = remote_time_ns - state->remote_time_ns_prev;
   int64_t local_delta_ns = local_time_ns - state->local_time_ns_prev;
-  // clock tick difference between master and slave
   int64_t tick_diff = remote_delta_ns - local_delta_ns;
 
-  // compute how to scale the slave frequency to lock with master frequency and also try to catch-up the offset
-  double freq_scale = ((double)(remote_delta_ns /*+ tick_diff*/ + adj)) / (double)local_delta_ns;
-  long freq_ppb = (long)((freq_scale - 1.0) * 1e9);
   struct timex tx = {
     .modes = ADJ_FREQUENCY,
-    .freq = freq_ppb,
+    .freq = trim_delta,
   };
-  clock_adjtime(PTPD_CLOCK_ID, &tx);
+  if (clock_adjtime(PTPD_CLOCK_ID, &tx) == 0)
+    {
+      state->freq_trim_ppb = (int32_t)target_trim;
+    }
 
   state->remote_time_ns_prev = remote_time_ns;
   state->local_time_ns_prev = local_time_ns;
 
   ptpinfo("remote_delta_ns %lli, local_delta_ns %lli, tick_diff %lli\n", remote_delta_ns, local_delta_ns, tick_diff);
-  ptpinfo("offset_ns %lli, adj %li, drift_acc %li\n", offset_ns, adj, state->offset_pi.drift_acc);
+  ptpinfo("offset_ns %lli, trim %li, delta %li, drift_acc %li\n",
+          offset_ns, (long)target_trim, (long)trim_delta,
+          (long)state->offset_pi.drift_acc);
 
   // Get the path delay only when clock is stable enough. If we were in process of adjustion (speeding/slowing slave),
   // we would get incorrect delay
@@ -2020,7 +2040,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
 
   delta_ns = timespec_delta_ns(remote_timestamp, local_timestamp);
   if (ptp_is_gptp(state)) {
-    delta_ns += state->port[0].peer_delay_ns;
+    delta_ns += state->port[0].peer_delay_ns + state->correction_ns;
   } else {
     delta_ns += state->port[0].path_delay_ns;
   }
@@ -2247,6 +2267,10 @@ static int ptp_process_followup(FAR struct ptp_state_s *state,
    */
 
   ptp_format_to_timespec(msg->origintimestamp, &remote_time);
+  if (ptp_is_gptp(state))
+    {
+      state->correction_ns = get_correction_ns(msg->header.correction);
+    }
   return ptp_update_local_clock(state, &remote_time, &state->port[0].twostep_rxtime);
 }
 
@@ -2295,14 +2319,11 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
          sizeof(resp.delay_resp.reqportindex));
   memcpy(resp.header.sequenceid, req->header.sequenceid,
          sizeof(resp.header.sequenceid));
-  // this is typically ignored in a response, except in the case of gPTP
-  resp.header.logmessageinterval = msec_to_log_period(CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS);
+  /* gPTP measures neighbor delay once per second; do not advertise the
+   * ordinary PTP delay-request interval on peer-delay responses. */
+  resp.header.logmessageinterval = msec_to_log_period(ptp_is_gptp(state) ?
+      GPTP_DELAYREQ_INTERVAL_MS : CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS);
 
-  /* Append AVB Lite Endpoint Declaration TLV to gPTP Pdelay_Resp
-   * (profiles/avb_lite.md §2.1) */
-  if (ptp_is_gptp(state)) {
-    resp_len += ptp_append_endpoint_decl_tlv(resp.raw, resp_len);
-  }
   resp.header.messagelength[1] = resp_len;
 
   /* Send the response message */
@@ -2325,16 +2346,13 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
   /* gPTP profile requires response follow-up message */
 
   if (ptp_is_gptp(state)) {
-    /* Rebuild the buffer for follow-up: the prior TLV append was at the end
-     * of the Pdelay_Resp body, but the follow-up has a different body size.
-     * Clear the Pdelay_Resp TLV area before laying down the follow-up's TLV. */
+    /* Rebuild the buffer for the follow-up body. */
     memset(resp.raw + sizeof(struct ptp_delay_resp_s), 0,
            sizeof(resp.raw) - sizeof(struct ptp_delay_resp_s));
     timespec_to_ptp_format(&ts, resp.delay_resp_follow_up.origintimestamp);
     resp.header.messagetype = PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP;
     resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
     size_t fup_len = sizeof(struct ptp_delay_resp_follow_up_s);
-    fup_len += ptp_append_endpoint_decl_tlv(resp.raw, fup_len);
     resp.header.messagelength[1] = fup_len;
     resp.header.flags[0] = 0; // Reset 2-step flag
 
@@ -2442,7 +2460,11 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
   }
 
   /* Calculate interval until next packet */
-  if (msg->header.logmessageinterval <= 12)
+  if (ptp_is_gptp(state))
+    {
+      state->port[0].delayreq_interval_ms = GPTP_DELAYREQ_INTERVAL_MS;
+    }
+  else if (msg->header.logmessageinterval <= 12)
     {
       state->port[0].delayreq_interval_ms = log_period_to_msec(msg->header.logmessageinterval);
     }
@@ -2453,7 +2475,9 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
 
   /* Randomize delay for next interval */
 
-  state->port[0].next_delayreq_interval_ms = rand_delayreq_interval(state->port[0].delayreq_interval_ms);
+  state->port[0].next_delayreq_interval_ms = ptp_is_gptp(state) ?
+      state->port[0].delayreq_interval_ms :
+      rand_delayreq_interval(state->port[0].delayreq_interval_ms);
 ptpinfo("Randomized delay req interval: %d ms\n", state->port[0].next_delayreq_interval_ms);
   return OK;
 }

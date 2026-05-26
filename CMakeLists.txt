@@ -1,5 +1,10 @@
+set(esp_ptp_private_requires esp_eth esp_netif esp_timer esp_event esp_wifi)
+if(CONFIG_ESP_PTP_HAS_WIFI_CP_AP)
+    list(APPEND esp_ptp_private_requires esp_ptp_rpc)
+endif()
+
 idf_component_register(SRCS "ptpd.c" "ptp_clock_sw.c" "ptp_beacon_ie.c"
-                       PRIV_REQUIRES esp_eth esp_netif esp_timer esp_event esp_ptp_rpc esp_wifi
+                       PRIV_REQUIRES ${esp_ptp_private_requires}
                        INCLUDE_DIRS "." "./include"
                        WHOLE_ARCHIVE)
 
