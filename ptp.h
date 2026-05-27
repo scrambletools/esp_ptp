@@ -206,6 +206,16 @@ int ptp_inject_received_frame(int port_index, const uint8_t *frame,
  * inject_peer_delay + inject_sync_pair. Idempotent. */
 int ptp_wifi_sta_start(int port_index);
 
+/* Defined in ptp_beacon_ie.c (only compiled when
+ * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y). Registers the §12.7
+ * FollowUpInformation beacon-IE publisher as ptpd's sync_egress_cb
+ * for the given AP-mode wifi_ftm port. Must be called AFTER ptpd has
+ * been started (s_state != NULL), so the registration won't fail with
+ * -ESRCH. Called from ptp_port_init_wifi_ftm in the AP branch.
+ * Returns 0 on success, negative errno otherwise. The non-AP build
+ * variant is a no-op (weak symbol below). */
+int ptp_beacon_ie_attach(int port_index);
+
 /* Defined in ptp_wifi_ap.c. Emits one unicast 802.1AS Announce per
  * currently-associated STA on a wifi_ftm/AP port. Per IEEE 802.1AS-
  * 2020 §12.2, media-independent messages (Announce, Signaling) are

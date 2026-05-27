@@ -80,9 +80,6 @@ participates as a time-aware bridge (BRIDGED+BRIDGED).
 | `ptpd_start(iface)` | Start daemon on a single eth_hwts port (legacy convenience). |
 | `ptpd_start_port(port, iface, medium)` | Multi-port start. `medium` ∈ {`eth_hwts`, `wifi_ftm`}. Peer-delay mechanism is derived from medium + the port's `wifi_mode` (set via Kconfig). |
 | `ptpd_now(ts)` | Read PTP-disciplined system time (HW or SW backend). |
-| `ptpd_inject_peer_delay(port, ns)` | Push externally-measured peer-delay (FTM). |
-| `ptpd_inject_sync(port, fup_info, len)` | Push out-of-band Sync/FollowUp (beacon-IE consumer side). |
-| `ptpd_register_sync_egress_cb(port, cb, ctx)` | Register a callback to receive marshalled `FollowUpInformation` for AP-side carriage onto the wire. |
 | `ptpd_set_profile(pid, profile)` | Switch between standard PTP and gPTP. |
 | `ptpd_status(pid, *status)` | Query daemon status (clock identity, offset, master, etc.). |
 | `ptpd_stop(pid)` | Stop the daemon. |

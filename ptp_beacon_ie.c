@@ -19,6 +19,7 @@
 #include "ptp.h"
 #include "ptp_rpc_proto.h"
 
+#include <errno.h>
 #include <stddef.h>
 #include <string.h>
 #include "esp_err.h"
@@ -141,40 +142,50 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
   }
 }
 
-/* Fires when the coprocessor's SoftAP is up — earliest moment
- * esp_wifi_set_vendor_ie() takes effect on the radio. Safe to
- * register the egress cb before ptpd_start_port(port=AP) since
- * disabled ports skip dispatch. */
-static void on_wifi_ap_start(void *arg, esp_event_base_t base, int32_t id,
-                             void *event_data) {
-  (void)arg;
-  (void)base;
-  (void)id;
-  (void)event_data;
+/* Wire the §12.7 FollowUpInformation publisher into ptpd. Called from
+ * ptp_port_init_wifi_ftm() in the AP-mode branch — i.e. after
+ * ptpd_start_port has guaranteed s_state != NULL — so the
+ * ptpd_register_sync_egress_cb call cannot fail with -ESRCH (the
+ * historical boot-race when this was driven off WIFI_EVENT_AP_START).
+ * Port validation is the caller's job; we just check it matches the
+ * build-time PTP_BEACON_IE_PORT to catch Kconfig drift early. */
+int ptp_beacon_ie_attach(int port_index) {
+  if (port_index != PTP_BEACON_IE_PORT) {
+    ESP_LOGE(TAG,
+             "ptp_beacon_ie_attach: port_index=%d but build-time "
+             "PTP_BEACON_IE_PORT=%d — Kconfig and call site disagree",
+             port_index, PTP_BEACON_IE_PORT);
+    return -EINVAL;
+  }
   int rc = ptpd_register_sync_egress_cb(PTP_BEACON_IE_PORT, on_sync_egress,
                                         NULL);
   if (rc != 0) {
     ESP_LOGE(TAG,
              "ptpd_register_sync_egress_cb(port=%d) failed: %d. Beacon "
-             "IE publishes will not fire — has ptpd been started?",
+             "IE publishes will not fire",
              PTP_BEACON_IE_PORT, rc);
-  } else {
-    ESP_LOGI(TAG,
-             "Registered sync_egress_cb for wifi_ftm AP on port %d; "
-             "the daemon will dispatch FollowUpInformation at the "
-             "configured gPTP Sync interval.",
-             PTP_BEACON_IE_PORT);
+    return rc;
   }
+  ESP_LOGI(TAG,
+           "Registered sync_egress_cb for wifi_ftm AP on port %d; "
+           "the daemon will dispatch FollowUpInformation at the "
+           "configured gPTP Sync interval.",
+           PTP_BEACON_IE_PORT);
+  return 0;
 }
 
 /* Constructor runs before app_main (heap + log layer live, scheduler
- * not yet running). Ensures the default event loop exists (idempotent),
- * arms the AP_START handler, and registers the ACK callback so the
- * coprocessor's reply isn't dropped. */
+ * not yet running). Ensures the default event loop exists (idempotent)
+ * and registers the ACK callback so the coprocessor's reply to our
+ * SET_VENDOR_IE_REQ isn't dropped. The sync_egress callback used to
+ * register here too via a WIFI_EVENT_AP_START handler, but that fired
+ * before app_main started ptpd, so registration failed with -ESRCH
+ * and beacon-IE publishing was permanently dead for the boot. It's
+ * now driven from ptp_beacon_ie_attach(), called by
+ * ptp_port_init_wifi_ftm in the AP branch — by which point ptpd is
+ * up and registration always succeeds. */
 __attribute__((constructor)) static void ptp_beacon_ie_autoreg(void) {
   (void)esp_event_loop_create_default();
-  (void)esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,
-                                   on_wifi_ap_start, NULL);
   (void)esp_hosted_register_custom_callback(PTP_RPC_MSG_SET_VENDOR_IE_ACK,
                                             on_set_vendor_ie_ack, NULL);
 }
