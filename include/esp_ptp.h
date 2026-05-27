@@ -3,73 +3,66 @@
  * SPDX-FileContributor: 2024 Espressif Systems (Shanghai) CO LTD
  */
 
-#ifndef __APPS_INCLUDE_NETUTILS_PTPD_H
-#define __APPS_INCLUDE_NETUTILS_PTPD_H
+#ifndef _ESP_PTP_H_
+#define _ESP_PTP_H_
 
-#include <time.h>
-#include <stdint.h>
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <time.h>
 #ifndef FAR
 #define FAR
 #endif
 
-typedef enum
-  {
-    ptp_profile_standard = 0,
-    ptp_profile_gptp = 1,
-  } ptp_profile_e;
+typedef enum {
+  ptp_profile_standard = 0,
+  ptp_profile_gptp = 1,
+} ptp_profile_e;
 
-typedef enum
-  {
-    ptp_port_medium_eth_hwts = 0,
-    ptp_port_medium_wifi_ftm = 1,
-  } ptp_port_medium_e;
+typedef enum {
+  ptp_port_medium_eth_hwts = 0,
+  ptp_port_medium_wifi_ftm = 1,
+} ptp_port_medium_e;
 
-typedef enum
-  {
-    ptp_port_host_if_emac  = 0,
-    ptp_port_host_if_ahb   = 1,
-    ptp_port_host_if_sdio  = 2,
-    ptp_port_host_if_spi   = 3,
-    ptp_port_host_if_usb   = 4,
-    ptp_port_host_if_other = 5,
-  } ptp_port_host_if_e;
+typedef enum {
+  ptp_port_host_if_emac = 0,
+  ptp_port_host_if_ahb = 1,
+  ptp_port_host_if_sdio = 2,
+  ptp_port_host_if_spi = 3,
+  ptp_port_host_if_usb = 4,
+  ptp_port_host_if_other = 5,
+} ptp_port_host_if_e;
 
 /* BRIDGED on any port implies the entity is in bridge mode. */
-typedef enum
-  {
-    ptp_port_type_primary  = 0,
-    ptp_port_type_failover = 1,
-    ptp_port_type_bridged  = 2,
-  } ptp_port_type_e;
+typedef enum {
+  ptp_port_type_primary = 0,
+  ptp_port_type_failover = 1,
+  ptp_port_type_bridged = 2,
+} ptp_port_type_e;
 
 /* Values match IDF's WIFI_IF_STA=0 / WIFI_IF_AP=1 for direct casting. */
-typedef enum
-  {
-    ptp_port_wifi_mode_sta  = 0,
-    ptp_port_wifi_mode_ap   = 1,
-    ptp_port_wifi_mode_none = 0xFF,
-  } ptp_port_wifi_mode_e;
+typedef enum {
+  ptp_port_wifi_mode_sta = 0,
+  ptp_port_wifi_mode_ap = 1,
+  ptp_port_wifi_mode_none = 0xFF,
+} ptp_port_wifi_mode_e;
 
-typedef struct
-  {
-    uint8_t id[8];     /* Clock identity */
-    int utcoffset;     /* Offset between clock time and UTC time (seconds) */
-    int priority1;     /* Main priority field */
-    int clockclass;    /* Clock class (IEEE-1588, lower is better) */
-    int accuracy;      /* Clock accuracy (IEEE-1588, lower is better) */
-    int variance;      /* Clock variance (IEEE-1588, lower is better) */
-    int priority2;     /* Secondary priority field */
-    uint8_t btc_id[8];  /* BTC clock identity */
-    int stepsremoved;  /* How many steps from BTC clock */
-    int timesource;    /* Type of time source (IEEE-1588) */
-  } clock_info_s;
+typedef struct {
+  uint8_t id[8];     /* Clock identity */
+  int utcoffset;     /* Offset between clock time and UTC time (seconds) */
+  int priority1;     /* Main priority field */
+  int clockclass;    /* Clock class (IEEE-1588, lower is better) */
+  int accuracy;      /* Clock accuracy (IEEE-1588, lower is better) */
+  int variance;      /* Clock variance (IEEE-1588, lower is better) */
+  int priority2;     /* Secondary priority field */
+  uint8_t btc_id[8]; /* BTC clock identity */
+  int stepsremoved;  /* How many steps from BTC clock */
+  int timesource;    /* Type of time source (IEEE-1588) */
+} clock_info_s;
 
 /* PTPD status information structure */
 
-struct ptpd_status_s
-{
+struct ptpd_status_s {
   /* Active PTP profile. */
 
   ptp_profile_e ptp_profile;
@@ -100,8 +93,8 @@ struct ptpd_status_s
 
   /* Details of clock adjustment made at last_clock_update */
 
-  int64_t last_delta_ns;     /* Latest measured clock error */
-  int64_t last_adjtime_ns;   /* Previously applied adjtime() offset */
+  int64_t last_delta_ns;   /* Latest measured clock error */
+  int64_t last_adjtime_ns; /* Previously applied adjtime() offset */
 
   /* Averaged clock drift estimate (parts per billion).
    * Positive means remote clock runs faster than local clock before
@@ -131,8 +124,7 @@ struct ptpd_status_s
 
 #ifdef __cplusplus
 #define EXTERN extern "C"
-extern "C"
-{
+extern "C" {
 #else
 #define EXTERN extern
 #endif
@@ -143,14 +135,13 @@ int ptpd_start(FAR const char *interface);
 /* Multi-port variant: bootstraps the daemon on first call (only an
  * eth_hwts port can bootstrap; wifi_ftm attaches to an existing
  * daemon) and configures port_index with the given medium. */
-int ptpd_start_port(int port_index,
-                    FAR const char *interface,
+int ptpd_start_port(int port_index, FAR const char *interface,
                     ptp_port_medium_e medium);
 
 /* Peer-delay / sync / sync-pair injection are internal to esp_ptp.
- * Per-medium transport modules (e.g. ptp_wifi_sta.c) call them
- * directly. Applications bring a port up via ptpd_start_port and
- * leave timing entirely to esp_ptp. */
+ * Per-medium transport modules (e.g. ptp_wifi.c) call them directly.
+ * Applications bring a port up via ptpd_start_port and leave timing
+ * entirely to esp_ptp. */
 
 /* Sync-egress callback registration is internal to esp_ptp.
  * ptp_beacon_ie.c registers itself via a constructor and carries
@@ -166,7 +157,7 @@ int ptpd_now(FAR struct timespec *ts);
 int ptpd_set_profile(int pid, ptp_profile_e profile);
 
 /* Query daemon status. Threads with priority below
- * CONFIG_NETUTILS_PTPD_SERVERPRIO may time out if higher-priority
+ * CONFIG_ESP_PTP_SERVERPRIO may time out if higher-priority
  * threads request status concurrently. */
 int ptpd_status(int pid, FAR struct ptpd_status_s *status);
 
@@ -177,9 +168,19 @@ int ptpd_stop(int pid);
  * cycle isn't dropped before the first link event fires. */
 bool ptpd_port_link_up(int port_index);
 
+/* Feed a received PTP message (Ethernet header already stripped) into
+ * the daemon on the given port. frame[0..len-1] is the PTP body
+ * starting at messagetype. Used by the application's Wi-Fi RX path
+ * — the IDF Wi-Fi netif has no L2TAP backend, so a Wi-Fi STA
+ * endpoint can't fan 0x88f7 frames into ptpd via the L2TAP socket
+ * the way the Ethernet path does; the dispatcher calls this instead.
+ * Safe to call from a Wi-Fi RX context — short synchronous body. */
+int ptp_inject_received_frame(int port_index, const uint8_t *frame,
+                              uint16_t len);
+
 #undef EXTERN
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __APPS_INCLUDE_NETUTILS_PTPD_H */
+#endif /* __APPS_INCLUDE_ESP_PTP_H */

@@ -29,7 +29,7 @@ comments / docs.
 - **gPTP** (IEEE 802.1AS) — peer-delay (Pdelay_Req/Resp) and Sync over
   L2 raw frames at ethertype 0x88f7. Required for AVB.
 
-Profile is selected by `CONFIG_NETUTILS_PTPD_GPTP_PROFILE` and can be
+Profile is selected by `CONFIG_ESP_PTP_GPTP_PROFILE` and can be
 changed at runtime via `ptpd_set_profile()`.
 
 ## Mediums and per-port topology

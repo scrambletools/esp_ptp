@@ -4,7 +4,7 @@
 #
 menu "PTP Daemon Configuration"
 
-    config NETUTILS_PTPD
+    config ESP_PTP
         bool "PTPD client/server"
         default y
     #depends on NET_IPv4
@@ -16,29 +16,29 @@ menu "PTP Daemon Configuration"
             with a timetransmitter clock through network, or to provide a
             timetransmitter clock to other systems.
 
-    if NETUTILS_PTPD
+    if ESP_PTP
 
-        config NETUTILS_PTPD_DEBUG
+        config ESP_PTP_DEBUG
             bool "Enable PTP debug messages"
             default n
             depends on DEBUG_INFO
             help
                 Enable PTP debug messages even if CONFIG_DEBUG_NET_INFO is not enabled.
 
-         config NETUTILS_PTPD_GPTP_PROFILE
+         config ESP_PTP_GPTP_PROFILE
             bool "Enable gPTP profile"
             default y
             help
                 Act as a gPTP endpoint, capable of supporting Audio/Video Bridging (AVB).
 
-        config NETUTILS_PTPD_CLIENT
+        config ESP_PTP_CLIENT
             bool "Enable client support"
             default y
             help
                 Act as a PTP client, synchronizing the local clock to a remote
                 timetransmitter clock.
 
-        config NETUTILS_PTPD_SERVER
+        config ESP_PTP_SERVER
             bool "Enable server support"
             default n
             help
@@ -49,15 +49,15 @@ menu "PTP Daemon Configuration"
                 or act as a timetransmitter clock itself if it has the highest
                 priority. Refer to the BTCA in IEEE-1588 for details.
 
-        config NETUTILS_PTPD_STACKSIZE
+        config ESP_PTP_STACKSIZE
             int "PTP daemon stack stack size"
             default 4096 # DEFAULT_TASK_STACKSIZE
 
-        config NETUTILS_PTPD_SERVERPRIO
+        config ESP_PTP_SERVERPRIO
             int "PTP daemon priority"
             default 100
 
-        config NETUTILS_PTPD_DOMAIN
+        config ESP_PTP_DOMAIN
             int    "PTP domain selection"
             default 0
             range 0 127
@@ -65,9 +65,9 @@ menu "PTP Daemon Configuration"
                 Set PTP domain to participate in. Default domain is 0, other domains
                 can be used to isolate reference clocks from each other.
 
-        if NETUTILS_PTPD_SERVER || NETUTILS_PTPD_GPTP_PROFILE
+        if ESP_PTP_SERVER || ESP_PTP_GPTP_PROFILE
 
-            config NETUTILS_PTPD_PRIORITY1
+            config ESP_PTP_PRIORITY1
                 int "PTP server priority1"
                 default 248
                 range 0 255
@@ -78,7 +78,7 @@ menu "PTP Daemon Configuration"
                     clock quality fields.
                     Refer to Best Master Clock algorithm in IEEE-1588 for details.
 
-            config NETUTILS_PTPD_PRIORITY2
+            config ESP_PTP_PRIORITY2
                 int "PTP server priority2"
                 default 248
                 range 0 255
@@ -88,7 +88,7 @@ menu "PTP Daemon Configuration"
                     priority1, class and accuracy values.
                     Lower value is higher priority.
 
-            config NETUTILS_PTPD_CLASS
+            config ESP_PTP_CLASS
                 int "PTP server class"
                 default 248
                 range 0 255
@@ -97,7 +97,7 @@ menu "PTP Daemon Configuration"
                     Lower value means higher quality clock source.
                     248 is the default for unknown class.
 
-            config NETUTILS_PTPD_ACCURACY
+            config ESP_PTP_ACCURACY
                 int "PTP server accuracy"
                 default 254
                 range 0 255
@@ -124,7 +124,7 @@ menu "PTP Daemon Configuration"
                     49: +-  more than 10 s
                     254: Unknown
 
-            config NETUTILS_PTPD_CLOCKSOURCE
+            config ESP_PTP_CLOCKSOURCE
                 int "PTP server clock source type"
                 default 160
                 range 0 255
@@ -137,14 +137,14 @@ menu "PTP Daemon Configuration"
                     144: Other
                     160: Internal oscillator
 
-            config NETUTILS_PTPD_SYNC_INTERVAL_MS
+            config ESP_PTP_SYNC_INTERVAL_MS
                 int "PTP server sync transmit interval (ms)"
                 default 125
                 help
                     How often to transmit sync packets in server mode.
                     Default 125 ms matches the 802.1AS default (logMessageInterval -3, 8 Hz).
 
-            config NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS
+            config ESP_PTP_ANNOUNCE_INTERVAL_MS
                 int "PTP server announce transmit interval (ms)"
                 default 1000
                 help
@@ -152,7 +152,7 @@ menu "PTP Daemon Configuration"
                     Default 1000 ms matches the PreSonus SW5E switch (and the 802.1AS
                     default of logMessageInterval 0).
 
-            config NETUTILS_PTPD_TWOSTEP_SYNC
+            config ESP_PTP_TWOSTEP_SYNC
                 bool "PTP server sends two-step synchronization packets"
                 default y
                 help
@@ -160,7 +160,7 @@ menu "PTP Daemon Configuration"
                     This helps compensate for the time taken to initiate the transmission.
                     If gPTP profile is enabled, this setting is ignored (acts as y).
 
-            config NETUTILS_PTPD_DELAYREQ_INTERVAL_MS
+            config ESP_PTP_DELAYREQ_INTERVAL_MS
                 int "PTP path-delay (E2E) request interval (ms)"
                 default 16000
                 help
@@ -169,9 +169,9 @@ menu "PTP Daemon Configuration"
                     suggested interval back to the client. Used only when the
                     delay mechanism is end-to-end (E2E).
                     For peer-delay (P2P) — including the gPTP profile —
-                    see NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS instead.
+                    see ESP_PTP_PDELAYREQ_INTERVAL_MS instead.
 
-            config NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS
+            config ESP_PTP_PDELAYREQ_INTERVAL_MS
                 int "PTP peer-delay (P2P) request interval (ms)"
                 default 1000
                 help
@@ -181,18 +181,18 @@ menu "PTP Daemon Configuration"
                     Default 1000 ms matches the 802.1AS default
                     (logMessageInterval 0).
 
-        endif # NETUTILS_PTPD_SERVER
+        endif # ESP_PTP_SERVER
 
-        if NETUTILS_PTPD_CLIENT || NETUTILS_PTPD_GPTP_PROFILE
+        if ESP_PTP_CLIENT || ESP_PTP_GPTP_PROFILE
 
-            config NETUTILS_PTPD_TIMEOUT_MS
+            config ESP_PTP_TIMEOUT_MS
                 int "PTP client timeout for changing clock source (ms)"
                 default 60000
                 help
                     If no packets are being received from currently chosen clock source,
                     fall back to next best clock source after this many seconds.
 
-            config NETUTILS_PTPD_SETTIME_THRESHOLD_MS
+            config ESP_PTP_SETTIME_THRESHOLD_MS
                 int "PTP client threshold for changing system time (ms)"
                 default 1000
                 help
@@ -200,7 +200,7 @@ menu "PTP Daemon Configuration"
                     time is reset with settimeofday() instead of changing the rate with
                     adjtime().
 
-            config NETUTILS_PTPD_DRIFT_AVERAGE_S
+            config ESP_PTP_DRIFT_AVERAGE_S
                 int "PTP client clock drift rate averaging time (s)"
                 default 600
                 range 10 86400
@@ -210,7 +210,7 @@ menu "PTP Daemon Configuration"
                     changes (such as caused by temperature changes).
 
         # Commented options not used by ESP_PTP
-        #config NETUTILS_PTPD_MULTICAST_TIMEOUT_MS
+        #config ESP_PTP_MULTICAST_TIMEOUT_MS
         #    int "PTP client timeout to rejoin multicast group (ms)"
         #    default 30000 #esp32
         #    default 0
@@ -220,7 +220,7 @@ menu "PTP Daemon Configuration"
         #        depending on hardware, after some error recovery events.
         #        Set to 0 to disable.
 
-            config NETUTILS_PTPD_SEND_DELAYREQ
+            config ESP_PTP_SEND_DELAYREQ
                 bool "PTP client enable delay requests"
                 default n
                 help
@@ -228,9 +228,9 @@ menu "PTP Daemon Configuration"
                     to server. If disabled, assumes no delay. If gPTP profile is enabled,
                     this setting is ignored (acts as y).
 
-            if NETUTILS_PTPD_SEND_DELAYREQ || NETUTILS_PTPD_GPTP_PROFILE
+            if ESP_PTP_SEND_DELAYREQ || ESP_PTP_GPTP_PROFILE
 
-                config NETUTILS_PTPD_MAX_PATH_DELAY_NS
+                config ESP_PTP_MAX_PATH_DELAY_NS
                     int "PTP client maximum path delay (ns)"
                     default 100000
                     range 1 1000000000
@@ -238,34 +238,34 @@ menu "PTP Daemon Configuration"
                         Measured path delay longer than this is ignored. Delay requests are
                         also not transmitted until clock synchronization is better than this.
 
-                config NETUTILS_PTPD_DELAYREQ_AVGCOUNT
+                config ESP_PTP_DELAYREQ_AVGCOUNT
                     int "PTP client path/peer delay averaging count"
                     default 100
                     help
                         Measured path/peer delay is averaged over this many samples.
 
-                config NETUTILS_PTPD_PATH_DELAY_STABILITY_NS
+                config ESP_PTP_PATH_DELAY_STABILITY_NS
                     int "PTP client send delay request when clock stability (ns)"
                     default 250
                     help
                         Sends path delay request only once the internal clock is stable and skews only
                         in defined interval.
-                config NETUTILS_PTPD_PEER_DELAY_STABILITY_NS
+                config ESP_PTP_PEER_DELAY_STABILITY_NS
                     int "PTP client send peer delay request when clock stability (ns)"
                     default 100
                     help
                         Sends peer delay request only once the internal clock is stable and skews only
                         in defined interval.
 
-            endif # NETUTILS_PTPD_SEND_DELAYREQ
+            endif # ESP_PTP_SEND_DELAYREQ
 
-        endif # NETUTILS_PTPD_CLIENT
+        endif # ESP_PTP_CLIENT
 
         config ESP_PTP_NUM_PORTS
             int "Number of PTP ports"
             default 1
             range 1 2
-            depends on NETUTILS_PTPD
+            depends on ESP_PTP
             help
                 Number of independent PTP port instances managed by the
                 daemon. The default is 1 (a single endpoint port). Set to
@@ -307,7 +307,7 @@ menu "PTP Daemon Configuration"
         choice ESP_PTP_PORT0_MEDIUM
             prompt "Port 0 medium"
             default ESP_PTP_PORT0_MEDIUM_ETH_HWTS
-            depends on NETUTILS_PTPD
+            depends on ESP_PTP
 
             config ESP_PTP_PORT0_MEDIUM_ETH_HWTS
                 bool "eth_hwts (ethernet + IEEE 1588 HW timestamping)"
@@ -319,7 +319,7 @@ menu "PTP Daemon Configuration"
             prompt "Port 0 host interface"
             default ESP_PTP_PORT0_HOST_IF_EMAC if ESP_PTP_PORT0_MEDIUM_ETH_HWTS
             default ESP_PTP_PORT0_HOST_IF_AHB  if ESP_PTP_PORT0_MEDIUM_WIFI_FTM
-            depends on NETUTILS_PTPD
+            depends on ESP_PTP
 
             config ESP_PTP_PORT0_HOST_IF_EMAC
                 bool "emac"
@@ -338,7 +338,7 @@ menu "PTP Daemon Configuration"
         choice ESP_PTP_PORT0_TYPE
             prompt "Port 0 type"
             default ESP_PTP_PORT0_TYPE_PRIMARY
-            depends on NETUTILS_PTPD
+            depends on ESP_PTP
 
             config ESP_PTP_PORT0_TYPE_PRIMARY
                 bool "primary"
@@ -353,7 +353,7 @@ menu "PTP Daemon Configuration"
         choice ESP_PTP_PORT0_WIFI_MODE
             prompt "Port 0 wifi mode"
             default ESP_PTP_PORT0_WIFI_MODE_STA
-            depends on NETUTILS_PTPD
+            depends on ESP_PTP
             depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM
 
             config ESP_PTP_PORT0_WIFI_MODE_AP
@@ -366,12 +366,12 @@ menu "PTP Daemon Configuration"
             int "Port 0 nominal link speed (Mbps)"
             default 1000 if ESP_PTP_PORT0_MEDIUM_ETH_HWTS
             default 150  if ESP_PTP_PORT0_MEDIUM_WIFI_FTM
-            depends on NETUTILS_PTPD
+            depends on ESP_PTP
 
         choice ESP_PTP_PORT1_MEDIUM
             prompt "Port 1 medium"
             default ESP_PTP_PORT1_MEDIUM_WIFI_FTM
-            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+            depends on ESP_PTP && ESP_PTP_NUM_PORTS = 2
 
             config ESP_PTP_PORT1_MEDIUM_ETH_HWTS
                 bool "eth_hwts (ethernet + IEEE 1588 HW timestamping)"
@@ -383,7 +383,7 @@ menu "PTP Daemon Configuration"
             prompt "Port 1 host interface"
             default ESP_PTP_PORT1_HOST_IF_SDIO if ESP_PTP_PORT1_MEDIUM_WIFI_FTM
             default ESP_PTP_PORT1_HOST_IF_EMAC if ESP_PTP_PORT1_MEDIUM_ETH_HWTS
-            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+            depends on ESP_PTP && ESP_PTP_NUM_PORTS = 2
 
             config ESP_PTP_PORT1_HOST_IF_EMAC
                 bool "emac"
@@ -402,7 +402,7 @@ menu "PTP Daemon Configuration"
         choice ESP_PTP_PORT1_TYPE
             prompt "Port 1 type"
             default ESP_PTP_PORT1_TYPE_BRIDGED
-            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+            depends on ESP_PTP && ESP_PTP_NUM_PORTS = 2
 
             config ESP_PTP_PORT1_TYPE_PRIMARY
                 bool "primary"
@@ -415,7 +415,7 @@ menu "PTP Daemon Configuration"
         choice ESP_PTP_PORT1_WIFI_MODE
             prompt "Port 1 wifi mode"
             default ESP_PTP_PORT1_WIFI_MODE_AP
-            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+            depends on ESP_PTP && ESP_PTP_NUM_PORTS = 2
             depends on ESP_PTP_PORT1_MEDIUM_WIFI_FTM
 
             config ESP_PTP_PORT1_WIFI_MODE_AP
@@ -428,7 +428,7 @@ menu "PTP Daemon Configuration"
             int "Port 1 nominal link speed (Mbps)"
             default 150  if ESP_PTP_PORT1_MEDIUM_WIFI_FTM
             default 1000 if ESP_PTP_PORT1_MEDIUM_ETH_HWTS
-            depends on NETUTILS_PTPD && ESP_PTP_NUM_PORTS = 2
+            depends on ESP_PTP && ESP_PTP_NUM_PORTS = 2
 
         # Derived: at least one port is Wi-Fi-AP reached via a coprocessor
         # (sdio or spi). Gates the beacon-IE publish code path in
@@ -440,6 +440,6 @@ menu "PTP Daemon Configuration"
             default y if (ESP_PTP_PORT1_MEDIUM_WIFI_FTM && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
             default n
 
-    endif # NETUTILS_PTPD
+    endif # ESP_PTP
 
 endmenu # PTP Daemon Configuration

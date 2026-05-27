@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
  * Beacon Vendor IE publisher for gPTP FollowUpInformation on a
@@ -19,14 +19,14 @@
 #include "ptp.h"
 #include "ptp_rpc_proto.h"
 
-#include <errno.h>
-#include <stddef.h>
-#include <string.h>
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_wifi_types_generic.h"
+#include <errno.h>
+#include <stddef.h>
+#include <string.h>
 
 /* Forward-declared instead of #included so we don't pull in a hard
  * dependency on espressif__esp_hosted; symbols only need to resolve
@@ -35,8 +35,7 @@ extern esp_err_t esp_hosted_send_custom_data(uint32_t msg_id,
                                              const uint8_t *data,
                                              size_t data_len);
 extern esp_err_t esp_hosted_register_custom_callback(
-    uint32_t msg_id,
-    void (*cb)(uint32_t, const uint8_t *, size_t, void *),
+    uint32_t msg_id, void (*cb)(uint32_t, const uint8_t *, size_t, void *),
     void *user);
 
 static const char *TAG = "ptp_beacon_ie";
@@ -44,10 +43,10 @@ static const char *TAG = "ptp_beacon_ie";
 /* OUI / sub-types are shared with the coprocessor RPC handler and
  * STA parser via ptp_rpc_proto.h. */
 
-#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) && \
+#if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) &&                           \
     defined(CONFIG_ESP_PTP_PORT0_WIFI_MODE_AP)
 #define PTP_BEACON_IE_PORT 0
-#elif defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM) && \
+#elif defined(CONFIG_ESP_PTP_PORT1_MEDIUM_WIFI_FTM) &&                         \
     defined(CONFIG_ESP_PTP_PORT1_WIFI_MODE_AP)
 #define PTP_BEACON_IE_PORT 1
 #else
@@ -99,8 +98,8 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
     memcpy(ie + 6, fu_info, fu_info_len);
   }
 
-  esp_err_t r = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ,
-                                            buf, sizeof(buf));
+  esp_err_t r = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ, buf,
+                                            sizeof(buf));
   if (r != ESP_OK) {
     ESP_LOGE(TAG, "esp_hosted_send_custom_data(SET_VENDOR_IE_REQ): %s",
              esp_err_to_name(r));
@@ -157,8 +156,8 @@ int ptp_beacon_ie_attach(int port_index) {
              port_index, PTP_BEACON_IE_PORT);
     return -EINVAL;
   }
-  int rc = ptpd_register_sync_egress_cb(PTP_BEACON_IE_PORT, on_sync_egress,
-                                        NULL);
+  int rc =
+      ptpd_register_sync_egress_cb(PTP_BEACON_IE_PORT, on_sync_egress, NULL);
   if (rc != 0) {
     ESP_LOGE(TAG,
              "ptpd_register_sync_egress_cb(port=%d) failed: %d. Beacon "

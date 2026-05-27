@@ -1,29 +1,46 @@
 /*
- * Wi-Fi STA-side PTP transport for ports with medium = wifi_ftm
- * and wifi_mode = sta. Owns:
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- *   - the beacon Vendor IE callback that decodes the §12.7
- *     FollowUpInformation and the Scramble Tools-private (gPTP, TSF)
- *     mapping IE, feeding the daemon via the internal inject path;
- *   - the FTM initiator task that bursts the AP at the §12.8.2
- *     cadence and computes (BTC time, local RX time) pairs from
- *     (gptp_marker, tsf_marker) + per-burst HW t1/t2 timestamps;
- *   - the WIFI_EVENT_FTM_REPORT handler that consumes the report;
- *   - the §12.2 unicast Announce RX hook (via esp_avb's PTP rxcb),
- *     feeding received Announce / Sync / Follow_Up frames into the
- *     daemon's existing BMCA / servo path.
+ * Wi-Fi PTP transport for ports with medium = wifi_ftm. Combines the
+ * AP-side (wifi_mode = ap) and STA-side (wifi_mode = sta) roles:
+ *
+ *   AP side (bridge):
+ *     - ptp_wifi_ap_send_announce: re-emits the upstream BTC's
+ *       Announce as one unicast 802.1AS frame per associated STA per
+ *       IEEE 802.1AS-2020 §12.2 (the §12.7 beacon IE only carries
+ *       Sync timing, not GM priority / clockQuality).
+ *
+ *   STA side (endpoint):
+ *     - beacon Vendor IE callback that decodes the §12.7
+ *       FollowUpInformation and the Scramble Tools-private (gPTP, TSF)
+ *       mapping IE, feeding the daemon via the internal inject path;
+ *     - FTM initiator task that bursts the AP at the §12.8.2 cadence
+ *       and computes (BTC time, local RX time) pairs from
+ *       (gptp_marker, tsf_marker) + per-burst HW t1/t2 timestamps;
+ *     - WIFI_EVENT_FTM_REPORT handler that consumes the report.
+ *
+ * §12.2 unicast Announce/Sync/Follow_Up RX is NOT owned here — those
+ * frames arrive on the IDF Wi-Fi rxcb (which the application's
+ * dispatcher owns, since the rxcb is single-slot per interface) and
+ * are fed into the daemon via the public ptp_inject_received_frame()
+ * API in esp_ptp.h.
  *
  * Application code brings the port up via ptpd_start_port(.., wifi_ftm)
  * and never sees §12.7 IE bytes, FTM cadence, or raw PTP frames.
  */
 
+#include "sdkconfig.h"
+
 #include <inttypes.h>
 #include <string.h>
 
+#include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_wifi_types_generic.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -32,18 +49,80 @@
 #include "ptp.h"
 #include "ptp_rpc_proto.h"
 
-/* esp_avb's PTP rx hook is provided as a public API on its avb.h
- * header. Forward-declare the symbols we need rather than pulling in
- * the whole header (which would create an unwanted component-level
- * dependency from esp_ptp to esp_avb). The hook lets esp_avb deliver
- * 0x88f7 frames to esp_ptp on Wi-Fi-medium endpoints that have no
- * L2TAP socket of their own. */
-typedef void (*avb_ptp_rx_handler_t)(const uint8_t *ptp_msg, uint16_t len,
-                                     const uint8_t src_mac[6], void *ctx);
-extern void avb_net_set_ptp_rx_handler(avb_ptp_rx_handler_t handler,
-                                       void *ctx);
+/* esp_wifi_internal_tx is not in any public IDF header. Same forward-
+ * declaration pattern as in esp_avb/avbnet.c. The wifi_remote layer
+ * on a host with a coprocessor radio forwards this call over SDIO so
+ * the AP actually emits the frame from the C6 side. */
+extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
 
-#define TAG "ptp_wifi_sta"
+#define TAG "ptp_wifi"
+
+#define ETH_HDR_LEN 14
+
+/* ===========================================================================
+ * AP side — §12.2 unicast Announce egress
+ * ===========================================================================
+ */
+
+/* Build an Ethernet frame with PTP ethertype carrying ptp_msg, then
+ * push it as one unicast TX to dst_mac via WIFI_IF_AP. Caller-owned
+ * buffer; we allocate on stack since Announce is small (~88 B). */
+static int wifi_ap_send_unicast_ptp(const uint8_t src_mac[6],
+                                    const uint8_t dst_mac[6], void *ptp_msg,
+                                    uint16_t ptp_msg_len) {
+  uint8_t frame[ETH_HDR_LEN + ptp_msg_len];
+
+  /* Ethernet header: dst MAC, src MAC (port's AP MAC), ethertype 0x88F7. */
+  memcpy(frame + 0, dst_mac, 6);
+  memcpy(frame + 6, src_mac, 6);
+  frame[12] = 0x88;
+  frame[13] = 0xF7;
+  memcpy(frame + ETH_HDR_LEN, ptp_msg, ptp_msg_len);
+
+  /* WIFI_IF_AP = 1 (numeric constant; the wifi_remote/native split
+   * doesn't expose a stable header constant we can pull in without
+   * tightening the build dependency further). */
+  esp_err_t r = esp_wifi_internal_tx(1, frame, sizeof(frame));
+  return (r == ESP_OK) ? (int)sizeof(frame) : -1;
+}
+
+int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
+                              void *ptp_msg, uint16_t ptp_msg_len) {
+  wifi_sta_list_t sta_list;
+  memset(&sta_list, 0, sizeof(sta_list));
+  esp_err_t r = esp_wifi_ap_get_sta_list(&sta_list);
+  if (r != ESP_OK) {
+    /* The wifi_remote bridge may not have an AP up yet, or the
+     * coprocessor RPC isn't ready. Drop silently — the next tick
+     * retries; no Announce will be missed once STAs associate. */
+    return 0;
+  }
+  if (sta_list.num == 0) {
+    return 0; /* No STAs to send to. */
+  }
+
+  int sent = 0;
+  for (int i = 0; i < sta_list.num; i++) {
+    int rc = wifi_ap_send_unicast_ptp(src_mac, sta_list.sta[i].mac, ptp_msg,
+                                      ptp_msg_len);
+    if (rc > 0)
+      sent++;
+  }
+
+  static uint32_t s_seen = 0;
+  if ((++s_seen % 30) == 1) {
+    ESP_LOGI(TAG,
+             "Sent unicast Announce to %d/%d associated STA(s) on port %d "
+             "(seen=%u)",
+             sent, sta_list.num, port_index, (unsigned)s_seen);
+  }
+  return sent;
+}
+
+/* ===========================================================================
+ * STA side — §12.7 beacon-IE consumer + §12.8.2 FTM initiator
+ * ===========================================================================
+ */
 
 /* FTM cadence target. IEEE 802.1AS-2020 §12.8.2 sets
  * initialLogSyncInterval = -3 → 8 messages/s on Wi-Fi. ESP-IDF FTM
@@ -51,7 +130,7 @@ extern void avb_net_set_ptp_rx_handler(avb_ptp_rx_handler_t handler,
  * use 2 (= 200 ms ≈ 5 Hz) since 1 is below the documented minimum.
  * frm_count: 0(No pref), 16, 24, 32, 64. */
 #define FTM_BURST_PERIOD_100MS 2
-#define FTM_FRM_COUNT          16
+#define FTM_FRM_COUNT 16
 
 static int s_port_index = -1;
 static EventGroupHandle_t s_events;
@@ -89,7 +168,7 @@ static uint64_t s_prev_ap_tsf_ps;
  * negative deltas can come from out-of-order packet processing or
  * clock corrections, not actual reboot. 1 s is well past any plausible
  * jitter and far below a real AP uptime. */
-#define TSF_BOUNCE_THRESHOLD_PS  (1000ULL * 1000ULL * 1000ULL * 1000ULL)
+#define TSF_BOUNCE_THRESHOLD_PS (1000ULL * 1000ULL * 1000ULL * 1000ULL)
 
 /* FTM repeated-failure fallback. The TSF-backwards check above only
  * fires if there was a previous valid t1 to compare against — useless
@@ -101,7 +180,7 @@ static uint64_t s_prev_ap_tsf_ps;
  * after a few. At a 200 ms FTM burst period this gives recovery in
  * a few seconds. */
 static uint32_t s_ftm_consecutive_fails;
-#define FTM_FAIL_REAUTH_THRESHOLD  10
+#define FTM_FAIL_REAUTH_THRESHOLD 10
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
@@ -126,7 +205,8 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       uint64_t avg_rtt_ps = 0;
       uint8_t valid = 0;
       uint8_t n = r->ftm_report_num_entries;
-      if (n > 16) n = 16;
+      if (n > 16)
+        n = 16;
       uint64_t best_t1_ps = 0;
       uint64_t best_t2_ps = 0;
       if (n) {
@@ -172,10 +252,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
           /* Fires WIFI_EVENT_STA_DISCONNECTED → app's handler calls
            * esp_wifi_connect() for a fresh Auth/Assoc handshake. */
           esp_wifi_disconnect();
-          break;  /* skip the rest of this report — markers are gone */
+          break; /* skip the rest of this report — markers are gone */
         }
       }
-      if (best_t1_ps) s_prev_ap_tsf_ps = best_t1_ps;
+      if (best_t1_ps)
+        s_prev_ap_tsf_ps = best_t1_ps;
       /* Reset consecutive-failure counter on any successful FTM. */
       s_ftm_consecutive_fails = 0;
       int64_t peer_delay_ns;
@@ -197,19 +278,19 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       int64_t t1_gPTP_ns = 0;
       int64_t local_at_RX_ns = 0;
       if (s_seen_gptp && s_seen_tsf && best_t1_ps && best_t2_ps) {
-        int64_t t1_us       = (int64_t)(best_t1_ps / 1000000ULL);
-        int64_t delta_us    = t1_us - s_tsf_marker_us;
-        t1_gPTP_ns          = s_gptp_marker_ns + delta_us * 1000;
+        int64_t t1_us = (int64_t)(best_t1_ps / 1000000ULL);
+        int64_t delta_us = t1_us - s_tsf_marker_us;
+        t1_gPTP_ns = s_gptp_marker_ns + delta_us * 1000;
 
-        int64_t t2_us       = (int64_t)(best_t2_ps / 1000000ULL);
-        int64_t now_us      = esp_timer_get_time();
+        int64_t t2_us = (int64_t)(best_t2_ps / 1000000ULL);
+        int64_t now_us = esp_timer_get_time();
         struct timespec swn = {0};
         ptpd_now(&swn);
-        int64_t sw_now_ns   = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
-        local_at_RX_ns      = sw_now_ns - (now_us - t2_us) * 1000;
+        int64_t sw_now_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
+        local_at_RX_ns = sw_now_ns - (now_us - t2_us) * 1000;
 
-        pair_rc = ptpd_inject_sync_pair(s_port_index, t1_gPTP_ns,
-                                        local_at_RX_ns);
+        pair_rc =
+            ptpd_inject_sync_pair(s_port_index, t1_gPTP_ns, local_at_RX_ns);
       }
 
       static uint32_t s_seen = 0;
@@ -220,20 +301,20 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                  "peer_delay=%lld ns  inject_rc=%d  "
                  "pair_rc=%d t1_gPTP=%lld local_RX=%lld",
                  (unsigned)s_seen, r->peer_mac[0], r->peer_mac[1],
-                 r->peer_mac[2], r->peer_mac[3], r->peer_mac[4],
-                 r->peer_mac[5], (unsigned)r->rtt_est,
-                 (unsigned long long)avg_rtt_ps, valid, n,
-                 (long long)peer_delay_ns, rc, pair_rc,
-                 (long long)t1_gPTP_ns, (long long)local_at_RX_ns);
+                 r->peer_mac[2], r->peer_mac[3], r->peer_mac[4], r->peer_mac[5],
+                 (unsigned)r->rtt_est, (unsigned long long)avg_rtt_ps, valid, n,
+                 (long long)peer_delay_ns, rc, pair_rc, (long long)t1_gPTP_ns,
+                 (long long)local_at_RX_ns);
       }
       xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
     } else {
-      ESP_LOGW(TAG, "FTM session failed: status=%d num_entries=%u",
-               r->status, r->ftm_report_num_entries);
+      ESP_LOGW(TAG, "FTM session failed: status=%d num_entries=%u", r->status,
+               r->ftm_report_num_entries);
       /* Consecutive-failure fallback for the no-baseline-TSF case. */
       if (++s_ftm_consecutive_fails >= FTM_FAIL_REAUTH_THRESHOLD) {
-        ESP_LOGW(TAG, "FTM failed %u times in a row — forcing clean "
-                      "reassociation (AP likely stuck-TX for this STA)",
+        ESP_LOGW(TAG,
+                 "FTM failed %u times in a row — forcing clean "
+                 "reassociation (AP likely stuck-TX for this STA)",
                  (unsigned)s_ftm_consecutive_fails);
         s_ftm_consecutive_fails = 0;
         s_prev_ap_tsf_ps = 0;
@@ -252,17 +333,17 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       if (r->ftm_report_num_entries && (s_fail <= 5 || s_fail % 25 == 0)) {
         wifi_ftm_report_entry_t entries[16];
         uint8_t n = r->ftm_report_num_entries;
-        if (n > 16) n = 16;
+        if (n > 16)
+          n = 16;
         if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
           for (uint8_t i = 0; i < n; ++i) {
             const wifi_ftm_report_entry_t *e = &entries[i];
             ESP_LOGW(TAG,
                      "  entry %u: rssi=%d rtt=%u ps t1=%llu t2=%llu "
                      "t3=%llu t4=%llu ppm=%d",
-                     i, e->rssi, (unsigned)e->rtt,
-                     (unsigned long long)e->t1, (unsigned long long)e->t2,
-                     (unsigned long long)e->t3, (unsigned long long)e->t4,
-                     e->ppm);
+                     i, e->rssi, (unsigned)e->rtt, (unsigned long long)e->t1,
+                     (unsigned long long)e->t2, (unsigned long long)e->t3,
+                     (unsigned long long)e->t4, e->ppm);
           }
         }
       }
@@ -347,8 +428,10 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
    * the high nibble carries majorSdoId; mask it off before comparing. */
   if ((h->messagetype & PTP_MSGTYPE_MASK) != PTP_MSGTYPE_FOLLOW_UP) {
     if ((s_seen % 50) == 1) {
-      ESP_LOGW(TAG, "Beacon Vendor IE messagetype 0x%02x not Follow_Up; "
-                    "skipped.", h->messagetype);
+      ESP_LOGW(TAG,
+               "Beacon Vendor IE messagetype 0x%02x not Follow_Up; "
+               "skipped.",
+               h->messagetype);
     }
     return;
   }
@@ -397,8 +480,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                      ((uint32_t)fu->origintimestamp[7] << 16) |
                      ((uint32_t)fu->origintimestamp[8] << 8) |
                      (uint32_t)fu->origintimestamp[9];
-    s_gptp_marker_ns =
-        (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs;
+    s_gptp_marker_ns = (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs;
     s_seen_gptp = true;
   }
 
@@ -410,8 +492,8 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
    * — that's the high-entropy field that always advances on a fresh
    * marshal. */
   static uint8_t s_last_origin_ts[10] = {0};
-  if (memcmp(s_last_origin_ts, fu->origintimestamp,
-             sizeof(s_last_origin_ts)) == 0) {
+  if (memcmp(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts)) ==
+      0) {
     return;
   }
   memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
@@ -449,8 +531,9 @@ static void ftm_client_task(void *arg) {
     }
     static bool s_logged_ap_caps = false;
     if (!s_logged_ap_caps) {
-      ESP_LOGI(TAG, "AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u "
-                    "ftm_responder=%d (advertised in beacon)",
+      ESP_LOGI(TAG,
+               "AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u "
+               "ftm_responder=%d (advertised in beacon)",
                ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
                ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5],
                ap_info.primary, ap_info.ftm_responder);
@@ -475,17 +558,6 @@ static void ftm_client_task(void *arg) {
   }
 }
 
-/* esp_avb dispatcher invokes this for every received Wi-Fi frame
- * with ethertype 0x88f7. Runs in the Wi-Fi RX task context — short
- * synchronous body, no blocking. */
-static void ptp_wifi_sta_on_ptp_rx(const uint8_t *ptp_msg, uint16_t len,
-                                   const uint8_t src_mac[6], void *ctx) {
-  (void)src_mac;
-  (void)ctx;
-  if (s_port_index < 0) return;
-  (void)ptp_inject_received_frame(s_port_index, ptp_msg, len);
-}
-
 int ptp_wifi_sta_start(int port_index) {
   if (s_port_index >= 0) {
     return 0; /* idempotent: already started */
@@ -500,12 +572,10 @@ int ptp_wifi_sta_start(int port_index) {
 
   /* Multiple handlers may register for the same WIFI_EVENT; ptp.c's
    * ptp_wifi_event_handler tracks link state on the same events. */
-  esp_err_t r =
-      esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                 on_wifi_event, NULL);
+  esp_err_t r = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                           on_wifi_event, NULL);
   if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
-    ESP_LOGW(TAG, "esp_event_handler_register failed: %s",
-             esp_err_to_name(r));
+    ESP_LOGW(TAG, "esp_event_handler_register failed: %s", esp_err_to_name(r));
   }
 
   /* Race: applications typically wait for STA_CONNECTED before calling
@@ -525,17 +595,15 @@ int ptp_wifi_sta_start(int port_index) {
     ESP_LOGW(TAG, "esp_wifi_set_vendor_ie_cb failed: %s", esp_err_to_name(r));
   }
 
-  /* Hook esp_avb's PTP rx dispatcher so received 0x88f7 frames on the
-   * Wi-Fi STA reach the daemon. The bridge sends unicast Announce per
-   * §12.2 (see ptp_wifi_ap.c); those land here and feed the existing
-   * BMCA / selected_source update via ptp_inject_received_frame. */
-  avb_net_set_ptp_rx_handler(ptp_wifi_sta_on_ptp_rx, NULL);
+  /* 0x88f7 RX is fed in by the application's Wi-Fi dispatcher via
+   * the public ptp_inject_received_frame() API (see esp_ptp.h) —
+   * no callback registration needed here. */
 
   if (xTaskCreate(ftm_client_task, "ftm_client", 4096, NULL, 5, NULL) !=
       pdPASS) {
     ESP_LOGW(TAG, "xTaskCreate ftm_client failed");
   }
 
-  ESP_LOGI(TAG, "Wi-Fi STA PTP transport started on port %d", port_index);
+  ESP_LOGI(TAG, "Wi-Fi PTP transport started on port %d", port_index);
   return 0;
 }

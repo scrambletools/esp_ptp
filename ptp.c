@@ -54,7 +54,6 @@
 #include <sys/poll.h>
 
 #include "ptp.h"
-#include "ptp_clock_sw.h"
 
 /* True once ptp_clock_sw_init() succeeds; routes time ops through the
  * SW clock backend. On C6 this is the only path that can actually move
@@ -209,32 +208,32 @@ static void ptpd_lateness_tick(void) {
   (CONFIG_ETH_CLOCK_ADJTIME_SLEWLIMIT_PPB / 1000)
 
 // To able to set either only server or only client
-#ifndef CONFIG_NETUTILS_PTPD_TIMEOUT_MS
-#define CONFIG_NETUTILS_PTPD_TIMEOUT_MS 0
+#ifndef CONFIG_ESP_PTP_TIMEOUT_MS
+#define CONFIG_ESP_PTP_TIMEOUT_MS 0
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_SETTIME_THRESHOLD_MS
-#define CONFIG_NETUTILS_PTPD_SETTIME_THRESHOLD_MS 0
+#ifndef CONFIG_ESP_PTP_SETTIME_THRESHOLD_MS
+#define CONFIG_ESP_PTP_SETTIME_THRESHOLD_MS 0
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_MAX_PATH_DELAY_NS
-#define CONFIG_NETUTILS_PTPD_MAX_PATH_DELAY_NS 0
+#ifndef CONFIG_ESP_PTP_MAX_PATH_DELAY_NS
+#define CONFIG_ESP_PTP_MAX_PATH_DELAY_NS 0
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT
-#define CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT 0
+#ifndef CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT
+#define CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT 0
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS
-#define CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS 16000
+#ifndef CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS
+#define CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS 16000
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS
-#define CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS 1000
+#ifndef CONFIG_ESP_PTP_PDELAYREQ_INTERVAL_MS
+#define CONFIG_ESP_PTP_PDELAYREQ_INTERVAL_MS 1000
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS
-#define CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS 250
+#ifndef CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS
+#define CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS 250
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_PEER_DELAY_STABILITY_NS
-#define CONFIG_NETUTILS_PTPD_PEER_DELAY_STABILITY_NS 100
+#ifndef CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS
+#define CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS 100
 #endif
-#ifndef CONFIG_NETUTILS_PTPD_MAX_PEER_DELAY_NS
-#define CONFIG_NETUTILS_PTPD_MAX_PEER_DELAY_NS 100000LL // 100us
+#ifndef CONFIG_ESP_PTP_MAX_PEER_DELAY_NS
+#define CONFIG_ESP_PTP_MAX_PEER_DELAY_NS 100000LL // 100us
 #endif
 
 #define clock_timespec_subtract(ts1, ts2, ts3) timespecsub(ts1, ts2, ts3)
@@ -418,14 +417,14 @@ struct ptp_state_s {
   bool wifi_event_handler_registered;
 };
 
-#ifdef CONFIG_NETUTILS_PTPD_SERVER
-#define PTPD_POLL_INTERVAL CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS
+#ifdef CONFIG_ESP_PTP_SERVER
+#define PTPD_POLL_INTERVAL CONFIG_ESP_PTP_SYNC_INTERVAL_MS
 #else
-#define PTPD_POLL_INTERVAL CONFIG_NETUTILS_PTPD_TIMEOUT_MS
+#define PTPD_POLL_INTERVAL CONFIG_ESP_PTP_TIMEOUT_MS
 #endif
 
 /* PTP debug messages are enabled by either CONFIG_DEBUG_NET_INFO
- * or separately by CONFIG_NETUTILS_PTPD_DEBUG. This simplifies
+ * or separately by CONFIG_ESP_PTP_DEBUG. This simplifies
  * debugging without having excessive amount of logging from net.
  */
 
@@ -576,14 +575,14 @@ static void ptp_reset_for_profile(FAR struct ptp_state_s *state) {
 
   if (ptp_is_gptp(state)) {
     state->port[0].delayreq_interval_ms =
-        CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS;
+        CONFIG_ESP_PTP_PDELAYREQ_INTERVAL_MS;
     state->port[0].next_delayreq_interval_ms =
-        CONFIG_NETUTILS_PTPD_PDELAYREQ_INTERVAL_MS;
+        CONFIG_ESP_PTP_PDELAYREQ_INTERVAL_MS;
   } else {
     state->port[0].delayreq_interval_ms =
-        CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
+        CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS;
     state->port[0].next_delayreq_interval_ms =
-        CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS;
+        CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS;
   }
 }
 
@@ -899,7 +898,7 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
    * 0x88f7 socket) refresh last_received_announce continuously, while
    * last_received_sync is only updated on BTCA *switch* events. Looking
    * at both prevents the Wi-Fi case from spuriously timing out after
-   * CONFIG_NETUTILS_PTPD_TIMEOUT_MS while a stable source is still
+   * CONFIG_ESP_PTP_TIMEOUT_MS while a stable source is still
    * being announced. */
   clock_gettime(CLOCK_MONOTONIC, &time_now);
   struct timespec last_evt = state->port[0].last_received_sync;
@@ -910,7 +909,7 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
   }
   clock_timespec_subtract(&time_now, &last_evt, &delta);
 
-  if (timespec_to_ms(&delta) > CONFIG_NETUTILS_PTPD_TIMEOUT_MS) {
+  if (timespec_to_ms(&delta) > CONFIG_ESP_PTP_TIMEOUT_MS) {
     ESP_LOGD(TAG, "Too long time since received packet\n");
     return false; /* Too long time since received packet */
   }
@@ -1209,7 +1208,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->offset_pi.ki = 3; /* matches ptp4l default gain ~0.3 */
   state->offset_pi.drift_acc = 0;
 
-#ifdef CONFIG_NETUTILS_PTPD_GPTP_PROFILE
+#ifdef CONFIG_ESP_PTP_GPTP_PROFILE
   state->ptp_profile = ptp_profile_gptp;
 #else
   state->ptp_profile = ptp_profile_standard;
@@ -1263,7 +1262,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
    * middle of the 48-bit MAC to form the 8-byte clockIdentity). */
   uint8_t *mac = p->intf_hw_addr;
   state->own_identity.header.version = 2;
-  state->own_identity.header.domain = CONFIG_NETUTILS_PTPD_DOMAIN;
+  state->own_identity.header.domain = CONFIG_ESP_PTP_DOMAIN;
   state->own_identity.header.sourceidentity[0] = mac[0];
   state->own_identity.header.sourceidentity[1] = mac[1];
   state->own_identity.header.sourceidentity[2] = mac[2];
@@ -1274,18 +1273,18 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->own_identity.header.sourceidentity[7] = mac[5];
   state->own_identity.header.sourceportindex[0] = 0;
   state->own_identity.header.sourceportindex[1] = 1;
-#if defined(CONFIG_NETUTILS_PTPD_SERVER) ||                                    \
-    defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
-  state->own_identity.btc_priority1 = CONFIG_NETUTILS_PTPD_PRIORITY1;
-  state->own_identity.btc_quality[0] = CONFIG_NETUTILS_PTPD_CLASS;
-  state->own_identity.btc_quality[1] = CONFIG_NETUTILS_PTPD_ACCURACY;
+#if defined(CONFIG_ESP_PTP_SERVER) ||                                    \
+    defined(CONFIG_ESP_PTP_GPTP_PROFILE)
+  state->own_identity.btc_priority1 = CONFIG_ESP_PTP_PRIORITY1;
+  state->own_identity.btc_quality[0] = CONFIG_ESP_PTP_CLASS;
+  state->own_identity.btc_quality[1] = CONFIG_ESP_PTP_ACCURACY;
   state->own_identity.btc_quality[2] = 0xff;
   state->own_identity.btc_quality[3] = 0xff;
-  state->own_identity.btc_priority2 = CONFIG_NETUTILS_PTPD_PRIORITY2;
+  state->own_identity.btc_priority2 = CONFIG_ESP_PTP_PRIORITY2;
   memcpy(state->own_identity.btc_identity,
          state->own_identity.header.sourceidentity,
          sizeof(state->own_identity.btc_identity));
-  state->own_identity.timesource = CONFIG_NETUTILS_PTPD_CLOCKSOURCE;
+  state->own_identity.timesource = CONFIG_ESP_PTP_CLOCKSOURCE;
 #else
   /* Statically configured as timereceiver: advertise worst priority. */
   state->own_identity.btc_priority1 = 255;
@@ -1474,7 +1473,7 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   msg.header.messagetype = PTP_MSGTYPE_ANNOUNCE;
   msg.header.messagelength[1] = sizeof(msg);
   msg.header.logmessageinterval =
-      msec_to_log_period(CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS);
+      msec_to_log_period(CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS);
 
   if (ptp_is_gptp(state)) {
     msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
@@ -1524,7 +1523,7 @@ ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
   out->header.messagetype = PTP_MSGTYPE_FOLLOW_UP;
   out->header.controlfield = 2; /* IEEE 1588 Follow_Up controlfield */
   out->header.logmessageinterval =
-      msec_to_log_period(CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS);
+      msec_to_log_period(CONFIG_ESP_PTP_SYNC_INTERVAL_MS);
   out->header.messagelength[0] = 0;
   out->header.messagelength[1] = sizeof(struct ptp_follow_up_s);
   out->header.flags[0] = 0; /* 2-step bit lives on Sync, cleared on Follow_Up */
@@ -1568,11 +1567,11 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
   msg.header.messagetype = PTP_MSGTYPE_SYNC;
   msg.header.messagelength[1] = sizeof(struct ptp_sync_s);
   msg.header.logmessageinterval =
-      msec_to_log_period(CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS);
+      msec_to_log_period(CONFIG_ESP_PTP_SYNC_INTERVAL_MS);
 
-#if defined(CONFIG_NETUTILS_PTPD_TWOSTEP_SYNC) ||                              \
+#if defined(CONFIG_ESP_PTP_TWOSTEP_SYNC) ||                              \
     defined(                                                                   \
-        CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always uses two-step sync
+        CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always uses two-step sync
   msg.header.flags[0] = PTP_FLAGS0_TWOSTEP;
 #endif
   if (ptp_is_gptp(state)) {
@@ -1592,9 +1591,9 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
     return ret;
   }
 
-#if defined(CONFIG_NETUTILS_PTPD_TWOSTEP_SYNC) ||                              \
+#if defined(CONFIG_ESP_PTP_TWOSTEP_SYNC) ||                              \
     defined(                                                                   \
-        CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always uses two-step sync
+        CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always uses two-step sync
 
   /* Send the follow up message */
 
@@ -1629,7 +1628,7 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
           (long)ptp_get_sequence(&msg.header));
 #else
   ptpinfo("Sent sync, seq %ld\n", (long)ptp_get_sequence(&msg.header));
-#endif /* CONFIG_NETUTILS_PTPD_TWOSTEP_SYNC */
+#endif /* CONFIG_ESP_PTP_TWOSTEP_SYNC */
 
   return OK;
 }
@@ -1785,8 +1784,8 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
 /* Check if we need to send packets */
 
 static int ptp_periodic_send(FAR struct ptp_state_s *state) {
-#if defined(CONFIG_NETUTILS_PTPD_SERVER) ||                                    \
-    defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
+#if defined(CONFIG_ESP_PTP_SERVER) ||                                    \
+    defined(CONFIG_ESP_PTP_GPTP_PROFILE)
   /* If there is no better timetransmitter clock on the network,
    * act as the reference source and send server packets. */
 
@@ -1801,19 +1800,19 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     clock_gettime(CLOCK_MONOTONIC, &time_now);
     clock_timespec_subtract(&time_now,
                             &state->port[0].last_transmitted_announce, &delta);
-    if (timespec_to_ms(&delta) > CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS) {
+    if (timespec_to_ms(&delta) > CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS) {
       state->port[0].last_transmitted_announce = time_now;
       ptp_send_announce(state);
     }
 
     clock_timespec_subtract(&time_now, &state->port[0].last_transmitted_sync,
                             &delta);
-    if (timespec_to_ms(&delta) > CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS) {
+    if (timespec_to_ms(&delta) > CONFIG_ESP_PTP_SYNC_INTERVAL_MS) {
       state->port[0].last_transmitted_sync = time_now;
       ptp_send_sync(state);
     }
   }
-#endif /* CONFIG_NETUTILS_PTPD_SERVER */
+#endif /* CONFIG_ESP_PTP_SERVER */
 
   /* Sync emission on wifi_ftm ports via the §12.7 FollowUpInformation
    * IE. Runs regardless of selected_source_valid (bridge republishes
@@ -1830,7 +1829,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     struct timespec time_now, delta;
     clock_gettime(CLOCK_MONOTONIC, &time_now);
     clock_timespec_subtract(&time_now, &port->last_transmitted_sync, &delta);
-    if (timespec_to_ms(&delta) <= CONFIG_NETUTILS_PTPD_SYNC_INTERVAL_MS) {
+    if (timespec_to_ms(&delta) <= CONFIG_ESP_PTP_SYNC_INTERVAL_MS) {
       continue;
     }
     port->last_transmitted_sync = time_now;
@@ -1859,7 +1858,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     clock_gettime(CLOCK_MONOTONIC, &time_now);
     clock_timespec_subtract(&time_now, &port->last_transmitted_announce,
                             &delta);
-    if (timespec_to_ms(&delta) <= CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS) {
+    if (timespec_to_ms(&delta) <= CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS) {
       continue;
     }
     port->last_transmitted_announce = time_now;
@@ -1878,7 +1877,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     msg.header.messagetype = PTP_MSGTYPE_ANNOUNCE;
     msg.header.messagelength[1] = sizeof(msg);
     msg.header.logmessageinterval =
-        msec_to_log_period(CONFIG_NETUTILS_PTPD_ANNOUNCE_INTERVAL_MS);
+        msec_to_log_period(CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS);
     if (ptp_is_gptp(state)) {
       msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP;
       msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
@@ -2017,9 +2016,9 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   int64_t diff = llabs(offset_ns) - llabs(state->last_offset_ns);
   static int cnt = 0;
   if ((ptp_is_gptp(state) &&
-       llabs(diff) < CONFIG_NETUTILS_PTPD_PEER_DELAY_STABILITY_NS) ||
+       llabs(diff) < CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS) ||
       (!ptp_is_gptp(state) &&
-       llabs(diff) < CONFIG_NETUTILS_PTPD_PATH_DELAY_STABILITY_NS)) {
+       llabs(diff) < CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS)) {
     if (cnt <= 3)
       cnt++;
   } else {
@@ -2053,7 +2052,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
   int64_t delta_ns;
   int64_t absdelta_ns;
   const int64_t adj_limit_ns =
-      CONFIG_NETUTILS_PTPD_SETTIME_THRESHOLD_MS * (int64_t)NSEC_PER_MSEC;
+      CONFIG_ESP_PTP_SETTIME_THRESHOLD_MS * (int64_t)NSEC_PER_MSEC;
 
   ptpinfo("Local time: %lld.%09ld, remote time %lld.%09ld\n",
           (long long)local_timestamp->tv_sec, (long)local_timestamp->tv_nsec,
@@ -2185,8 +2184,8 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
       ptp_is_gptp(state) ? PTP_MSGTYPE_PDELAY_RESP : PTP_MSGTYPE_DELAY_RESP;
   size_t resp_len = sizeof(struct ptp_delay_resp_s);
 
-#if defined(CONFIG_NETUTILS_PTPD_TWOSTEP_SYNC) ||                              \
-    defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE)
+#if defined(CONFIG_ESP_PTP_TWOSTEP_SYNC) ||                              \
+    defined(CONFIG_ESP_PTP_GPTP_PROFILE)
   resp.header.flags[0] = PTP_FLAGS0_TWOSTEP;
 #endif
 
@@ -2210,7 +2209,7 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
    * Pdelay_Resp_Follow_Up inherits the value from this header. */
   resp.header.logmessageinterval = msec_to_log_period(
       ptp_is_gptp(state) ? log_period_to_msec(0x7F)
-                         : CONFIG_NETUTILS_PTPD_DELAYREQ_INTERVAL_MS);
+                         : CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS);
   resp.header.messagelength[1] = resp_len;
 
   /* Send the response message */
@@ -2318,9 +2317,9 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
     path_delay = (path_delay + sync_delay) / 2;
 
     if (path_delay >= 0 &&
-        path_delay < CONFIG_NETUTILS_PTPD_MAX_PATH_DELAY_NS) {
+        path_delay < CONFIG_ESP_PTP_MAX_PATH_DELAY_NS) {
       if (state->port[0].path_delay_avgcount <
-          CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT) {
+          CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT) {
         state->port[0].path_delay_avgcount++;
       }
 
@@ -2399,9 +2398,9 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
   peer_delay_reflection = timespec_delta_ns(&remote_txtime, &remote_rxtime);
   peer_delay = (peer_delay_roundtrip - peer_delay_reflection) / 2;
 
-  if (peer_delay >= 0 && peer_delay < CONFIG_NETUTILS_PTPD_MAX_PEER_DELAY_NS) {
+  if (peer_delay >= 0 && peer_delay < CONFIG_ESP_PTP_MAX_PEER_DELAY_NS) {
     if (state->port[0].peer_delay_avgcount <
-        CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT) {
+        CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT) {
       state->port[0].peer_delay_avgcount++;
     }
 
@@ -2433,7 +2432,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     return OK;
   }
 
-  if (state->port[0].rxbuf.header.domain != CONFIG_NETUTILS_PTPD_DOMAIN) {
+  if (state->port[0].rxbuf.header.domain != CONFIG_ESP_PTP_DOMAIN) {
     /* Part of different clock domain, ignore */
 
     return OK;
@@ -2450,8 +2449,8 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
   /* Rout the packet to the appropriate handler */
 
   switch (state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_MASK) {
-#if defined(CONFIG_NETUTILS_PTPD_CLIENT) ||                                    \
-    defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always acts as a client
+#if defined(CONFIG_ESP_PTP_CLIENT) ||                                    \
+    defined(CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always acts as a client
   case PTP_MSGTYPE_ANNOUNCE:
     s_ptpd_rx_announce++;
     ptpinfo("Got announce packet, seq %ld\n",
@@ -2492,8 +2491,8 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     return ptp_process_delay_resp(state, &state->port[0].rxbuf.delay_resp);
 #endif
 
-#if defined(CONFIG_NETUTILS_PTPD_SERVER) ||                                    \
-    defined(CONFIG_NETUTILS_PTPD_GPTP_PROFILE) // gPTP always responds to delay
+#if defined(CONFIG_ESP_PTP_SERVER) ||                                    \
+    defined(CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always responds to delay
                                                // requests
   case PTP_MSGTYPE_DELAY_REQ:
   case PTP_MSGTYPE_PDELAY_REQ:
@@ -2753,7 +2752,7 @@ int ptpd_start_port(int port_index, FAR const char *interface,
     const BaseType_t ptpd_core = tskNO_AFFINITY;
 #endif
     if (xTaskCreatePinnedToCore(ptp_daemon, "PTPD",
-                                CONFIG_NETUTILS_PTPD_STACKSIZE, args, 22, NULL,
+                                CONFIG_ESP_PTP_STACKSIZE, args, 22, NULL,
                                 ptpd_core) != pdPASS) {
       free(args);
       ESP_LOGE(TAG, "ptpd_start_port: xTaskCreate failed");
@@ -2811,14 +2810,14 @@ int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
   }
   /* Discard out-of-band samples (multipath / handoff). */
   if (peer_delay_ns < 0 ||
-      peer_delay_ns >= CONFIG_NETUTILS_PTPD_MAX_PEER_DELAY_NS) {
+      peer_delay_ns >= CONFIG_ESP_PTP_MAX_PEER_DELAY_NS) {
     return -ERANGE;
   }
   struct ptp_port_s *p = &s_state->port[port_index];
 
   /* Running average over DELAYREQ_AVGCOUNT samples; smoothed value
    * read via port->peer_delay_ns. */
-  if (p->peer_delay_avgcount < CONFIG_NETUTILS_PTPD_DELAYREQ_AVGCOUNT) {
+  if (p->peer_delay_avgcount < CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT) {
     p->peer_delay_avgcount++;
   }
   p->peer_delay_ns +=
@@ -2828,8 +2827,7 @@ int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
 
 /* Push a Wi-Fi-received PTP frame (Ethernet header already stripped)
  * into the daemon's RX path. Used by per-medium modules that don't
- * have an L2TAP socket — esp_ptp's ptp_wifi_sta hooks esp_avb's
- * dispatcher and feeds 0x88f7 frames here. The frame is copied into
+ * have an L2TAP socket. The frame is copied into
  * port[0]'s rxbuf and routed through the same ptp_process_rx_packet
  * the EMAC RX loop uses, so received Announce / Sync / Follow_Up
  * messages flow into the existing BMCA / servo state machine. */
@@ -2991,7 +2989,7 @@ int ptpd_start(FAR const char *interface) {
   if (interface != NULL) {
     strncpy(args->interface, interface, sizeof(args->interface) - 1);
   }
-  if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_NETUTILS_PTPD_STACKSIZE, args, 6,
+  if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_ESP_PTP_STACKSIZE, args, 6,
                   NULL) != pdPASS) {
     free(args);
     ESP_LOGE(TAG, "ptpd_start: xTaskCreate failed");
@@ -3015,7 +3013,7 @@ int ptpd_start(FAR const char *interface) {
  *   On failure, a negated errno value is returned.
  *
  * Assumptions/Limitations:
- *   Multiple threads with priority less than CONFIG_NETUTILS_PTPD_SERVERPRIO
+ *   Multiple threads with priority less than CONFIG_ESP_PTP_SERVERPRIO
  *   can request status simultaneously. If higher priority threads request
  *   status simultaneously, some of the requests may timeout.
  *

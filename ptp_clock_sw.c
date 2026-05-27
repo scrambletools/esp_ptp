@@ -2,7 +2,8 @@
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
  * Software clock backend for ptpd_now() on chips without IEEE 1588
- * hardware. See ptp_clock_sw.h for design notes.
+ * hardware. Declarations and design notes live in ptp.h (the
+ * "Software clock backend" block in the internal-API section).
  *
  * Time model:
  *   t_ptp_ns(local_us) = anchor_ptp_ns
@@ -18,9 +19,10 @@
  * a seqlock — not needed today.
  */
 
-#include "ptp_clock_sw.h"
+#include "ptp.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "esp_timer.h"
