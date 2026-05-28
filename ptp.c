@@ -94,94 +94,11 @@ static bool s_use_sw_clock = false;
 
 #define ETH_TYPE_PTP 0x88F7
 
-/* Lateness diagnostic: 3+ missed pdelay exchanges in a row makes
- * strict-1AS upstream bridges drop asCapable. */
 /* Pdelay_Req emission is driven from esp_timer (priority 22, IRAM)
  * rather than the main poll() loop to keep cadence tight enough for
  * strict-1AS evaluators. */
 static esp_timer_handle_t s_pdelay_req_timer = NULL;
 static void pdelay_req_timer_cb(void *arg);
-
-static int64_t s_ptpd_last_loop_us = 0;
-static int64_t s_ptpd_loop_max_gap_us = 0;
-static int64_t s_ptpd_last_report_us = 0;
-static uint32_t s_ptpd_loop_iters = 0;
-static uint32_t s_ptpd_tx_req_total = 0;
-static uint32_t s_ptpd_tx_req_late = 0;
-static int64_t s_ptpd_tx_req_late_max_us = 0;
-
-/* Per-message-type RX counters, reset each report window. */
-static uint32_t s_ptpd_rx_sync = 0;
-static uint32_t s_ptpd_rx_followup = 0;
-static uint32_t s_ptpd_rx_announce = 0;
-static uint32_t s_ptpd_rx_pdelay_req = 0;
-static uint32_t s_ptpd_rx_pdelay_resp = 0;
-static uint32_t s_ptpd_rx_pdelay_fup = 0;
-/* Max gap between two consecutive received syncs. If the wire shows
- * steady 125 ms syncs but this goes above say 1 s, ptpd isn't seeing
- * them even though they're reaching the NIC. */
-static int64_t s_ptpd_rx_sync_last_us = 0;
-static int64_t s_ptpd_rx_sync_max_gap_us = 0;
-
-static void ptpd_lateness_record_rx_sync(void) {
-  int64_t now = esp_timer_get_time();
-  if (s_ptpd_rx_sync_last_us) {
-    int64_t gap = now - s_ptpd_rx_sync_last_us;
-    if (gap > s_ptpd_rx_sync_max_gap_us)
-      s_ptpd_rx_sync_max_gap_us = gap;
-  }
-  s_ptpd_rx_sync_last_us = now;
-  s_ptpd_rx_sync++;
-}
-
-static void ptpd_lateness_record_tx(int64_t lateness_us) {
-  s_ptpd_tx_req_total++;
-  if (lateness_us > 200000LL) {
-    s_ptpd_tx_req_late++;
-    if (lateness_us > s_ptpd_tx_req_late_max_us)
-      s_ptpd_tx_req_late_max_us = lateness_us;
-  }
-}
-
-static void ptpd_lateness_tick(void) {
-  int64_t now = esp_timer_get_time();
-  s_ptpd_loop_iters++;
-  if (s_ptpd_last_loop_us) {
-    int64_t gap = now - s_ptpd_last_loop_us;
-    if (gap > s_ptpd_loop_max_gap_us)
-      s_ptpd_loop_max_gap_us = gap;
-  }
-  s_ptpd_last_loop_us = now;
-  if (s_ptpd_last_report_us == 0) {
-    s_ptpd_last_report_us = now;
-    return;
-  }
-  if (now - s_ptpd_last_report_us < 10000000LL)
-    return;
-  ESP_LOGW(
-      "ptpd-late",
-      "iters=%u loop_gap_max=%lldms tx=%u/%u late(max=%lldms) "
-      "rx_sync=%u max_gap=%lldms fup=%u ann=%u pd_req=%u pd_resp=%u pd_fup=%u",
-      (unsigned)s_ptpd_loop_iters, s_ptpd_loop_max_gap_us / 1000,
-      (unsigned)s_ptpd_tx_req_late, (unsigned)s_ptpd_tx_req_total,
-      s_ptpd_tx_req_late_max_us / 1000, (unsigned)s_ptpd_rx_sync,
-      s_ptpd_rx_sync_max_gap_us / 1000, (unsigned)s_ptpd_rx_followup,
-      (unsigned)s_ptpd_rx_announce, (unsigned)s_ptpd_rx_pdelay_req,
-      (unsigned)s_ptpd_rx_pdelay_resp, (unsigned)s_ptpd_rx_pdelay_fup);
-  s_ptpd_loop_max_gap_us = 0;
-  s_ptpd_loop_iters = 0;
-  s_ptpd_tx_req_total = 0;
-  s_ptpd_tx_req_late = 0;
-  s_ptpd_tx_req_late_max_us = 0;
-  s_ptpd_rx_sync = 0;
-  s_ptpd_rx_sync_max_gap_us = 0;
-  s_ptpd_rx_followup = 0;
-  s_ptpd_rx_announce = 0;
-  s_ptpd_rx_pdelay_req = 0;
-  s_ptpd_rx_pdelay_resp = 0;
-  s_ptpd_rx_pdelay_fup = 0;
-  s_ptpd_last_report_us = now;
-}
 
 #define SET_MAC_ADDR(addr, a, b, c, d, e, f)                                   \
   do {                                                                         \
@@ -246,6 +163,8 @@ static void ptpd_lateness_tick(void) {
 #define ADJ_FREQ_MAX 512000
 #define PTP_FREQ_P_DIV 100
 #define PTP_FREQ_I_DIV 1000
+#define PTP_LOCK_OFFSET_NS 100000LL
+#define PTP_LOCK_STABILITY_NS 5000LL
 typedef struct {
   int32_t kp;
   int32_t ki;
@@ -1497,8 +1416,6 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
-  } else {
-    ptpinfo("Sent announce, seq %ld\n", (long)ptp_get_sequence(&msg.header));
   }
 
   return ret;
@@ -1624,10 +1541,6 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
     return ret;
   }
 
-  ptpinfo("Sent sync + follow-up, seq %ld\n",
-          (long)ptp_get_sequence(&msg.header));
-#else
-  ptpinfo("Sent sync, seq %ld\n", (long)ptp_get_sequence(&msg.header));
 #endif /* CONFIG_ESP_PTP_TWOSTEP_SYNC */
 
   return OK;
@@ -1683,7 +1596,6 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
       /* For AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2). */
       state->port[0].pdelay_req_attempts_unanswered++;
     }
-    ptpinfo("Sent delay req, seq %ld\n", (long)ptp_get_sequence(&req.header));
   }
 
   return ret;
@@ -1703,19 +1615,6 @@ static IRAM_ATTR void pdelay_req_timer_cb(void *arg) {
       state->port[0].ptp_socket >= 0 &&
       (ptp_is_gptp(state) ||
        (state->selected_source_valid && state->port[0].can_send_delayreq))) {
-    /* Record lateness against the planned interval for the diagnostic. */
-    if (state->port[0].last_transmitted_delayreq.tv_sec != 0) {
-      struct timespec time_now;
-      struct timespec delta;
-      clock_gettime(CLOCK_MONOTONIC, &time_now);
-      clock_timespec_subtract(
-          &time_now, &state->port[0].last_transmitted_delayreq, &delta);
-      int64_t late_ms = (int64_t)timespec_to_ms(&delta) -
-                        (int64_t)state->port[0].next_delayreq_interval_ms;
-      if (late_ms > 0) {
-        ptpd_lateness_record_tx(late_ms * 1000LL);
-      }
-    }
     ptp_send_delay_req(state);
   }
   /* Re-arm with the current interval (updated when Pdelay_Resp arrives). */
@@ -1963,6 +1862,11 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   /* The ESP-IDF hardware clock applies ADJ_FREQUENCY relative to its current
    * addend. Keep the PI output as an absolute trim and apply only its delta;
    * applying the complete output every Sync accumulates rate error. */
+  if ((offset_ns > 0 && state->last_offset_ns < 0) ||
+      (offset_ns < 0 && state->last_offset_ns > 0)) {
+    state->offset_pi.drift_acc = 0;
+  }
+
   state->offset_pi.drift_acc += offset_ns / PTP_FREQ_I_DIV;
   if (state->offset_pi.drift_acc > ADJ_FREQ_MAX) {
     state->offset_pi.drift_acc = ADJ_FREQ_MAX;
@@ -1977,17 +1881,11 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   }
   int32_t trim_delta = (int32_t)target_trim - state->freq_trim_ppb;
 
-  /* Record interval diagnostics; these values are not an adjustment input
-   * because short Sync-to-Sync measurements contain scheduling jitter. */
   int64_t remote_time_ns = timespec_to_ns(remote_timestamp);
   int64_t local_time_ns = timespec_to_ns(local_timestamp);
-  int64_t remote_delta_ns = remote_time_ns - state->remote_time_ns_prev;
-  int64_t local_delta_ns = local_time_ns - state->local_time_ns_prev;
-  int64_t tick_diff = remote_delta_ns - local_delta_ns;
 
   if (s_use_sw_clock) {
     /* SW backend caps at +/- 1e8 ppb; let it clamp by returning -1. */
-    ptp_clock_sw_adjtime_rate((int32_t)trim_delta);
     if (ptp_clock_sw_adjtime_rate((int32_t)trim_delta) == 0) {
       state->freq_trim_ppb = (int32_t)target_trim;
     }
@@ -2005,30 +1903,26 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   state->remote_time_ns_prev = remote_time_ns;
   state->local_time_ns_prev = local_time_ns;
 
-  ptpinfo("remote_delta_ns %lli, local_delta_ns %lli, tick_diff %lli\n",
-          remote_delta_ns, local_delta_ns, tick_diff);
-  ptpinfo("offset_ns %lli, trim %li, delta %li, drift_acc %li\n", offset_ns,
-          (long)target_trim, (long)trim_delta,
-          (long)state->offset_pi.drift_acc);
   // Get the path delay only when clock is stable enough. If we were
   // in the process of speeding/slowing the local clock, we'd get an
   // incorrect delay measurement
   int64_t diff = llabs(offset_ns) - llabs(state->last_offset_ns);
   static int cnt = 0;
-  if ((ptp_is_gptp(state) &&
-       llabs(diff) < CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS) ||
-      (!ptp_is_gptp(state) &&
-       llabs(diff) < CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS)) {
+  const int64_t lock_offset_ns = PTP_LOCK_OFFSET_NS;
+  int64_t lock_stability_ns =
+      ptp_is_gptp(state) ? (int64_t)CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS
+                         : (int64_t)CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS;
+  if (lock_stability_ns < PTP_LOCK_STABILITY_NS) {
+    lock_stability_ns = PTP_LOCK_STABILITY_NS;
+  }
+  if (llabs(offset_ns) < lock_offset_ns && llabs(diff) < lock_stability_ns) {
     if (cnt <= 3)
       cnt++;
   } else {
     cnt = 0;
   }
   if (cnt > 3) {
-    ptpinfo("clock is stablized\n");
     state->port[0].can_send_delayreq = true;
-  } else {
-    ptpinfo("clock is still unstable\n");
   }
   state->last_offset_ns = offset_ns;
 }
@@ -2053,10 +1947,6 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
   int64_t absdelta_ns;
   const int64_t adj_limit_ns =
       CONFIG_ESP_PTP_SETTIME_THRESHOLD_MS * (int64_t)NSEC_PER_MSEC;
-
-  ptpinfo("Local time: %lld.%09ld, remote time %lld.%09ld\n",
-          (long long)local_timestamp->tv_sec, (long)local_timestamp->tv_nsec,
-          (long long)remote_timestamp->tv_sec, (long)remote_timestamp->tv_nsec);
 
   delta_ns = timespec_delta_ns(remote_timestamp, local_timestamp);
   if (ptp_is_gptp(state)) {
@@ -2123,7 +2013,6 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
 
     state->port[0].twostep_rxtime = state->port[0].rxtime;
     state->port[0].twostep_packet = *msg;
-    ptpinfo("Waiting for follow-up\n");
     return OK;
   }
 
@@ -2303,7 +2192,6 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
 
     state->port[0].twostep_delay_resp_rxtime = state->port[0].rxtime;
     state->port[0].twostep_delay_resp_packet = *msg;
-    ptpinfo("Waiting for delay response follow-up\n");
   } else {
     /* Path delay is calculated as the average between delta for sync
      * message and delta for delay req message.
@@ -2327,8 +2215,6 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
           (path_delay - state->port[0].path_delay_ns) /
           state->port[0].path_delay_avgcount;
 
-      ptpinfo("Path delay: %ld ns (avg: %ld ns)\n", (long)path_delay,
-              (long)state->port[0].path_delay_ns);
     } else {
       ptpwarn("Path delay out of range: %lld ns\n", (long long)path_delay);
     }
@@ -2351,8 +2237,6 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
       ptp_is_gptp(state)
           ? state->port[0].delayreq_interval_ms
           : rand_delayreq_interval(state->port[0].delayreq_interval_ms);
-  ptpinfo("Randomized delay req interval: %d ms\n",
-          state->port[0].next_delayreq_interval_ms);
 
   return OK;
 }
@@ -2408,8 +2292,6 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
         (peer_delay - state->port[0].peer_delay_ns) /
         state->port[0].peer_delay_avgcount;
 
-    ptpinfo("Peer delay: %ld ns (avg: %ld ns)\n", (long)peer_delay,
-            (long)state->port[0].peer_delay_ns);
   } else {
     ptpwarn("Peer delay out of range: %lld ns\n", (long long)peer_delay);
   }
@@ -2452,24 +2334,15 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 #if defined(CONFIG_ESP_PTP_CLIENT) ||                                    \
     defined(CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always acts as a client
   case PTP_MSGTYPE_ANNOUNCE:
-    s_ptpd_rx_announce++;
-    ptpinfo("Got announce packet, seq %ld\n",
-            (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     return ptp_process_announce(state, &state->port[0].rxbuf.announce);
 
   case PTP_MSGTYPE_SYNC:
-    ptpd_lateness_record_rx_sync();
-    ptpinfo("Got sync packet, seq %ld\n",
-            (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (!state->selected_source_valid) {
       return OK;
     } // ignore if operating as a server in gPTP profile
     return ptp_process_sync(state, &state->port[0].rxbuf.sync);
 
   case PTP_MSGTYPE_FOLLOW_UP:
-    s_ptpd_rx_followup++;
-    ptpinfo("Got follow-up packet, seq %ld\n",
-            (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (!state->selected_source_valid) {
       return OK;
     } // ignore if operating as a server in gPTP profile
@@ -2477,9 +2350,6 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 
   case PTP_MSGTYPE_DELAY_RESP:
   case PTP_MSGTYPE_PDELAY_RESP:
-    s_ptpd_rx_pdelay_resp++;
-    ptpinfo("Got delay-resp, seq %ld\n",
-            (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(state->port[0].rxbuf.raw, length,
                                       sizeof(struct ptp_delay_resp_s))) {
       state->port[0].peer_is_endpoint = true;
@@ -2496,9 +2366,6 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
                                                // requests
   case PTP_MSGTYPE_DELAY_REQ:
   case PTP_MSGTYPE_PDELAY_REQ:
-    s_ptpd_rx_pdelay_req++;
-    ptpinfo("Got delay req, seq %ld\n",
-            (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(state->port[0].rxbuf.raw, length,
                                       sizeof(struct ptp_pdelay_req_s))) {
       state->port[0].peer_is_endpoint = true;
@@ -2507,9 +2374,6 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 #endif
 
   case PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP:
-    s_ptpd_rx_pdelay_fup++;
-    ptpinfo("Got peer delay resp follow-up, seq %ld\n",
-            (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(
             state->port[0].rxbuf.raw, length,
             sizeof(struct ptp_delay_resp_follow_up_s))) {
@@ -2651,7 +2515,6 @@ static void ptp_daemon(void *task_param) {
       (pollfds[0].fd < 0) ? PTPD_NOSOCK_POLL_MS : PTPD_POLL_INTERVAL;
 
   while (!state->stop) {
-    ptpd_lateness_tick();
     state->port[0].can_send_delayreq = ptp_is_gptp(state);
 
     pollfds[0].revents = 0;
