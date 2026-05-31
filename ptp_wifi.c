@@ -170,18 +170,6 @@ static uint64_t s_prev_ap_tsf_ps;
  * jitter and far below a real AP uptime. */
 #define TSF_BOUNCE_THRESHOLD_PS (1000ULL * 1000ULL * 1000ULL * 1000ULL)
 
-/* FTM repeated-failure fallback. The TSF-backwards check above only
- * fires if there was a previous valid t1 to compare against — useless
- * when the STA boots into an AP that's stuck from the moment of
- * association (i.e., AP unicast TX is broken, so FTM frames don't
- * arrive at the STA and the report is FTM_STATUS_NO_VALID_MSMT). In
- * that case the STA never gets a valid t1, so the only way out is to
- * count consecutive FTM failures and force a clean reassociation
- * after a few. At a 200 ms FTM burst period this gives recovery in
- * a few seconds. */
-static uint32_t s_ftm_consecutive_fails;
-#define FTM_FAIL_REAUTH_THRESHOLD 10
-
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
   (void)arg;
@@ -257,8 +245,6 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       }
       if (best_t1_ps)
         s_prev_ap_tsf_ps = best_t1_ps;
-      /* Reset consecutive-failure counter on any successful FTM. */
-      s_ftm_consecutive_fails = 0;
       int64_t peer_delay_ns;
       if (avg_rtt_ps) {
         uint64_t one_way_ps = avg_rtt_ps / 2;
@@ -310,19 +296,16 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     } else {
       ESP_LOGW(TAG, "FTM session failed: status=%d num_entries=%u", r->status,
                r->ftm_report_num_entries);
-      /* Consecutive-failure fallback for the no-baseline-TSF case. */
-      if (++s_ftm_consecutive_fails >= FTM_FAIL_REAUTH_THRESHOLD) {
-        ESP_LOGW(TAG,
-                 "FTM failed %u times in a row — forcing clean "
-                 "reassociation (AP likely stuck-TX for this STA)",
-                 (unsigned)s_ftm_consecutive_fails);
-        s_ftm_consecutive_fails = 0;
-        s_prev_ap_tsf_ps = 0;
-        s_seen_tsf = false;
-        s_seen_gptp = false;
-        esp_wifi_disconnect();
-        break;
-      }
+      /* No reassociation on FTM failure. status=5 (NO_VALID_MSMT) here
+       * means the responder shipped unusable ranging timestamps, not
+       * that frames went missing — the STA receives the FTM frames every
+       * session (RSSI healthy, beacons + §12.7 Follow_Ups keep flowing)
+       * but the driver rejects the measurements. A reassociation cannot
+       * fix bad timestamps; it only churns the link, which (with the
+       * default STA netif present) re-attaches the netif rxcb and stalls
+       * AVB RX. The genuine AP-reboot case is still caught by the
+       * TSF-backwards check on the success path above. Time transfer
+       * falls back to §12.7 beacon-IE markers without FTM ranging. */
       /* Diagnostic dump of per-entry t1..t4 on rare statuses where
        * IDF still populates the report (e.g. NO_VALID_MSMT). Tells us
        * which side is shipping zero/garbage timestamps. Always dump
