@@ -157,7 +157,7 @@ static bool s_seen_tsf;
 /* AP-bounce detection. The AP's TSF (Timing Synchronization Function)
  * increments monotonically and resets to ~0 when the AP reboots. Each
  * FTM report carries the AP TSF at the FTM TX moment (per-entry t1 in
- * picoseconds). A sudden backward step in t1 across FTM cycles means
+ * picoseconds). A sustained backward step in t1 across FTM cycles means
  * the AP rebooted while the STA was still associated — in that state
  * the STA's per-STA TX scheduler on the AP side stays corrupted until
  * the STA does a clean leave/rejoin (see Phase B in our investigation
@@ -169,6 +169,31 @@ static uint64_t s_prev_ap_tsf_ps;
  * clock corrections, not actual reboot. 1 s is well past any plausible
  * jitter and far below a real AP uptime. */
 #define TSF_BOUNCE_THRESHOLD_PS (1000ULL * 1000ULL * 1000ULL * 1000ULL)
+/* Distinguishing a real AP reboot from a bad FTM sample.
+ *
+ * This C6 SoftAP FTM responder emits occasional garbage-low t1 values
+ * in degraded-FTM windows. They are indistinguishable from a reboot if
+ * you only look at the FTM t1 (correlated capture 2026-05-31: the AP TSF
+ * never actually reset — the bridge's beacon TSF climbed continuously
+ * while the FTM t1 returned 5/8/10 s; ESP3 deauthed itself on the bad
+ * samples). The streak counter below is a weak guard (the bad samples
+ * arrive in sustained runs ≥3, so a streak alone still trips).
+ *
+ * PRIMARY discriminator: cross-check against an INDEPENDENT, monotonic
+ * copy of the AP TSF — the §12.7 TSF-mapping IE carried in every beacon
+ * (s_tsf_marker_us, updated by on_vendor_ie). A genuine reboot zeroes the
+ * beacon TSF too; a bad FTM sample leaves it high and advancing. Extra
+ * corroboration: a real reboot makes FTM sessions FAIL outright, so a
+ * backward t1 inside a *successful* report is almost always a bad sample.
+ *
+ * SECONDARY guard: still require several CONSECUTIVE corroborated
+ * backward readings before tearing the link down — mirrors IEEE
+ * 802.1AS-2020 allowedLostResponses / syncReceiptTimeout (both default 3:
+ * never fault a link on one bad measurement). While a streak is open we
+ * HOLD the baseline at the last trusted t1; any forward reading clears
+ * it. */
+#define TSF_BOUNCE_CONSEC_THRESHOLD 3
+static uint32_t s_tsf_backward_streak;
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
@@ -227,13 +252,58 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
        * AP-mode driver has the unicast-stuck bug. */
       if (best_t1_ps && s_prev_ap_tsf_ps) {
         if (best_t1_ps + TSF_BOUNCE_THRESHOLD_PS < s_prev_ap_tsf_ps) {
+          /* FTM t1 stepped backward — reboot signature, OR a garbage-low
+           * FTM sample. Cross-check the independent beacon §12.7 TSF
+           * marker: if it is still near the old baseline (not zeroed),
+           * the AP did NOT reboot and this t1 is a bad sample. Default to
+           * "corroborated" only when there is no fresh beacon marker to
+           * check (then the streak guard alone decides). */
+          bool beacon_confirms = true;
+          if (s_seen_tsf && s_tsf_marker_us > 0) {
+            uint64_t tsf_marker_ps = (uint64_t)s_tsf_marker_us * 1000000ULL;
+            beacon_confirms =
+                (tsf_marker_ps + TSF_BOUNCE_THRESHOLD_PS < s_prev_ap_tsf_ps);
+          }
+          if (!beacon_confirms) {
+            /* Bad FTM ranging sample — beacon TSF proves the AP is up.
+             * Ignore it entirely: don't count the streak, hold baseline,
+             * skip this report's pair injection (t1 is untrustworthy). */
+            static uint32_t s_bad_ftm_t1;
+            if ((++s_bad_ftm_t1 % 10) == 1) {
+              ESP_LOGW(TAG,
+                       "FTM t1 backward (now=%llu ps) but beacon TSF still "
+                       "advancing (ap_tsf=%lld us) — bad FTM sample, ignoring "
+                       "(count=%u)",
+                       (unsigned long long)best_t1_ps,
+                       (long long)s_tsf_marker_us, (unsigned)s_bad_ftm_t1);
+            }
+            s_tsf_backward_streak = 0;
+            break;
+          }
+          /* Beacon corroborates (or none to check). Still require a
+           * sustained streak before tearing the link down. Hold the
+           * baseline at the last trusted t1 while the streak is open, so
+           * one outlier followed by a normal reading clears itself. */
+          if (++s_tsf_backward_streak < TSF_BOUNCE_CONSEC_THRESHOLD) {
+            ESP_LOGW(TAG,
+                     "AP TSF backward (prev=%llu ps, now=%llu ps) "
+                     "streak=%u/%u — awaiting confirmation",
+                     (unsigned long long)s_prev_ap_tsf_ps,
+                     (unsigned long long)best_t1_ps,
+                     (unsigned)s_tsf_backward_streak,
+                     (unsigned)TSF_BOUNCE_CONSEC_THRESHOLD);
+            break; /* hold baseline; skip this report's pair injection */
+          }
           ESP_LOGW(TAG,
-                   "AP TSF stepped backwards (prev=%llu ps, now=%llu ps) — "
-                   "AP rebooted; forcing clean reassociation",
+                   "AP TSF stepped backwards %u cycles (prev=%llu ps, "
+                   "now=%llu ps), beacon TSF corroborates — AP rebooted; "
+                   "forcing clean reassociation",
+                   (unsigned)s_tsf_backward_streak,
                    (unsigned long long)s_prev_ap_tsf_ps,
                    (unsigned long long)best_t1_ps);
           /* Invalidate cached markers so we don't pair-inject against
            * the (now-meaningless) old bridge time anchor. */
+          s_tsf_backward_streak = 0;
           s_seen_tsf = false;
           s_seen_gptp = false;
           s_prev_ap_tsf_ps = 0;
@@ -242,6 +312,8 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
           esp_wifi_disconnect();
           break; /* skip the rest of this report — markers are gone */
         }
+        /* Forward (normal) reading — clear any pending backward streak. */
+        s_tsf_backward_streak = 0;
       }
       if (best_t1_ps)
         s_prev_ap_tsf_ps = best_t1_ps;
