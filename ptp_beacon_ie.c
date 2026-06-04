@@ -24,6 +24,9 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_wifi_types_generic.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include <errno.h>
 #include <stddef.h>
 #include <string.h>
@@ -71,11 +74,23 @@ static void on_set_vendor_ie_ack(uint32_t msg_id, const uint8_t *data,
 
 static bool s_acked_at_least_once = false;
 
-static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
-                           size_t fu_info_len, FAR void *ctx) {
-  (void)port_index;
-  (void)ctx;
+/* §12.7 publishing runs on a dedicated task so the blocking esp_hosted
+ * SDIO RPC never stalls the PTPD main loop. The loop must answer wired
+ * Pdelay within ~hundreds of µs to keep the upstream peer treating us
+ * as asCapable; a synchronous C6 round-trip in that loop adds tens to
+ * hundreds of ms of jitter and causes the peer to revoke asCapable.
+ * The daemon marshals the FollowUpInformation in its own context and
+ * hands it off via a length-1 overwrite mailbox — only the most recent
+ * Sync matters, so a superseded entry is correctly dropped. */
+#define PTP_BEACON_IE_FU_MAX 128
+typedef struct {
+  uint8_t fu[PTP_BEACON_IE_FU_MAX];
+  size_t len;
+} beacon_ie_item_t;
 
+static QueueHandle_t s_fu_mbox;
+
+static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
   /* Wire frame: ptp_rpc_set_vendor_ie_t header + vendor_ie_data_t.
    * Vendor IE layout per 802.11 9.4.2.25 + 802.1AS §12.7 Figure 12-8. */
   uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + fu_info_len];
@@ -141,6 +156,36 @@ static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
   }
 }
 
+static void republish_task(FAR void *arg) {
+  (void)arg;
+  beacon_ie_item_t item;
+  for (;;) {
+    if (xQueueReceive(s_fu_mbox, &item, portMAX_DELAY) == pdTRUE) {
+      publish_ies(item.fu, item.len);
+    }
+  }
+}
+
+/* Daemon-context hook: copy the marshaled FollowUpInformation into the
+ * mailbox and return immediately. The blocking C6 RPC happens on
+ * republish_task, off the PTPD loop. */
+static void on_sync_egress(int port_index, FAR const uint8_t *fu_info,
+                           size_t fu_info_len, FAR void *ctx) {
+  (void)port_index;
+  (void)ctx;
+  if (s_fu_mbox == NULL || fu_info == NULL) {
+    return;
+  }
+  beacon_ie_item_t item;
+  if (fu_info_len > sizeof(item.fu)) {
+    fu_info_len = sizeof(item.fu);
+  }
+  memcpy(item.fu, fu_info, fu_info_len);
+  item.len = fu_info_len;
+  /* Overwrite mailbox: non-blocking; latest Sync supersedes any pending. */
+  xQueueOverwrite(s_fu_mbox, &item);
+}
+
 /* Wire the §12.7 FollowUpInformation publisher into ptpd. Called from
  * ptp_port_init_wifi_ftm() in the AP-mode branch — i.e. after
  * ptpd_start_port has guaranteed s_state != NULL — so the
@@ -155,6 +200,20 @@ int ptp_beacon_ie_attach(int port_index) {
              "PTP_BEACON_IE_PORT=%d — Kconfig and call site disagree",
              port_index, PTP_BEACON_IE_PORT);
     return -EINVAL;
+  }
+  if (s_fu_mbox == NULL) {
+    s_fu_mbox = xQueueCreate(1, sizeof(beacon_ie_item_t));
+    if (s_fu_mbox == NULL) {
+      ESP_LOGE(TAG, "failed to create FollowUpInformation mailbox");
+      return -ENOMEM;
+    }
+    /* Core 0: PTPD is pinned to core 1, so this task's blocking C6 RPC
+     * can never preempt or stall the wired gPTP loop. */
+    if (xTaskCreatePinnedToCore(republish_task, "ptp_ie_pub", 4096, NULL, 5,
+                                NULL, 0) != pdPASS) {
+      ESP_LOGE(TAG, "failed to create FollowUpInformation publish task");
+      return -ENOMEM;
+    }
   }
   int rc =
       ptpd_register_sync_egress_cb(PTP_BEACON_IE_PORT, on_sync_egress, NULL);

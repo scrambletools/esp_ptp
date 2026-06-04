@@ -2251,6 +2251,23 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
     }
     ptpinfo("Sent response + response follow-up, seq %ld\n",
             (long)ptp_get_sequence(&resp.header));
+    /* asCapable-trigger diagnostic: per Pdelay response, log the inputs the
+     * upstream peer uses to keep us asCapable — responder turnaround (t3-t2),
+     * our applied clock-rate trim (its neighborRateRatio input), peer delay,
+     * and time since the last Sync we received (gap = peer withholding). */
+    {
+      int64_t turn_us =
+          (timespec_to_ns(&ts) - timespec_to_ns(&state->port[0].rxtime)) / 1000;
+      struct timespec now_mono, sync_gap;
+      clock_gettime(CLOCK_MONOTONIC, &now_mono);
+      clock_timespec_subtract(&now_mono, &state->port[0].last_received_sync,
+                              &sync_gap);
+      ESP_LOGW("ptpd-trig",
+               "turn_us=%lld freq_ppb=%ld pdelay_ns=%lld sync_gap_ms=%lld",
+               (long long)turn_us, (long)state->freq_trim_ppb,
+               (long long)state->port[0].peer_delay_ns,
+               (long long)timespec_to_ms(&sync_gap));
+    }
   } else {
     ptpinfo("Sent delay resp, seq %ld\n", (long)ptp_get_sequence(&req->header));
   }

@@ -43,6 +43,7 @@
 #include "esp_wifi_types_generic.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "esp_ptp.h"
@@ -86,8 +87,8 @@ static int wifi_ap_send_unicast_ptp(const uint8_t src_mac[6],
   return (r == ESP_OK) ? (int)sizeof(frame) : -1;
 }
 
-int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
-                              void *ptp_msg, uint16_t ptp_msg_len) {
+static int ap_send_announce_now(int port_index, const uint8_t src_mac[6],
+                                void *ptp_msg, uint16_t ptp_msg_len) {
   wifi_sta_list_t sta_list;
   memset(&sta_list, 0, sizeof(sta_list));
   esp_err_t r = esp_wifi_ap_get_sta_list(&sta_list);
@@ -117,6 +118,65 @@ int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
              sent, sta_list.num, port_index, (unsigned)s_seen);
   }
   return sent;
+}
+
+/* §12.2 Announce republish runs on a dedicated task so the blocking
+ * esp_wifi_ap_get_sta_list RPC never stalls the PTPD main loop. The
+ * daemon builds the Announce in its own context and hands it off via a
+ * length-1 overwrite mailbox — only the most recent Announce matters. */
+#define PTP_AP_ANNOUNCE_MAX 160
+typedef struct {
+  int port_index;
+  uint8_t src_mac[6];
+  uint16_t len;
+  uint8_t msg[PTP_AP_ANNOUNCE_MAX];
+} ap_announce_item_t;
+
+static QueueHandle_t s_announce_mbox;
+
+static void ap_announce_task(void *arg) {
+  (void)arg;
+  ap_announce_item_t item;
+  for (;;) {
+    if (xQueueReceive(s_announce_mbox, &item, portMAX_DELAY) == pdTRUE) {
+      ap_send_announce_now(item.port_index, item.src_mac, item.msg, item.len);
+    }
+  }
+}
+
+/* Daemon-context hook: copy the Announce into the mailbox and return
+ * immediately. The blocking get-STA-list RPC + unicast sends run on
+ * ap_announce_task, off the PTPD loop. */
+int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
+                              void *ptp_msg, uint16_t ptp_msg_len) {
+  if (s_announce_mbox == NULL) {
+    s_announce_mbox = xQueueCreate(1, sizeof(ap_announce_item_t));
+    if (s_announce_mbox == NULL) {
+      ESP_LOGE(TAG, "failed to create Announce mailbox");
+      return -1;
+    }
+    /* Core 0: PTPD is pinned to core 1, so the blocking RPC can never
+     * stall the wired gPTP loop. */
+    if (xTaskCreatePinnedToCore(ap_announce_task, "ptp_ann_pub", 4096, NULL, 5,
+                                NULL, 0) != pdPASS) {
+      ESP_LOGE(TAG, "failed to create Announce publish task");
+      vQueueDelete(s_announce_mbox);
+      s_announce_mbox = NULL;
+      return -1;
+    }
+  }
+  ap_announce_item_t item;
+  memset(&item, 0, sizeof(item));
+  item.port_index = port_index;
+  memcpy(item.src_mac, src_mac, sizeof(item.src_mac));
+  if (ptp_msg_len > sizeof(item.msg)) {
+    ptp_msg_len = sizeof(item.msg);
+  }
+  memcpy(item.msg, ptp_msg, ptp_msg_len);
+  item.len = ptp_msg_len;
+  /* Overwrite mailbox: non-blocking; latest Announce supersedes any pending. */
+  xQueueOverwrite(s_announce_mbox, &item);
+  return 0;
 }
 
 /* ===========================================================================
@@ -211,10 +271,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     if (r->status == FTM_STATUS_SUCCESS) {
       /* Per-entry rtt is picosecond-resolution; the aggregate rtt_est
        * is integer nanoseconds, which truncates to 0 at bench
-       * distances where one-way delay is sub-ns. Average the valid
-       * per-entry rtt values (zeros are invalid samples filtered by
-       * IDF), halve for one-way, then round ps → ns at the daemon
-       * boundary. */
+       * distances where one-way delay is sub-ns. Average only the
+       * genuinely valid per-entry rtt values, halve for one-way, then
+       * round ps → ns at the daemon boundary. IDF flags an invalid
+       * reading with rtt == UINT32_MAX (and occasionally 0); both must
+       * be excluded or they poison the average and the t1/t2 anchor,
+       * yielding ms-scale peer delays that the servo then rejects. */
       uint64_t avg_rtt_ps = 0;
       uint8_t valid = 0;
       uint8_t n = r->ftm_report_num_entries;
@@ -228,7 +290,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
           uint64_t sum_ps = 0;
           int last_valid = -1;
           for (uint8_t i = 0; i < n; ++i) {
-            if (entries[i].rtt) {
+            if (entries[i].rtt && entries[i].rtt != UINT32_MAX) {
               sum_ps += entries[i].rtt;
               valid++;
               last_valid = i;
@@ -347,6 +409,18 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
         int64_t sw_now_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
         local_at_RX_ns = sw_now_ns - (now_us - t2_us) * 1000;
 
+        /* Diagnostic: expose the raw time bases. If FTM t2 shares
+         * esp_timer's epoch then (now_us - t2_us) is a small positive
+         * residence time; if t2 is on the AP-TSF epoch (like t1_us /
+         * tsf_mk) the term is huge and throws local_RX onto the wrong
+         * epoch, thrashing the servo. */
+        ESP_LOGW(TAG,
+                 "FTMpair t1_us=%lld t2_us=%lld tsf_mk=%lld now_us=%lld "
+                 "now-t2=%lld t1gPTP=%lld localRX=%lld",
+                 (long long)t1_us, (long long)t2_us, (long long)s_tsf_marker_us,
+                 (long long)now_us, (long long)(now_us - t2_us),
+                 (long long)t1_gPTP_ns, (long long)local_at_RX_ns);
+
         pair_rc =
             ptpd_inject_sync_pair(s_port_index, t1_gPTP_ns, local_at_RX_ns);
       }
@@ -366,18 +440,28 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       }
       xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
     } else {
-      ESP_LOGW(TAG, "FTM session failed: status=%d num_entries=%u", r->status,
-               r->ftm_report_num_entries);
-      /* No reassociation on FTM failure. status=5 (NO_VALID_MSMT) here
-       * means the responder shipped unusable ranging timestamps, not
-       * that frames went missing — the STA receives the FTM frames every
-       * session (RSSI healthy, beacons + §12.7 Follow_Ups keep flowing)
-       * but the driver rejects the measurements. A reassociation cannot
-       * fix bad timestamps; it only churns the link, which (with the
-       * default STA netif present) re-attaches the netif rxcb and stalls
-       * AVB RX. The genuine AP-reboot case is still caught by the
-       * TSF-backwards check on the success path above. Time transfer
-       * falls back to §12.7 beacon-IE markers without FTM ranging. */
+      /* Failure path. In practice num_entries is always 0 here: IDF
+       * receives the FTM action frames (it logs "N received measurements")
+       * but yields zero valid report entries, so there are no per-entry
+       * t1..t4 to inspect. The only initiator-side data IDF exposes on a
+       * failed session are the aggregates below: rtt_raw/rtt_est are the
+       * RTTs it computed before rejecting them (0 if it derived none) and
+       * dist_est its one-way distance estimate. These show whether IDF
+       * computed anything at all from the frames or discarded them
+       * outright. We do NOT yet know which side is at fault (responder
+       * t1/t4 vs local t2/t3 capture); the empty report hides it. */
+      ESP_LOGW(TAG,
+               "FTM session failed: status=%d num_entries=%u "
+               "rtt_raw=%u ns rtt_est=%u ns dist_est=%u cm",
+               r->status, r->ftm_report_num_entries, (unsigned)r->rtt_raw,
+               (unsigned)r->rtt_est, (unsigned)r->dist_est);
+      /* No reassociation on FTM failure — the STA still receives the FTM
+       * frames (RSSI healthy, beacons + §12.7 Follow_Ups keep flowing), so
+       * churning the link cannot help and (with the default STA netif
+       * present) would re-attach the netif rxcb and stall AVB RX. The
+       * genuine AP-reboot case is still caught by the TSF-backwards check
+       * on the success path above. Time transfer falls back to §12.7
+       * beacon-IE markers without FTM ranging. */
       /* Diagnostic dump of per-entry t1..t4 on rare statuses where
        * IDF still populates the report (e.g. NO_VALID_MSMT). Tells us
        * which side is shipping zero/garbage timestamps. Always dump
@@ -552,6 +636,30 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     return;
   }
   memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
+
+  /* Diagnostic: assess a beacon-anchored sync pair. Capture the local
+   * clocks at IE-parse time against the §12.7 BTC marker. d_diff_ns —
+   * the beacon-to-beacon difference between remote BTC advance and local
+   * monotonic advance — is the jitter a beacon-RX servo would face
+   * (callback latency + marshal/TX granularity, no HW RX stamp). */
+  {
+    int64_t now_us = esp_timer_get_time();
+    struct timespec swn = {0};
+    ptpd_now(&swn);
+    int64_t sw_now_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
+    static int64_t s_prev_now_us;
+    static int64_t s_prev_gptp_ns;
+    int64_t d_now = s_prev_now_us ? (now_us - s_prev_now_us) : 0;
+    int64_t d_gptp = s_prev_gptp_ns ? (s_gptp_marker_ns - s_prev_gptp_ns) : 0;
+    ESP_LOGW(TAG,
+             "BCNanchor now_us=%lld gptp_ns=%lld sw_now_ns=%lld d_now_us=%lld "
+             "d_gptp_ns=%lld d_diff_ns=%lld",
+             (long long)now_us, (long long)s_gptp_marker_ns,
+             (long long)sw_now_ns, (long long)d_now, (long long)d_gptp,
+             (long long)(d_gptp - d_now * 1000));
+    s_prev_now_us = now_us;
+    s_prev_gptp_ns = s_gptp_marker_ns;
+  }
 
   /* Feed Follow_Up into the daemon. inject_sync bootstraps —
    * sets selected_source (so inject_sync_pair has the BTC identity
