@@ -213,6 +213,10 @@ static int64_t s_gptp_marker_ns;
 static int64_t s_tsf_marker_us;
 static bool s_seen_gptp;
 static bool s_seen_tsf;
+/* Latest FTM-derived link delay (ns). The beacon disciplining path adds
+ * it to BTC_now; FTM only refines this value, so the clock still tracks
+ * when FTM is unavailable (it just loses the ~propagation correction). */
+static int64_t s_peer_delay_ns;
 
 /* AP-bounce detection. The AP's TSF (Timing Synchronization Function)
  * increments monotonically and resets to ~0 when the AP reboots. Each
@@ -283,7 +287,6 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       if (n > 16)
         n = 16;
       uint64_t best_t1_ps = 0;
-      uint64_t best_t2_ps = 0;
       if (n) {
         wifi_ftm_report_entry_t entries[16];
         if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
@@ -301,7 +304,6 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
           }
           if (last_valid >= 0) {
             best_t1_ps = entries[last_valid].t1;
-            best_t2_ps = entries[last_valid].t2;
           }
         }
       }
@@ -389,54 +391,22 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       }
       int rc = ptpd_inject_peer_delay(s_port_index, peer_delay_ns);
 
-      /* FTM-derived sync pair. With a fresh (gPTP, AP-TSF) mapping
-       * AND a valid FTM measurement, convert the bridge-side hardware-
-       * timestamped t1 (pSec on bridge TSF) into BTC time, then
-       * back-project the STA local clock to the FTM RX moment via t2.
-       * Pair-injection runs the same servo as the wired path. */
-      int pair_rc = 0;
-      int64_t t1_gPTP_ns = 0;
-      int64_t local_at_RX_ns = 0;
-      if (s_seen_gptp && s_seen_tsf && best_t1_ps && best_t2_ps) {
-        int64_t t1_us = (int64_t)(best_t1_ps / 1000000ULL);
-        int64_t delta_us = t1_us - s_tsf_marker_us;
-        t1_gPTP_ns = s_gptp_marker_ns + delta_us * 1000;
-
-        int64_t t2_us = (int64_t)(best_t2_ps / 1000000ULL);
-        int64_t now_us = esp_timer_get_time();
-        struct timespec swn = {0};
-        ptpd_now(&swn);
-        int64_t sw_now_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
-        local_at_RX_ns = sw_now_ns - (now_us - t2_us) * 1000;
-
-        /* Diagnostic: expose the raw time bases. If FTM t2 shares
-         * esp_timer's epoch then (now_us - t2_us) is a small positive
-         * residence time; if t2 is on the AP-TSF epoch (like t1_us /
-         * tsf_mk) the term is huge and throws local_RX onto the wrong
-         * epoch, thrashing the servo. */
-        ESP_LOGW(TAG,
-                 "FTMpair t1_us=%lld t2_us=%lld tsf_mk=%lld now_us=%lld "
-                 "now-t2=%lld t1gPTP=%lld localRX=%lld",
-                 (long long)t1_us, (long long)t2_us, (long long)s_tsf_marker_us,
-                 (long long)now_us, (long long)(now_us - t2_us),
-                 (long long)t1_gPTP_ns, (long long)local_at_RX_ns);
-
-        pair_rc =
-            ptpd_inject_sync_pair(s_port_index, t1_gPTP_ns, local_at_RX_ns);
-      }
+      /* FTM now only refines the link delay. The BTC timeline is carried
+       * by the beacon's (BTC, AP-TSF) pair + the STA TSF and disciplined
+       * in on_vendor_ie, so the broken ToD weld is gone. Stash the latest
+       * link delay for that path. */
+      s_peer_delay_ns = peer_delay_ns;
 
       static uint32_t s_seen = 0;
       if ((++s_seen % 25) == 1) {
         ESP_LOGI(TAG,
                  "FTM report #%u: peer %02x:%02x:%02x:%02x:%02x:%02x "
                  "RTT_est=%u ns  avg_rtt=%llu ps (%u/%u valid)  "
-                 "peer_delay=%lld ns  inject_rc=%d  "
-                 "pair_rc=%d t1_gPTP=%lld local_RX=%lld",
+                 "peer_delay=%lld ns  inject_rc=%d",
                  (unsigned)s_seen, r->peer_mac[0], r->peer_mac[1],
                  r->peer_mac[2], r->peer_mac[3], r->peer_mac[4], r->peer_mac[5],
                  (unsigned)r->rtt_est, (unsigned long long)avg_rtt_ps, valid, n,
-                 (long long)peer_delay_ns, rc, pair_rc, (long long)t1_gPTP_ns,
-                 (long long)local_at_RX_ns);
+                 (long long)peer_delay_ns, rc);
       }
       xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
     } else {
@@ -495,18 +465,13 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
 }
 
 /* Vendor IE callback — fires for every Vendor IE in scanned/received
- * beacons and probe responses. Filters to our OUI and decodes both
- * IE sub-types we publish from the bridge:
- *
- *   FOLLOWUP    — IEEE 802.1AS-2020 §12.7 Follow_Up message. The
- *                  preciseOriginTimestamp is stashed as the BTC marker
- *                  for FTM pair-injection, and the parsed bytes are
- *                  fed into ptpd's selected_source via inject_sync.
- *   TSF_MAPPING — bridge AP TSF µs at coprocessor publish moment
- *                  (Scramble Tools-private). Paired with the §12.7
- *                  preciseOriginTimestamp it gives the STA a
- *                  (BTC, TSF) anchor that converts FTM t1 (TSF µs)
- *                  to BTC time. */
+ * beacons and probe responses. Filters to our OUI and decodes the
+ * combined FOLLOWUP IE the bridge publishes: an IEEE 802.1AS-2020
+ * §12.7 Follow_Up (its preciseOriginTimestamp is the BTC marker) with
+ * the bridge AP TSF µs appended (the AP-TSF marker). Both are captured
+ * for the same beacon, giving the STA an atomic (BTC, AP-TSF) anchor;
+ * combined with the STA's own TSF (the same counter as the AP TSF) it
+ * disciplines its clock to BTC. FTM supplies only the link delay. */
 static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                          const uint8_t sa[6], const vendor_ie_data_t *vnd_ie,
                          int rssi) {
@@ -523,24 +488,8 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   int payload_len = (int)vnd_ie->length - 4;
   const uint8_t *payload = vnd_ie->payload;
 
-  if (vnd_ie->vendor_oui_type == PTP_VND_IE_OUI_TYPE_TSF_MAPPING) {
-    if (payload_len < PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN) {
-      return;
-    }
-    int64_t tsf_us = 0;
-    for (int i = 0; i < 8; ++i) {
-      tsf_us |= ((int64_t)payload[i]) << (8 * i);
-    }
-    s_tsf_marker_us = tsf_us;
-    s_seen_tsf = true;
-    static uint32_t s_tsf_ie_seen = 0;
-    if ((++s_tsf_ie_seen % 25) == 1) {
-      ESP_LOGI(TAG, "TSF mapping IE #%u: ap_tsf=%lld us",
-               (unsigned)s_tsf_ie_seen, (long long)tsf_us);
-    }
-    return;
-  }
-
+  /* Only the combined FOLLOWUP IE is published now; the AP-TSF marker
+   * rides its trailing bytes (parsed below) rather than a separate IE. */
   if (vnd_ie->vendor_oui_type != PTP_VND_IE_OUI_TYPE_FOLLOWUP) {
     return;
   }
@@ -548,14 +497,17 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   static uint32_t s_seen = 0;
   ++s_seen;
 
-  /* Validate size against an 802.1AS-2020 §12.7 Follow_Up payload. */
-  if (payload_len != (int)sizeof(struct ptp_follow_up_s)) {
+  /* Validate size: §12.7 Follow_Up payload + the appended AP-TSF marker
+   * (the bridge combines them into one IE for atomic BTC/TSF pairing). */
+  const int expect_len =
+      (int)sizeof(struct ptp_follow_up_s) + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN;
+  if (payload_len != expect_len) {
     if ((s_seen % 50) == 1) {
       ESP_LOGW(TAG,
                "Beacon Vendor IE from %02x:%02x:%02x:%02x:%02x:%02x: "
-               "payload %d B (expected %u for §12.7 Follow_Up). Skipped.",
+               "payload %d B (expected %d for §12.7 FU + AP-TSF). Skipped.",
                sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], payload_len,
-               (unsigned)sizeof(struct ptp_follow_up_s));
+               expect_len);
     }
     return;
   }
@@ -623,6 +575,19 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     s_seen_gptp = true;
   }
 
+  /* The AP-TSF marker (µs, little-endian) is appended right after the
+   * Follow_Up in the combined IE — atomically paired with the BTC marker
+   * above (both captured for the same beacon on the bridge). */
+  {
+    const uint8_t *tsf = payload + sizeof(struct ptp_follow_up_s);
+    int64_t tsf_us = 0;
+    for (int i = 0; i < PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN; i++) {
+      tsf_us |= ((int64_t)tsf[i]) << (8 * i);
+    }
+    s_tsf_marker_us = tsf_us;
+    s_seen_tsf = true;
+  }
+
   /* Deduplicate against the previous-seen IE. Beacons fire every
    * ~100 ms (AP DTIM cadence) but the bridge only re-marshals the IE
    * every Sync interval (125 ms by default). So most beacons re-carry
@@ -637,37 +602,68 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   }
   memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
 
-  /* Diagnostic: assess a beacon-anchored sync pair. Capture the local
-   * clocks at IE-parse time against the §12.7 BTC marker. d_diff_ns —
-   * the beacon-to-beacon difference between remote BTC advance and local
-   * monotonic advance — is the jitter a beacon-RX servo would face
-   * (callback latency + marshal/TX granularity, no HW RX stamp). */
-  {
-    int64_t now_us = esp_timer_get_time();
+  /* Discipline the clock to BTC. The beacon carries the (BTC, AP-TSF)
+   * pair (gptp_marker, tsf_mk); the STA's own TSF is the same counter as
+   * the AP-TSF marker, so (sta_tsf_now - tsf_mk) is a valid AP-TSF
+   * interval. FTM supplies only the link delay. selected_source (GM
+   * identity / validity) comes from the §12.2 Announce, which
+   * inject_sync_pair gates on. STA TSF and local clock are read
+   * back-to-back so the pair is one instant:
+   *   BTC_now = gptp_marker + (sta_tsf_now - tsf_mk)*1000 + link_delay  */
+  if (s_seen_gptp && s_seen_tsf) {
+    int64_t sta_tsf_us = esp_wifi_get_tsf_time(WIFI_IF_STA);
     struct timespec swn = {0};
     ptpd_now(&swn);
-    int64_t sw_now_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
-    static int64_t s_prev_now_us;
-    static int64_t s_prev_gptp_ns;
-    int64_t d_now = s_prev_now_us ? (now_us - s_prev_now_us) : 0;
-    int64_t d_gptp = s_prev_gptp_ns ? (s_gptp_marker_ns - s_prev_gptp_ns) : 0;
-    ESP_LOGW(TAG,
-             "BCNanchor now_us=%lld gptp_ns=%lld sw_now_ns=%lld d_now_us=%lld "
-             "d_gptp_ns=%lld d_diff_ns=%lld",
-             (long long)now_us, (long long)s_gptp_marker_ns,
-             (long long)sw_now_ns, (long long)d_now, (long long)d_gptp,
-             (long long)(d_gptp - d_now * 1000));
-    s_prev_now_us = now_us;
-    s_prev_gptp_ns = s_gptp_marker_ns;
-  }
+    int64_t local_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
+    int64_t btc_now_ns = s_gptp_marker_ns +
+                         (sta_tsf_us - s_tsf_marker_us) * 1000 + s_peer_delay_ns;
+    int64_t off_ns = btc_now_ns - local_ns;
 
-  /* Feed Follow_Up into the daemon. inject_sync bootstraps —
-   * sets selected_source (so inject_sync_pair has the BTC identity
-   * it gates on) and jumps the SW clock to BTC time on the first
-   * beacon. After that the FTM-derived pair injection (sub-ms
-   * precision) runs alongside this coarse beacon-IE injection;
-   * the servo converges to the FTM-precision regime. */
-  (void)ptpd_inject_sync(s_port_index, payload, (size_t)payload_len);
+    /* Spike filter for the beacon-IE discipline. The BTC marker (host
+     * marshal) and the AP-TSF marker (coprocessor patch) are captured one
+     * SDIO RPC apart; that gap's variance throws the occasional beacon's
+     * offset by tens of ms. Once converged, drop isolated outliers so they
+     * don't step the clock; accept a sustained run of them as a genuine
+     * step and re-converge. Bootstrap (not yet locked) always injects. */
+    static bool s_locked = false;
+    static int s_lock_run = 0;
+    static int s_spike_run = 0;
+    const int64_t LOCK_NS = 30LL * 1000 * 1000;  /* "converged" band */
+    const int64_t SPIKE_NS = 50LL * 1000 * 1000; /* outlier threshold */
+    const int LOCK_RUN = 3;       /* in-band samples to declare lock */
+    const int SPIKE_RUN_STEP = 8; /* consecutive outliers => real step */
+
+    bool inject = true;
+    bool spike = false;
+    if (s_locked && llabs(off_ns) > SPIKE_NS) {
+      if (++s_spike_run >= SPIKE_RUN_STEP) {
+        s_locked = false; /* sustained: a genuine step, let it through */
+        s_spike_run = 0;
+      } else {
+        inject = false; /* isolated spike: reject */
+        spike = true;
+      }
+    } else {
+      s_spike_run = 0;
+      if (llabs(off_ns) <= LOCK_NS) {
+        if (!s_locked && ++s_lock_run >= LOCK_RUN) {
+          s_locked = true;
+        }
+      } else {
+        s_lock_run = 0;
+      }
+    }
+
+    if (inject) {
+      (void)ptpd_inject_sync_pair(s_port_index, btc_now_ns, local_ns);
+    }
+    static uint32_t s_disc_seen = 0;
+    if (spike || (++s_disc_seen % 25) == 1) {
+      ESP_LOGI(TAG, "BTC discipline: off=%lld ns link_delay=%lld ns locked=%d%s",
+               (long long)off_ns, (long long)s_peer_delay_ns, (int)s_locked,
+               spike ? " (spike rejected)" : "");
+    }
+  }
 }
 
 /* FTM client task — initiates one burst per cadence interval against

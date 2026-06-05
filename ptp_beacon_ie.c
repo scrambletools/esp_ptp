@@ -93,7 +93,15 @@ static QueueHandle_t s_fu_mbox;
 static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
   /* Wire frame: ptp_rpc_set_vendor_ie_t header + vendor_ie_data_t.
    * Vendor IE layout per 802.11 9.4.2.25 + 802.1AS §12.7 Figure 12-8. */
-  uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + fu_info_len];
+  /* One combined IE: the §12.7 FollowUpInformation followed by an 8-byte
+   * AP-TSF marker. BTC (preciseOriginTimestamp, in fu_info) and the
+   * AP-TSF thus travel atomically paired in a single beacon IE — the STA
+   * needs both from the same instant to map its STA TSF onto BTC. The host
+   * cannot read the AP TSF (the remote esp_wifi_get_tsf_time returns -1),
+   * so it leaves a zero placeholder; the coprocessor patches the live TSF
+   * into the IE's trailing bytes before publishing. */
+  uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + fu_info_len +
+              PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
   memset(buf, 0, sizeof(buf));
 
   ptp_rpc_set_vendor_ie_t *hdr = (ptp_rpc_set_vendor_ie_t *)buf;
@@ -104,7 +112,7 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
 
   uint8_t *ie = buf + sizeof(*hdr);
   ie[0] = WIFI_VENDOR_IE_ELEMENT_ID; /* 0xDD */
-  ie[1] = (uint8_t)(4 + fu_info_len);
+  ie[1] = (uint8_t)(4 + fu_info_len + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN);
   ie[2] = PTP_VND_IE_OUI0;
   ie[3] = PTP_VND_IE_OUI1;
   ie[4] = PTP_VND_IE_OUI2;
@@ -112,6 +120,10 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
   if (fu_info != NULL && fu_info_len > 0) {
     memcpy(ie + 6, fu_info, fu_info_len);
   }
+  /* The trailing PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN bytes stay zero here:
+   * the coprocessor patches the live AP TSF into them at publish (it owns
+   * the radio and is the only side where esp_wifi_get_tsf_time(WIFI_IF_AP)
+   * is valid). */
 
   esp_err_t r = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ, buf,
                                             sizeof(buf));
@@ -128,32 +140,8 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
     s_acked_at_least_once = true;
   }
 
-  /* Companion (gPTP, AP-TSF) mapping IE in slot 1. TSF payload bytes
-   * are placeholder zeros; the coprocessor RPC handler patches in the
-   * live esp_wifi_get_tsf_time(WIFI_IF_AP) value before publishing.
-   * STA pairs this with the §12.7 preciseOriginTimestamp to convert
-   * FTM t1 into BTC time. */
-  uint8_t tbuf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 +
-               PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
-  memset(tbuf, 0, sizeof(tbuf));
-  ptp_rpc_set_vendor_ie_t *thdr = (ptp_rpc_set_vendor_ie_t *)tbuf;
-  thdr->enable = 1;
-  thdr->type = WIFI_VND_IE_TYPE_BEACON;
-  thdr->idx = WIFI_VND_IE_ID_1;
-  thdr->reserved = 0;
-  uint8_t *tie = tbuf + sizeof(*thdr);
-  tie[0] = WIFI_VENDOR_IE_ELEMENT_ID;
-  tie[1] = (uint8_t)(4 + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN);
-  tie[2] = PTP_VND_IE_OUI0;
-  tie[3] = PTP_VND_IE_OUI1;
-  tie[4] = PTP_VND_IE_OUI2;
-  tie[5] = PTP_VND_IE_OUI_TYPE_TSF_MAPPING;
-  /* tie[6..13] left zero; coprocessor patches in TSF µs LE. */
-  esp_err_t r2 = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ,
-                                             tbuf, sizeof(tbuf));
-  if (r2 != ESP_OK) {
-    ESP_LOGE(TAG, "TSF mapping IE dispatch: %s", esp_err_to_name(r2));
-  }
+  /* The separate slot-1 TSF-mapping IE is gone: the AP TSF now rides the
+   * combined FU IE above, atomically paired with BTC. */
 }
 
 static void republish_task(FAR void *arg) {
