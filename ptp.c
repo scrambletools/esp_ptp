@@ -246,6 +246,18 @@ static void ptpd_lateness_tick(void) {
 #define ADJ_FREQ_MAX 512000
 #define PTP_FREQ_P_DIV 100
 #define PTP_FREQ_I_DIV 1000
+/* The wifi/SW-clock path disciplines to a reference carrying ms-scale
+ * cross-chip gap noise. The wired gains above turn that into hundreds of
+ * ppm of per-Sync rate jitter (the proportional term alone is ~10 ppm per
+ * ms of offset). Use much gentler gains there so the loop averages the
+ * noise and locks the rate; the phase still wobbles at the gap-noise
+ * level, which is expected (and adequate for media-clock recovery). */
+#define PTP_FREQ_P_DIV_SW 2000
+#define PTP_FREQ_I_DIV_SW 8000    /* gentle integrator: heavily averages the gap noise
+                                   * so the recovered rate stays clean (slower acquire) */
+#define PTP_FREQ_STABLE_PPB 12000 /* SW: integrator flat within 12 ppm across the
+                                   * window = locked (a slow wind fails this) */
+#define PTP_FREQ_STABLE_WIN 6     /* plateau window (samples) for the SW lock check */
 typedef struct {
   int32_t kp;
   int32_t ki;
@@ -1963,13 +1975,17 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   /* The ESP-IDF hardware clock applies ADJ_FREQUENCY relative to its current
    * addend. Keep the PI output as an absolute trim and apply only its delta;
    * applying the complete output every Sync accumulates rate error. */
-  state->offset_pi.drift_acc += offset_ns / PTP_FREQ_I_DIV;
+  /* Gentler gains on the gap-noisy wifi/SW path; wired keeps the tight
+   * gains its sub-µs reference can use. */
+  const int64_t p_div = s_use_sw_clock ? PTP_FREQ_P_DIV_SW : PTP_FREQ_P_DIV;
+  const int64_t i_div = s_use_sw_clock ? PTP_FREQ_I_DIV_SW : PTP_FREQ_I_DIV;
+  state->offset_pi.drift_acc += offset_ns / i_div;
   if (state->offset_pi.drift_acc > ADJ_FREQ_MAX) {
     state->offset_pi.drift_acc = ADJ_FREQ_MAX;
   } else if (state->offset_pi.drift_acc < -ADJ_FREQ_MAX) {
     state->offset_pi.drift_acc = -ADJ_FREQ_MAX;
   }
-  int64_t target_trim = offset_ns / PTP_FREQ_P_DIV + state->offset_pi.drift_acc;
+  int64_t target_trim = offset_ns / p_div + state->offset_pi.drift_acc;
   if (target_trim > ADJ_FREQ_MAX) {
     target_trim = ADJ_FREQ_MAX;
   } else if (target_trim < -ADJ_FREQ_MAX) {
@@ -1986,8 +2002,10 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   int64_t tick_diff = remote_delta_ns - local_delta_ns;
 
   if (s_use_sw_clock) {
-    /* SW backend caps at +/- 1e8 ppb; let it clamp by returning -1. */
-    ptp_clock_sw_adjtime_rate((int32_t)trim_delta);
+    /* SW backend caps at +/- 1e8 ppb; let it clamp by returning -1. The
+     * rate adjustment is cumulative, so it must be applied exactly once
+     * per Sync — applying it twice doubles every correction and the loop
+     * never settles. */
     if (ptp_clock_sw_adjtime_rate((int32_t)trim_delta) == 0) {
       state->freq_trim_ppb = (int32_t)target_trim;
     }
@@ -1996,7 +2014,6 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
         .modes = ADJ_FREQUENCY,
         .freq = trim_delta,
     };
-    clock_adjtime(PTPD_CLOCK_ID, &tx);
     if (clock_adjtime(PTPD_CLOCK_ID, &tx) == 0) {
       state->freq_trim_ppb = (int32_t)target_trim;
     }
@@ -2015,10 +2032,38 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   // incorrect delay measurement
   int64_t diff = llabs(offset_ns) - llabs(state->last_offset_ns);
   static int cnt = 0;
-  if ((ptp_is_gptp(state) &&
-       llabs(diff) < CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS) ||
-      (!ptp_is_gptp(state) &&
-       llabs(diff) < CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS)) {
+  bool within_stability;
+  if (s_use_sw_clock) {
+    /* Phase never settles on the gap-noisy wifi reference, so judge lock by
+     * the rate. Watch the integrator (drift_acc), not freq_trim: the latter
+     * carries the proportional term, which is pure gap noise (tens of ppm)
+     * even when the rate is locked. Require a windowed plateau — flat across
+     * several seconds — so a slow integrator wind (small per-sample steps
+     * but still climbing) is not mistaken for a lock. After a step the ring
+     * holds stale values and naturally reports unstable until it refills. */
+    static int32_t drift_ring[PTP_FREQ_STABLE_WIN];
+    static int drift_ring_count = 0;
+    static int drift_ring_pos = 0;
+    drift_ring[drift_ring_pos] = state->offset_pi.drift_acc;
+    drift_ring_pos = (drift_ring_pos + 1) % PTP_FREQ_STABLE_WIN;
+    if (drift_ring_count < PTP_FREQ_STABLE_WIN) {
+      drift_ring_count++;
+    }
+    int32_t dmin = drift_ring[0], dmax = drift_ring[0];
+    for (int k = 1; k < drift_ring_count; k++) {
+      if (drift_ring[k] < dmin) dmin = drift_ring[k];
+      if (drift_ring[k] > dmax) dmax = drift_ring[k];
+    }
+    within_stability = (drift_ring_count >= PTP_FREQ_STABLE_WIN) &&
+                       (dmax - dmin < PTP_FREQ_STABLE_PPB);
+  } else {
+    within_stability =
+        (ptp_is_gptp(state) &&
+         llabs(diff) < CONFIG_ESP_PTP_PEER_DELAY_STABILITY_NS) ||
+        (!ptp_is_gptp(state) &&
+         llabs(diff) < CONFIG_ESP_PTP_PATH_DELAY_STABILITY_NS);
+  }
+  if (within_stability) {
     if (cnt <= 3)
       cnt++;
   } else {
