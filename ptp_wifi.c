@@ -602,66 +602,99 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   }
   memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
 
-  /* Discipline the clock to BTC. The beacon carries the (BTC, AP-TSF)
-   * pair (gptp_marker, tsf_mk); the STA's own TSF is the same counter as
-   * the AP-TSF marker, so (sta_tsf_now - tsf_mk) is a valid AP-TSF
-   * interval. FTM supplies only the link delay. selected_source (GM
-   * identity / validity) comes from the §12.2 Announce, which
-   * inject_sync_pair gates on. STA TSF and local clock are read
-   * back-to-back so the pair is one instant:
-   *   BTC_now = gptp_marker + (sta_tsf_now - tsf_mk)*1000 + link_delay  */
+  /* Discipline the clock to BTC in two layers, so the cross-chip pairing
+   * gap can't corrupt the recovered rate:
+   *   BTC_now = O_filt + sta_tsf_now*1000
+   * Layer 1 (rate): sta_tsf_now*1000 is the AP-clock-locked timebase — the
+   *   STA TSF is the same counter as the AP-TSF marker and is read locally
+   *   with no cross-chip gap, so its rate is clean.
+   * Layer 2 (offset): O = gptp_marker - tsf_mk*1000 + link_delay is the
+   *   BTC<->AP-TSF offset. The BTC marker (host marshal) and the AP-TSF
+   *   marker (coprocessor patch) are captured one SDIO RPC apart, so O
+   *   carries that gap's variance. It is filtered separately (min-gap
+   *   tracker, see below) so the gap never reaches the servo's integrator;
+   *   the rate is unaffected because it rides the live STA TSF.
+   * selected_source (GM identity/validity) comes from the §12.2 Announce,
+   * which inject_sync_pair gates on. STA TSF and local clock are read
+   * back-to-back so the injected pair is one instant. */
   if (s_seen_gptp && s_seen_tsf) {
     int64_t sta_tsf_us = esp_wifi_get_tsf_time(WIFI_IF_STA);
     struct timespec swn = {0};
     ptpd_now(&swn);
     int64_t local_ns = (int64_t)swn.tv_sec * 1000000000LL + swn.tv_nsec;
-    int64_t btc_now_ns = s_gptp_marker_ns +
-                         (sta_tsf_us - s_tsf_marker_us) * 1000 + s_peer_delay_ns;
-    int64_t off_ns = btc_now_ns - local_ns;
 
-    /* Spike filter for the beacon-IE discipline. The BTC marker (host
-     * marshal) and the AP-TSF marker (coprocessor patch) are captured one
-     * SDIO RPC apart; that gap's variance throws the occasional beacon's
-     * offset by tens of ms. Once converged, drop isolated outliers so they
-     * don't step the clock; accept a sustained run of them as a genuine
-     * step and re-converge. Bootstrap (not yet locked) always injects. */
-    static bool s_locked = false;
-    static int s_lock_run = 0;
-    static int s_spike_run = 0;
-    const int64_t LOCK_NS = 30LL * 1000 * 1000;  /* "converged" band */
-    const int64_t SPIKE_NS = 50LL * 1000 * 1000; /* outlier threshold */
-    const int LOCK_RUN = 3;       /* in-band samples to declare lock */
-    const int SPIKE_RUN_STEP = 8; /* consecutive outliers => real step */
+    int64_t offset_raw =
+        s_gptp_marker_ns - (int64_t)s_tsf_marker_us * 1000 + s_peer_delay_ns;
 
-    bool inject = true;
-    bool spike = false;
-    if (s_locked && llabs(off_ns) > SPIKE_NS) {
-      if (++s_spike_run >= SPIKE_RUN_STEP) {
-        s_locked = false; /* sustained: a genuine step, let it through */
-        s_spike_run = 0;
-      } else {
-        inject = false; /* isolated spike: reject */
-        spike = true;
+    /* Layer 2 recovers the BTC<->AP-TSF offset. The gap is always >= 0, so
+     * O = true_offset - gap can only dip BELOW the truth; the cleanest
+     * estimate is the smallest-gap (largest O) sample. So track the UPPER
+     * ENVELOPE of O (a min-gap / minimum-delay filter, as PTP/NTP do for
+     * asymmetric delay), not the mean — the mean sits a whole mean-gap
+     * below the truth (tens of ms of constant offset error). Stages:
+     *  - Acquire: over the first ACQ_SAMPLES, peak-hold the min-gap offset
+     *    WITHOUT disciplining (clock free-runs); the first post-acquire
+     *    inject is then one clean jump, not a long slew.
+     *  - Track (peak-hold + slow decay): rise toward cleaner samples but
+     *    cap the step below the servo slew so it never rails; decay slowly
+     *    to follow the BTC<->AP-TSF crystal drift (ignoring how deep each
+     *    gap dips); snap on a genuine step (large upward, or a sustained
+     *    large-downward run that isn't just a transient gap spike). The
+     *    rate rides the live STA TSF, so the residual offset is ~the floor
+     *    (min gap) instead of the mean gap. */
+    static int s_acq = 0;
+    static int64_t s_off_filt;
+    static int s_down_run = 0;
+    const int ACQ_SAMPLES = 16;
+    const int64_t OFF_STEP_NS = 100LL * 1000 * 1000;     /* up step => snap+jump */
+    const int OFF_UP_SHIFT = 1;                          /* rise fast to floor */
+    const int64_t OFF_UP_MAX_NS = 400000;               /* but <= ~slew/sample */
+    const int64_t OFF_DECAY_NS = 100000;                /* ~100 ppm drift follow */
+    const int64_t OFF_DOWN_STEP_NS = 350LL * 1000 * 1000; /* > worst gap spike */
+    const int OFF_DOWN_RUN = 8;                          /* sustained => real step */
+    int64_t off_err = offset_raw - s_off_filt;
+
+    if (s_acq < ACQ_SAMPLES) {
+      if (s_acq == 0 || off_err > 0) {
+        s_off_filt = offset_raw; /* peak-hold the min-gap sample */
+      }
+      s_acq++;
+      static uint32_t s_acq_log = 0;
+      if ((++s_acq_log % 8) == 1) {
+        ESP_LOGI(TAG, "BTC discipline: acquiring offset %d/%d", s_acq,
+                 ACQ_SAMPLES);
       }
     } else {
-      s_spike_run = 0;
-      if (llabs(off_ns) <= LOCK_NS) {
-        if (!s_locked && ++s_lock_run >= LOCK_RUN) {
-          s_locked = true;
+      if (off_err > OFF_STEP_NS) {
+        s_off_filt = offset_raw; /* large upward: real step / recovery, snap */
+        s_down_run = 0;
+      } else if (off_err > 0) {
+        int64_t up = off_err >> OFF_UP_SHIFT;
+        if (up > OFF_UP_MAX_NS) {
+          up = OFF_UP_MAX_NS;
         }
+        s_off_filt += up; /* rise toward the min-gap floor */
+        s_down_run = 0;
+      } else if (off_err < -OFF_DOWN_STEP_NS && ++s_down_run >= OFF_DOWN_RUN) {
+        s_off_filt = offset_raw; /* sustained deep-down: genuine downward step */
+        s_down_run = 0;
       } else {
-        s_lock_run = 0;
+        s_off_filt -= OFF_DECAY_NS; /* higher gap: ignore depth, slow decay */
+        if (off_err >= -OFF_DOWN_STEP_NS) {
+          s_down_run = 0;
+        }
       }
-    }
-
-    if (inject) {
+      int64_t btc_now_ns = s_off_filt + sta_tsf_us * 1000;
+      int64_t off_ns = btc_now_ns - local_ns;
       (void)ptpd_inject_sync_pair(s_port_index, btc_now_ns, local_ns);
-    }
-    static uint32_t s_disc_seen = 0;
-    if (spike || (++s_disc_seen % 25) == 1) {
-      ESP_LOGI(TAG, "BTC discipline: off=%lld ns link_delay=%lld ns locked=%d%s",
-               (long long)off_ns, (long long)s_peer_delay_ns, (int)s_locked,
-               spike ? " (spike rejected)" : "");
+
+      static uint32_t s_disc_seen = 0;
+      if ((++s_disc_seen % 25) == 1) {
+        ESP_LOGI(TAG,
+                 "BTC discipline: off=%lld ns gap=%lld ns link_delay=%lld ns",
+                 (long long)off_ns, (long long)off_err,
+                 (long long)s_peer_delay_ns);
+      }
     }
   }
 }
