@@ -381,21 +381,38 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       }
       if (best_t1_ps)
         s_prev_ap_tsf_ps = best_t1_ps;
-      int64_t peer_delay_ns;
-      if (avg_rtt_ps) {
+      /* Prefer the IDF's calibrated rtt_est: it is the noise-filtered
+       * estimate (the basis for dist_est) and is what gPTP's
+       * neighborPropDelay expects — single-digit-to-tens of ns at room
+       * scale. The per-entry ps average is kept only as a close-range
+       * fallback for when rtt_est truncates to 0 (sub-ns), a regime where
+       * FTM ranging is unreliable anyway (RTT floors at <=0 and IDF
+       * discards the entries). */
+      int64_t peer_delay_ns = 0;
+      bool have_delay = true;
+      if (r->rtt_est) {
+        peer_delay_ns = (int64_t)r->rtt_est / 2;
+      } else if (avg_rtt_ps) {
         uint64_t one_way_ps = avg_rtt_ps / 2;
         peer_delay_ns = (int64_t)((one_way_ps + 500) / 1000);
       } else {
-        /* No per-entry data — fall back to ns-resolution aggregate. */
-        peer_delay_ns = (int64_t)r->rtt_est / 2;
+        have_delay = false;
       }
-      int rc = ptpd_inject_peer_delay(s_port_index, peer_delay_ns);
+      int rc = have_delay
+                   ? ptpd_inject_peer_delay(s_port_index, peer_delay_ns)
+                   : -1;
 
-      /* FTM now only refines the link delay. The BTC timeline is carried
-       * by the beacon's (BTC, AP-TSF) pair + the STA TSF and disciplined
-       * in on_vendor_ie, so the broken ToD weld is gone. Stash the latest
-       * link delay for that path. */
-      s_peer_delay_ns = peer_delay_ns;
+      /* Adopt the link delay for the Layer-2 offset path (on_vendor_ie)
+       * only if ptpd accepted it (rc == 0). ptpd rejects negative /
+       * out-of-range samples with -ERANGE; reusing that one check means a
+       * garbage reading — a multipath spike, or a point-blank ms-scale
+       * per-entry average — cannot poison the beacon-paired offset. On
+       * rejection, hold the last good delay. The BTC timeline itself is
+       * carried by the beacon's (BTC, AP-TSF) pair + the STA TSF, so the
+       * broken ToD weld stays gone. */
+      if (rc == 0) {
+        s_peer_delay_ns = peer_delay_ns;
+      }
 
       static uint32_t s_seen = 0;
       if ((++s_seen % 25) == 1) {
