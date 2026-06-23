@@ -1,7 +1,7 @@
 version: "1.2.0"
 description: "PTP implementation for ESP32"
 url: "https://github.com/scrambletools/esp_ptp"
-license: "Apache 2.0"
+license: "Apache-2.0"
 dependencies:
   idf: ^6.0
   scrambletools/esp_ptp_rpc: "*"
