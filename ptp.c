@@ -381,7 +381,11 @@ struct ptp_state_s {
 
   struct ptp_port_s port[CONFIG_ESP_PTP_NUM_PORTS];
 
-  ptp_profile_e ptp_profile;
+  ptp_profile_e active_ptp_profile;
+  /* Preferred profile. The AVB Lite fallback degrades active_ptp_profile (gPTP
+   * -> standard) but leaves this untouched, so a link-up can restore the
+   * preferred profile instead of being stranded in standard PTP. */
+  ptp_profile_e preferred_ptp_profile;
 
   int64_t remote_time_ns_prev;
   int64_t local_time_ns_prev;
@@ -451,14 +455,27 @@ static struct ptp_state_s *s_state;
  * Private Functions
  ****************************************************************************/
 static void ptp_clean_after_step(FAR struct ptp_state_s *state);
+static void ptp_reset_for_profile(FAR struct ptp_state_s *state);
 
 static inline bool ptp_is_gptp(FAR const struct ptp_state_s *state) {
-  return state->ptp_profile == ptp_profile_gptp;
+  return state->active_ptp_profile == ptp_profile_gptp;
 }
 
 static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
+  /* A link change begins a fresh startup window. Restore the configured profile
+   * so an AVB Lite fallback forced on a previous link (peer absent at boot, or a
+   * non-AVB switch flooding Pdelay) is not permanent: once the endpoint is moved
+   * onto an AVB link, link-up returns it to gPTP and re-runs the fallback
+   * evaluation. The fallback degrades only the effective profile; the configured
+   * profile is the intent to return to. */
+
+  if (state->active_ptp_profile != state->preferred_ptp_profile) {
+    state->active_ptp_profile = state->preferred_ptp_profile;
+    ptp_reset_for_profile(state);
+  }
+
   if (!ptp_is_gptp(state)) {
-    return;
+    return; /* configured as standard PTP: no gPTP fallback to arm */
   }
 
   state->gptp_fallback_done = false;
@@ -1221,10 +1238,11 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->offset_pi.drift_acc = 0;
 
 #ifdef CONFIG_ESP_PTP_GPTP_PROFILE
-  state->ptp_profile = ptp_profile_gptp;
+  state->active_ptp_profile = ptp_profile_gptp;
 #else
-  state->ptp_profile = ptp_profile_standard;
+  state->active_ptp_profile = ptp_profile_standard;
 #endif
+  state->preferred_ptp_profile = state->active_ptp_profile;
   ptp_reset_for_profile(state);
 
   /* Per-port topology from Kconfig; runs before per-medium init so
@@ -1761,7 +1779,7 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
     ptpwarn("Endpoint Declaration TLV seen on Pdelay channel; "
             "switching to standard PTP mode\n");
     state->gptp_fallback_done = true;
-    state->ptp_profile = ptp_profile_standard;
+    state->active_ptp_profile = ptp_profile_standard;
     ptp_reset_for_profile(state);
     return;
   }
@@ -1774,7 +1792,7 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
         "No Pdelay_Resp after %u attempts; switching to standard PTP mode\n",
         state->port[0].pdelay_req_attempts_unanswered);
     state->gptp_fallback_done = true;
-    state->ptp_profile = ptp_profile_standard;
+    state->active_ptp_profile = ptp_profile_standard;
     ptp_reset_for_profile(state);
     return;
   }
@@ -1788,7 +1806,7 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
     ptpwarn(
         "Pdelay_Resp from multiple sources; switching to standard PTP mode\n");
     state->gptp_fallback_done = true;
-    state->ptp_profile = ptp_profile_standard;
+    state->active_ptp_profile = ptp_profile_standard;
     ptp_reset_for_profile(state);
   }
 }
@@ -1917,7 +1935,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
    * 3 s cadence matches the §2.2 evaluation window. */
 
   /* Endpoint-fallback beacon — only on eth_hwts with a socket. */
-  if (state->gptp_fallback_done && state->ptp_profile == ptp_profile_standard &&
+  if (state->gptp_fallback_done && state->active_ptp_profile == ptp_profile_standard &&
       state->port[0].enabled &&
       state->port[0].medium == ptp_port_medium_eth_hwts &&
       state->port[0].ptp_socket >= 0) {
@@ -2598,7 +2616,7 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   }
 
   status = state->status_req.dest;
-  status->ptp_profile = state->ptp_profile;
+  status->ptp_profile = state->active_ptp_profile;
   status->peer_is_endpoint = state->port[0].peer_is_endpoint;
   status->clock_source_valid = state->selected_source_valid;
 
@@ -3092,8 +3110,9 @@ int ptpd_set_profile(int pid, ptp_profile_e profile) {
     return -ESRCH;
   }
 
-  if (s_state->ptp_profile != profile) {
-    s_state->ptp_profile = profile;
+  if (s_state->active_ptp_profile != profile) {
+    s_state->active_ptp_profile = profile;
+    s_state->preferred_ptp_profile = profile; /* an explicit set is the new intent */
     ptp_reset_for_profile(s_state);
     if (profile == ptp_profile_gptp) {
       ptp_arm_profile_fallback(s_state);
