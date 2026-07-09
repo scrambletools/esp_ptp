@@ -1080,6 +1080,41 @@ static void ptp_apply_port_topology_kconfig(FAR struct ptp_state_s *state) {
 #endif /* CONFIG_ESP_PTP_NUM_PORTS > 1 */
 }
 
+/* Recreate the L2TAP socket of a wired port in place. Recovery path
+ * for a wedged fd: a multi-second stall of the daemon loop (observed
+ * with bursts of NVS persist writes) can leave the L2TAP fd
+ * permanently silent — the EMAC dispatcher keeps handing 0x88f7
+ * frames to esp_vfs_l2tap_eth_filter_frame, but poll() on the old fd
+ * never signals again. Closing and reopening the fd restores RX.
+ * Only the socket-level state is rebuilt; the EMAC PTP clock and MAC
+ * filters set up at init are untouched. */
+static int ptp_port_reopen_l2tap(FAR struct ptp_state_s *state,
+                                 int port_index) {
+  struct ptp_port_s *p = &state->port[port_index];
+  if (p->medium != ptp_port_medium_eth_hwts)
+    return ERROR;
+  if (p->ptp_socket >= 0) {
+    close(p->ptp_socket);
+    p->ptp_socket = -1;
+  }
+  int fd = open("/dev/net/tap", 0);
+  if (fd < 0) {
+    ptperr("port %d: L2TAP reopen failed: %d\n", port_index, errno);
+    return ERROR;
+  }
+  uint16_t eth_type_filter = ETH_TYPE_PTP;
+  if (ioctl(fd, L2TAP_S_INTF_DEVICE, p->interface_name) < 0 ||
+      ioctl(fd, L2TAP_S_RCV_FILTER, &eth_type_filter) < 0 ||
+      ioctl(fd, L2TAP_S_TIMESTAMP_EN) < 0) {
+    ptperr("port %d: L2TAP reopen config failed: %d\n", port_index, errno);
+    close(fd);
+    return ERROR;
+  }
+  p->ptp_socket = fd;
+  ptpwarn("port %d: L2TAP socket reopened after RX starvation\n", port_index);
+  return OK;
+}
+
 /* Per-medium port initialisation. Caller has filled
  * enabled/medium/interface_name/wifi_mode; helper fills intf_hw_addr
  * and any medium-specific resources. */
@@ -2730,10 +2765,22 @@ static void ptp_daemon(void *task_param) {
   int poll_timeout =
       (pollfds[0].fd < 0) ? PTPD_NOSOCK_POLL_MS : PTPD_POLL_INTERVAL;
 
+  /* L2TAP RX-starvation watchdog (see ptp_port_reopen_l2tap). On a
+   * wired gPTP port there is Pdelay traffic at least once a second in
+   * any healthy AVB domain, so multi-second silence with the link up
+   * means the fd has wedged. Keyed on last_received_multicast — the
+   * CLOCK_MONOTONIC stamp taken only for VALID in-domain gPTP
+   * messages in ptp_process_rx_packet — because a wedged fd has been
+   * observed to keep waking poll() with reads that never parse as
+   * in-domain PTP, which would defeat a read()-based liveness key. */
+#define PTPD_RX_STARVATION_US 5000000LL
+  int64_t watchdog_rearm_us = esp_timer_get_time();
+
   while (!state->stop) {
     ptpd_lateness_tick();
     state->port[0].can_send_delayreq = ptp_is_gptp(state);
 
+    pollfds[0].fd = state->port[0].ptp_socket;
     pollfds[0].revents = 0;
     ret = poll(pollfds, 1, poll_timeout);
 
@@ -2747,6 +2794,27 @@ static void ptp_daemon(void *task_param) {
 
       if (ret > 0) {
         ptp_process_rx_packet(state, ret);
+      }
+    }
+
+    /* Starvation check runs UNCONDITIONALLY every loop iteration —
+     * gating it on the poll outcome or on read() success would mask
+     * the wedge (see comment at PTPD_RX_STARVATION_US). */
+    if (state->port[0].medium == ptp_port_medium_eth_hwts) {
+      int64_t now_us = esp_timer_get_time();
+      struct timespec mono;
+      clock_gettime(CLOCK_MONOTONIC, &mono);
+      int64_t mono_us =
+          (int64_t)mono.tv_sec * 1000000LL + mono.tv_nsec / 1000LL;
+      int64_t last_valid_us =
+          (int64_t)state->port[0].last_received_multicast.tv_sec * 1000000LL +
+          state->port[0].last_received_multicast.tv_nsec / 1000LL;
+      if (mono_us - last_valid_us > PTPD_RX_STARVATION_US &&
+          now_us - watchdog_rearm_us > PTPD_RX_STARVATION_US) {
+        (void)ptp_port_reopen_l2tap(state, 0);
+        /* Rearm on our own clock regardless of outcome so a dead link
+         * doesn't spin the reopen path faster than once per window. */
+        watchdog_rearm_us = now_us;
       }
     }
 
