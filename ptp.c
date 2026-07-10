@@ -123,6 +123,14 @@ static uint32_t s_ptpd_rx_pdelay_fup = 0;
 static int64_t s_ptpd_rx_sync_last_us = 0;
 static int64_t s_ptpd_rx_sync_max_gap_us = 0;
 
+/* L2TAP-wedge diagnosis counters: poll wakeups with revents set, read()
+ * outcomes, and the last read errno. Printed in the ptpd-late line. */
+static uint32_t s_ptpd_poll_wake = 0;
+static uint32_t s_ptpd_read_ok = 0;
+static uint32_t s_ptpd_read_err = 0;
+static int s_ptpd_read_last_errno = 0;
+static int s_ptpd_read_last_ret = 0;
+
 static void ptpd_lateness_record_rx_sync(void) {
   int64_t now = esp_timer_get_time();
   if (s_ptpd_rx_sync_last_us) {
@@ -168,6 +176,14 @@ static void ptpd_lateness_tick(void) {
       s_ptpd_rx_sync_max_gap_us / 1000, (unsigned)s_ptpd_rx_followup,
       (unsigned)s_ptpd_rx_announce, (unsigned)s_ptpd_rx_pdelay_req,
       (unsigned)s_ptpd_rx_pdelay_resp, (unsigned)s_ptpd_rx_pdelay_fup);
+  ESP_LOGW("ptpd-late",
+           "sock: poll_wake=%u read_ok=%u read_err=%u last_ret=%d last_errno=%d",
+           (unsigned)s_ptpd_poll_wake, (unsigned)s_ptpd_read_ok,
+           (unsigned)s_ptpd_read_err, s_ptpd_read_last_ret,
+           s_ptpd_read_last_errno);
+  s_ptpd_poll_wake = 0;
+  s_ptpd_read_ok = 0;
+  s_ptpd_read_err = 0;
   s_ptpd_loop_max_gap_us = 0;
   s_ptpd_loop_iters = 0;
   s_ptpd_tx_req_total = 0;
@@ -761,6 +777,13 @@ static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg,
   ts_info->type = L2TAP_IREC_TIME_STAMP;
 
   int ret = read(state->port[0].ptp_socket, &ptp_msg_ext_buff, 0);
+  s_ptpd_read_last_ret = ret;
+  if (ret > 0) {
+    s_ptpd_read_ok++;
+  } else {
+    s_ptpd_read_err++;
+    s_ptpd_read_last_errno = errno;
+  }
 
   // check if read was successful, ts exists and ts_info is valid
   if (ret > 0 && ts && ts_info->type == L2TAP_IREC_TIME_STAMP) {
@@ -2788,6 +2811,7 @@ static void ptp_daemon(void *task_param) {
       /* Receive time-critical packet, potentially with cmsg
        * indicating the timestamp.
        */
+      s_ptpd_poll_wake++;
 
       ret = ptp_net_recv(state, &state->port[0].rxbuf,
                          sizeof(state->port[0].rxbuf), &state->port[0].rxtime);
