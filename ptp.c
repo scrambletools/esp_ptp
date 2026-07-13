@@ -123,6 +123,23 @@ static uint32_t s_ptpd_rx_pdelay_fup = 0;
 static int64_t s_ptpd_rx_sync_last_us = 0;
 static int64_t s_ptpd_rx_sync_max_gap_us = 0;
 
+/* Hexdump of validation-rejected frames, rate-limited: the first 5,
+ * then one in every 256. Enough to characterize a corrupted-delivery
+ * incident without flooding the console at frame rate. */
+static void ptpd_reject_dump(const char *why, const uint8_t *buf,
+                             ssize_t len) {
+  static uint32_t s_reject_count = 0;
+  s_reject_count++;
+  if (s_reject_count > 5 && (s_reject_count & 0xFF) != 0)
+    return;
+  char hex[3 * 24 + 1];
+  int n = len < 24 ? (int)len : 24;
+  for (int i = 0; i < n; i++)
+    snprintf(hex + 3 * i, 4, "%02x ", buf[i]);
+  ESP_LOGW("ptpd", "rx reject #%u (%s, len=%d): %s", (unsigned)s_reject_count,
+           why, (int)len, hex);
+}
+
 /* L2TAP-wedge diagnosis counters: poll wakeups with revents set, read()
  * outcomes, and the last read errno. Printed in the ptpd-late line. */
 static uint32_t s_ptpd_poll_wake = 0;
@@ -2574,14 +2591,19 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
   }
 
   if (state->port[0].rxbuf.header.domain != CONFIG_ESP_PTP_DOMAIN) {
-    /* Part of different clock domain, ignore */
-
+    /* Part of different clock domain, ignore. Hexdump the first
+     * rejects and then a decimated sample: after an EMAC RX stall the
+     * driver has been observed to deliver correctly-SIZED frames whose
+     * CONTENT fails this check forever — the dump shows what actually
+     * arrives (stale/desynced buffer suspect, P4 RX recovery path). */
+    ptpd_reject_dump("domain", state->port[0].rxbuf.raw, length);
     return OK;
   }
 
   bool msg_is_gptp =
       (state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_SDOID_GPTP) != 0;
   if (msg_is_gptp != ptp_is_gptp(state)) {
+    ptpd_reject_dump("sdoid", state->port[0].rxbuf.raw, length);
     return OK;
   }
 
