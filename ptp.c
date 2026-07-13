@@ -1843,9 +1843,12 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
   }
 
   /* AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2):
-   * three consecutive Pdelay_Req attempts with no Pdelay_Resp received. */
+   * nine consecutive Pdelay_Req attempts with no Pdelay_Resp received,
+   * per the 802.1AS-2020 §11.5.3 allowedLostResponses default. The
+   * original value of 3 (802.1AS-2011) let a ~3 s ingress blip on a
+   * healthy AVB link spring the fallback latch permanently. */
 
-  if (state->port[0].pdelay_req_attempts_unanswered >= 3) {
+  if (state->port[0].pdelay_req_attempts_unanswered >= 9) {
     ptpwarn(
         "No Pdelay_Resp after %u attempts; switching to standard PTP mode\n",
         state->port[0].pdelay_req_attempts_unanswered);
