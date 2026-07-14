@@ -183,7 +183,7 @@ static void ptpd_lateness_tick(void) {
   }
   if (now - s_ptpd_last_report_us < 10000000LL)
     return;
-  ESP_LOGW(
+  ESP_LOGD(
       "ptpd-late",
       "iters=%u loop_gap_max=%lldms tx=%u/%u late(max=%lldms) "
       "rx_sync=%u max_gap=%lldms fup=%u ann=%u pd_req=%u pd_resp=%u pd_fup=%u",
@@ -193,7 +193,7 @@ static void ptpd_lateness_tick(void) {
       s_ptpd_rx_sync_max_gap_us / 1000, (unsigned)s_ptpd_rx_followup,
       (unsigned)s_ptpd_rx_announce, (unsigned)s_ptpd_rx_pdelay_req,
       (unsigned)s_ptpd_rx_pdelay_resp, (unsigned)s_ptpd_rx_pdelay_fup);
-  ESP_LOGW("ptpd-late",
+  ESP_LOGD("ptpd-late",
            "sock: poll_wake=%u read_ok=%u read_err=%u last_ret=%d last_errno=%d",
            (unsigned)s_ptpd_poll_wake, (unsigned)s_ptpd_read_ok,
            (unsigned)s_ptpd_read_err, s_ptpd_read_last_ret,
@@ -472,14 +472,17 @@ struct ptp_state_s {
 #define PTPD_POLL_INTERVAL CONFIG_ESP_PTP_TIMEOUT_MS
 #endif
 
-/* PTP debug messages are enabled by either CONFIG_DEBUG_NET_INFO
- * or separately by CONFIG_ESP_PTP_DEBUG. This simplifies
- * debugging without having excessive amount of logging from net.
- */
+/* Log macros. Per-packet and per-servo-turn telemetry uses ptpdebug
+ * (ESP_LOGD): compiled out at the default CONFIG_LOG_MAXIMUM_LEVEL;
+ * build with DEBUG max level to re-enable for forensics. */
 
 static const char *TAG = "ptpd";
 #define ptpinfo(format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
 #define ptpwarn(format, ...) ESP_LOGW(TAG, format, ##__VA_ARGS__)
+/* Per-sync servo telemetry (~3 lines/s at 1 Hz sync). Compiled out at
+ * the default log level; raise CONFIG_LOG_MAXIMUM_LEVEL to DEBUG to
+ * get it back for servo forensics. */
+#define ptpdebug(format, ...) ESP_LOGD(TAG, format, ##__VA_ARGS__)
 #define ptperr(format, ...) ESP_LOGE(TAG, format, ##__VA_ARGS__)
 
 static struct ptp_state_s *s_state;
@@ -1509,7 +1512,7 @@ static int ptp_send_endpoint_beacon(FAR struct ptp_state_s *state) {
   static const uint8_t lldp_mac[6] = LLDP_MULTICAST_ADDR;
   int ret = ptp_net_send_to(state, &req, req_len, &ts, lldp_mac);
   if (ret >= 0) {
-    ptpinfo("Sent endpoint beacon, seq %ld\n",
+    ptpdebug("Sent endpoint beacon, seq %ld",
             (long)ptp_get_sequence(&req.header));
   }
   return ret;
@@ -1603,7 +1606,7 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
   } else {
-    ptpinfo("Sent announce, seq %ld\n", (long)ptp_get_sequence(&msg.header));
+    ptpdebug("Sent announce, seq %ld", (long)ptp_get_sequence(&msg.header));
   }
 
   return ret;
@@ -1729,10 +1732,10 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
     return ret;
   }
 
-  ptpinfo("Sent sync + follow-up, seq %ld\n",
+  ptpdebug("Sent sync + follow-up, seq %ld",
           (long)ptp_get_sequence(&msg.header));
 #else
-  ptpinfo("Sent sync, seq %ld\n", (long)ptp_get_sequence(&msg.header));
+  ptpdebug("Sent sync, seq %ld", (long)ptp_get_sequence(&msg.header));
 #endif /* CONFIG_ESP_PTP_TWOSTEP_SYNC */
 
   return OK;
@@ -1788,7 +1791,7 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
       /* For AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2). */
       state->port[0].pdelay_req_attempts_unanswered++;
     }
-    ptpinfo("Sent delay req, seq %ld\n", (long)ptp_get_sequence(&req.header));
+    ptpdebug("Sent delay req, seq %ld", (long)ptp_get_sequence(&req.header));
   }
 
   return ret;
@@ -2118,9 +2121,9 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   state->remote_time_ns_prev = remote_time_ns;
   state->local_time_ns_prev = local_time_ns;
 
-  ptpinfo("remote_delta_ns %lli, local_delta_ns %lli, tick_diff %lli\n",
+  ptpdebug("remote_delta_ns %lli, local_delta_ns %lli, tick_diff %lli",
           remote_delta_ns, local_delta_ns, tick_diff);
-  ptpinfo("offset_ns %lli, trim %li, delta %li, drift_acc %li\n", offset_ns,
+  ptpdebug("offset_ns %lli, trim %li, delta %li, drift_acc %li", offset_ns,
           (long)target_trim, (long)trim_delta,
           (long)state->offset_pi.drift_acc);
   // Get the path delay only when clock is stable enough. If we were
@@ -2166,10 +2169,10 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
     cnt = 0;
   }
   if (cnt > 3) {
-    ptpinfo("clock is stablized\n");
+    ptpdebug("clock is stabilized");
     state->port[0].can_send_delayreq = true;
   } else {
-    ptpinfo("clock is still unstable\n");
+    ptpdebug("clock is still unstable");
   }
   state->last_offset_ns = offset_ns;
 }
@@ -2195,7 +2198,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
   const int64_t adj_limit_ns =
       CONFIG_ESP_PTP_SETTIME_THRESHOLD_MS * (int64_t)NSEC_PER_MSEC;
 
-  ptpinfo("Local time: %lld.%09ld, remote time %lld.%09ld\n",
+  ptpdebug("Local time: %lld.%09ld, remote time %lld.%09ld",
           (long long)local_timestamp->tv_sec, (long)local_timestamp->tv_nsec,
           (long long)remote_timestamp->tv_sec, (long)remote_timestamp->tv_nsec);
 
@@ -2264,7 +2267,7 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
 
     state->port[0].twostep_rxtime = state->port[0].rxtime;
     state->port[0].twostep_packet = *msg;
-    ptpinfo("Waiting for follow-up\n");
+    ptpdebug("Waiting for follow-up");
     return OK;
   }
 
@@ -2390,7 +2393,7 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
       ptperr("sendto for delay response follow-up message failed: %d\n", errno);
       return ret;
     }
-    ptpinfo("Sent response + response follow-up, seq %ld\n",
+    ptpdebug("Sent response + response follow-up, seq %ld",
             (long)ptp_get_sequence(&resp.header));
     /* asCapable-trigger diagnostic: per Pdelay response, log the inputs the
      * upstream peer uses to keep us asCapable — responder turnaround (t3-t2),
@@ -2403,14 +2406,14 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
       clock_gettime(CLOCK_MONOTONIC, &now_mono);
       clock_timespec_subtract(&now_mono, &state->port[0].last_received_sync,
                               &sync_gap);
-      ESP_LOGW("ptpd-trig",
+      ESP_LOGD("ptpd-trig",
                "turn_us=%lld freq_ppb=%ld pdelay_ns=%lld sync_gap_ms=%lld",
                (long long)turn_us, (long)state->freq_trim_ppb,
                (long long)state->port[0].peer_delay_ns,
                (long long)timespec_to_ms(&sync_gap));
     }
   } else {
-    ptpinfo("Sent delay resp, seq %ld\n", (long)ptp_get_sequence(&req->header));
+    ptpdebug("Sent delay resp, seq %ld", (long)ptp_get_sequence(&req->header));
   }
 
   return OK;
@@ -2461,7 +2464,7 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
 
     state->port[0].twostep_delay_resp_rxtime = state->port[0].rxtime;
     state->port[0].twostep_delay_resp_packet = *msg;
-    ptpinfo("Waiting for delay response follow-up\n");
+    ptpdebug("Waiting for delay response follow-up");
   } else {
     /* Path delay is calculated as the average between delta for sync
      * message and delta for delay req message.
@@ -2509,7 +2512,7 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
       ptp_is_gptp(state)
           ? state->port[0].delayreq_interval_ms
           : rand_delayreq_interval(state->port[0].delayreq_interval_ms);
-  ptpinfo("Randomized delay req interval: %d ms\n",
+  ptpdebug("Randomized delay req interval: %d ms",
           state->port[0].next_delayreq_interval_ms);
 
   return OK;
@@ -2566,7 +2569,7 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
         (peer_delay - state->port[0].peer_delay_ns) /
         state->port[0].peer_delay_avgcount;
 
-    ptpinfo("Peer delay: %ld ns (avg: %ld ns)\n", (long)peer_delay,
+    ptpdebug("Peer delay: %ld ns (avg: %ld ns)", (long)peer_delay,
             (long)state->port[0].peer_delay_ns);
   } else {
     ptpwarn("Peer delay out of range: %lld ns\n", (long long)peer_delay);
@@ -2616,13 +2619,13 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     defined(CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always acts as a client
   case PTP_MSGTYPE_ANNOUNCE:
     s_ptpd_rx_announce++;
-    ptpinfo("Got announce packet, seq %ld\n",
+    ptpdebug("Got announce packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     return ptp_process_announce(state, &state->port[0].rxbuf.announce);
 
   case PTP_MSGTYPE_SYNC:
     ptpd_lateness_record_rx_sync();
-    ptpinfo("Got sync packet, seq %ld\n",
+    ptpdebug("Got sync packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (!state->selected_source_valid) {
       return OK;
@@ -2631,7 +2634,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 
   case PTP_MSGTYPE_FOLLOW_UP:
     s_ptpd_rx_followup++;
-    ptpinfo("Got follow-up packet, seq %ld\n",
+    ptpdebug("Got follow-up packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (!state->selected_source_valid) {
       return OK;
@@ -2641,7 +2644,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
   case PTP_MSGTYPE_DELAY_RESP:
   case PTP_MSGTYPE_PDELAY_RESP:
     s_ptpd_rx_pdelay_resp++;
-    ptpinfo("Got delay-resp, seq %ld\n",
+    ptpdebug("Got delay-resp, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(state->port[0].rxbuf.raw, length,
                                       sizeof(struct ptp_delay_resp_s))) {
@@ -2660,7 +2663,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
   case PTP_MSGTYPE_DELAY_REQ:
   case PTP_MSGTYPE_PDELAY_REQ:
     s_ptpd_rx_pdelay_req++;
-    ptpinfo("Got delay req, seq %ld\n",
+    ptpdebug("Got delay req, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(state->port[0].rxbuf.raw, length,
                                       sizeof(struct ptp_pdelay_req_s))) {
@@ -2671,7 +2674,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 
   case PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP:
     s_ptpd_rx_pdelay_fup++;
-    ptpinfo("Got peer delay resp follow-up, seq %ld\n",
+    ptpdebug("Got peer delay resp follow-up, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(
             state->port[0].rxbuf.raw, length,
