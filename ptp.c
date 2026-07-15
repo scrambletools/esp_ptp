@@ -351,6 +351,12 @@ struct ptp_port_s {
 
   /* Last received packet timestamps (CLOCK_MONOTONIC). */
   struct timespec last_received_multicast;
+  /* Stamped on structurally-valid frames rejected by policy (SDOID) —
+   * proves the socket delivers real PTP even when nothing is accepted
+   * (AVB-Lite steady state can be all-rejects on the BTC side). The
+   * EMAC-wedge signature (sized frames with garbage content) fails
+   * the DOMAIN check and must NOT stamp this. */
+  struct timespec last_socket_alive;
   struct timespec last_received_announce;
   struct timespec last_received_sync;
 
@@ -2606,7 +2612,18 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
   bool msg_is_gptp =
       (state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_SDOID_GPTP) != 0;
   if (msg_is_gptp != ptp_is_gptp(state)) {
-    ptpd_reject_dump("sdoid", state->port[0].rxbuf.raw, length);
+    /* Frame passed the domain check, so content is sane — the socket
+     * is alive even though policy rejects the frame. */
+    clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_socket_alive);
+    /* §2.3 endpoint beacons are deliberately SDOID-tagged for gPTP
+     * receivers; a fallen-back peer sees them here at steady state.
+     * Expected traffic — keep it out of the capped reject log. */
+    if ((state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_MASK) ==
+        PTP_MSGTYPE_PDELAY_REQ) {
+      ptpdebug("beacon pdelay_req ignored (sdoid), len=%d", (int)length);
+    } else {
+      ptpd_reject_dump("sdoid", state->port[0].rxbuf.raw, length);
+    }
     return OK;
   }
 
@@ -2813,8 +2830,16 @@ static void ptp_daemon(void *task_param) {
  * interval, ptpd_status() (1 s timeout) would otherwise always time
  * out and AVB_INTERFACE / CLOCK_SOURCE descriptors never refresh. */
 #define PTPD_NOSOCK_POLL_MS 100
+/* Cap the RX poll so periodic TX (announce/sync, the 3 s §2.3 beacon,
+ * Pdelay) keeps schedule on a quiet wire. On gPTP networks inbound
+ * traffic wakes poll far more often than this, so the cap only bounds
+ * the worst case: AVB-Lite through a non-AVB switch, where all TX
+ * cadence used to collapse to the 10 s poll timeout. */
+#define PTPD_POLL_CAP_MS 500
   int poll_timeout =
-      (pollfds[0].fd < 0) ? PTPD_NOSOCK_POLL_MS : PTPD_POLL_INTERVAL;
+      (pollfds[0].fd < 0) ? PTPD_NOSOCK_POLL_MS
+      : (PTPD_POLL_INTERVAL < PTPD_POLL_CAP_MS ? PTPD_POLL_INTERVAL
+                                               : PTPD_POLL_CAP_MS);
 
   /* L2TAP RX-starvation watchdog (see ptp_port_reopen_l2tap). On a
    * wired gPTP port there is Pdelay traffic at least once a second in
@@ -2861,6 +2886,11 @@ static void ptp_daemon(void *task_param) {
       int64_t last_valid_us =
           (int64_t)state->port[0].last_received_multicast.tv_sec * 1000000LL +
           state->port[0].last_received_multicast.tv_nsec / 1000LL;
+      int64_t last_alive_us =
+          (int64_t)state->port[0].last_socket_alive.tv_sec * 1000000LL +
+          state->port[0].last_socket_alive.tv_nsec / 1000LL;
+      if (last_alive_us > last_valid_us)
+        last_valid_us = last_alive_us;
       if (mono_us - last_valid_us > PTPD_RX_STARVATION_US &&
           now_us - watchdog_rearm_us > PTPD_RX_STARVATION_US) {
         (void)ptp_port_reopen_l2tap(state, 0);
