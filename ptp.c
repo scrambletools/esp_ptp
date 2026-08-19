@@ -879,29 +879,19 @@ static void ptp_format_to_timespec(FAR const uint8_t *timestamp,
 
 static bool is_better_clock(FAR const struct ptp_announce_s *a,
                             FAR const struct ptp_announce_s *b) {
-  int system_identity_check = 1;
-
-  if (a->btc_priority1 < b->btc_priority1      /* Main priority field */
-      || a->btc_quality[0] < b->btc_quality[0] /* Clock class */
-      || a->btc_quality[1] < b->btc_quality[1] /* Clock accuracy */
-      || a->btc_quality[2] < b->btc_quality[2] /* Clock variance high byte */
-      || a->btc_quality[3] < b->btc_quality[3] /* Clock variance low byte */
-      || a->btc_priority2 < b->btc_priority2   /* Sub priority field */
-      ||
-      memcmp(a->btc_identity, b->btc_identity, sizeof(a->btc_identity)) < 0) {
-    system_identity_check = -1;
-  } else if (a->btc_priority1 == b->btc_priority1      /* Main priority field */
-             && a->btc_quality[0] == b->btc_quality[0] /* Clock class */
-             && a->btc_quality[1] == b->btc_quality[1] /* Clock accuracy */
-             && a->btc_quality[2] ==
-                    b->btc_quality[2] /* Clock variance high byte */
-             && a->btc_quality[3] ==
-                    b->btc_quality[3] /* Clock variance low byte */
-             && a->btc_priority2 == b->btc_priority2 /* Sub priority field */
-             && memcmp(a->btc_identity, b->btc_identity,
-                       sizeof(a->btc_identity)) == 0) {
-    system_identity_check = 0;
-  }
+  /* System identity comparison per IEEE 1588 §9.3.4 / 802.1AS §10.3.5:
+   * priority1, clock class, accuracy, variance, priority2, clock
+   * identity — each field consulted only when all earlier ones are
+   * equal. The fields sit contiguous in wire order (which IS the
+   * comparison order), so a single memcmp over the 14 bytes from
+   * btc_priority1 through btc_identity is the lexicographic compare.
+   * The previous flat OR of per-field comparisons let a clock that
+   * LOST priority1 still win on any numerically-lower later field
+   * (observed: a peer with worse priority1 but lower accuracy byte
+   * was selected as BTC, silencing our own announce). */
+  int system_identity_check =
+      memcmp(&a->btc_priority1, &b->btc_priority1,
+             1 + sizeof(a->btc_quality) + 1 + sizeof(a->btc_identity));
 
   // Check if A is a better clock source than B
   if ((system_identity_check < 0) /* Compare root system identity */
