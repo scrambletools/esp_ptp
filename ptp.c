@@ -2848,7 +2848,21 @@ static void ptp_daemon(void *task_param) {
 
     pollfds[0].fd = state->port[0].ptp_socket;
     pollfds[0].revents = 0;
-    ret = poll(pollfds, 1, poll_timeout);
+
+    /* While acting as the BTC on a wired gPTP port, Sync must go out
+     * every CONFIG_ESP_PTP_SYNC_INTERVAL_MS (125 ms for 802.1AS). TX
+     * happens once per loop pass, and on a quiet wire poll() sleeps
+     * up to PTPD_POLL_CAP_MS between passes, capping Sync at ~2/s —
+     * peers' syncReceiptTimeout (3 intervals) then expires on every
+     * gap and they never lock to us. Tighten the wait while BTC. */
+#define PTPD_BTC_POLL_CAP_MS 25
+    int wait_ms = poll_timeout;
+    if (!state->selected_source_valid && ptp_is_gptp(state) &&
+        state->port[0].medium == ptp_port_medium_eth_hwts &&
+        wait_ms > PTPD_BTC_POLL_CAP_MS) {
+      wait_ms = PTPD_BTC_POLL_CAP_MS;
+    }
+    ret = poll(pollfds, 1, wait_ms);
 
     if (pollfds[0].revents) {
       /* Receive time-critical packet, potentially with cmsg
