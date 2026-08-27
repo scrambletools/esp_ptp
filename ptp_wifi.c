@@ -442,6 +442,31 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                "rtt_raw=%u ns rtt_est=%u ns dist_est=%u cm",
                r->status, r->ftm_report_num_entries, (unsigned)r->rtt_raw,
                (unsigned)r->rtt_est, (unsigned)r->dist_est);
+      if (r->status == FTM_STATUS_NO_VALID_MSMT) {
+        /* Proximity floor. This status means the session ran and the
+         * responder answered (the driver logs the received measurement
+         * count) but every computed RTT landed at or below zero, the
+         * devices sit closer than FTM's turnaround-calibration floor
+         * (roughly a metre, true RTT of single-digit ns). The real
+         * propagation delay is below anything FTM can resolve here, so
+         * inject zero rather than leaving neighborPropDelay undefined:
+         * a floor-limited zero is accurate to within the measurement
+         * resolution, and the peer-delay mechanism keeps producing the
+         * value 802.1AS expects. Genuinely failed sessions
+         * (UNSUPPORTED, NO_RESPONSE, FAIL) keep the no-injection path
+         * below, there the peer may actually be gone. */
+        int zrc = ptpd_inject_peer_delay(s_port_index, 0);
+        if (zrc == 0) {
+          s_peer_delay_ns = 0;
+        }
+        static uint32_t s_zero_injects = 0;
+        if ((++s_zero_injects % 25) == 1) {
+          ESP_LOGI(TAG,
+                   "FTM below proximity floor (status=%d), peer delay "
+                   "injected as 0 ns (count=%u, rc=%d)",
+                   r->status, (unsigned)s_zero_injects, zrc);
+        }
+      }
       /* No reassociation on FTM failure — the STA still receives the FTM
        * frames (RSSI healthy, beacons + §12.7 Follow_Ups keep flowing), so
        * churning the link cannot help and (with the default STA netif
