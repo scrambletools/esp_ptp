@@ -1,145 +1,141 @@
 /* SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * Software clock backend for ptpd_now() on chips without IEEE 1588
- * hardware. Declarations and design notes live in ptp.h (the
- * "Software clock backend" block in the internal-API section).
- *
- * Time model:
- *   t_ptp_ns(local_us) = anchor_ptp_ns
- *                        + (local_us - anchor_local_us) * 1000
- *                        + (local_us - anchor_local_us) * rate_ppb / 1000000
- *
- * Re-anchoring on every settime/adjtime call keeps extrapolation
- * window short and arithmetic in 64-bit safely.
- *
- * Reads and writes happen on the daemon task, which is the same
- * thread, so no locking is required. If a higher-priority caller
- * ever needs to read the clock, mark the anchor pair atomic and use
- * a seqlock — not needed today.
+ * Software PTP clock with a coherent affine anchor and relative rate control.
+ * Capture each update's local time once so rate changes preserve continuity.
  */
-
 #include "ptp.h"
-
+#include "ptp_clock_affine.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
-
+#include "sdkconfig.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#if CONFIG_IDF_TARGET_ESP32C6
+#include "esp_timer_impl.h"
+#endif
 
-/* Forward declaration of the indirection installer in ptpd.c. */
 typedef int (*ptpd_sw_clock_now_fn)(struct timespec *ts);
 extern void ptpd_set_sw_clock_now(ptpd_sw_clock_now_fn fn);
 
-static int64_t s_anchor_local_us = 0;
-static int64_t s_anchor_ptp_ns = 0;
-static int32_t s_rate_ppb = 0;
-static bool s_initialized = false;
+static ptp_clock_affine_t s_clock;
+static bool s_initialized;
+static portMUX_TYPE s_clock_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static int64_t sw_now_ns(void)
+bool ptp_clock_sw_snapshot(ptp_clock_affine_t *snapshot)
 {
-    int64_t local_us = esp_timer_get_time();
-    int64_t delta_us = local_us - s_anchor_local_us;
-    int64_t delta_ns = delta_us * 1000;
-    /* Rate correction: rate_ppb describes how much faster the
-     * disciplined clock should advance vs. esp_timer. 1 ppb = 1 ns
-     * extra per 1e9 ns = 1 ns extra per 1e6 us, so:
-     *   correction_ns = delta_us * rate_ppb / 1000000
-     * For ±1000 ppm (±1e6 ppb) and a typical re-anchor window of
-     * <1 s, the correction stays well within int64_t range. */
-    delta_ns += (delta_us * (int64_t)s_rate_ppb) / 1000000;
-    return s_anchor_ptp_ns + delta_ns;
+    if (!snapshot) return false;
+    portENTER_CRITICAL(&s_clock_lock);
+    bool initialized = s_initialized;
+    *snapshot = s_clock;
+    portEXIT_CRITICAL(&s_clock_lock);
+    return initialized;
 }
 
-static void reanchor_to(int64_t ptp_ns)
+int64_t ptp_clock_local_ns(void)
 {
-    s_anchor_local_us = esp_timer_get_time();
-    s_anchor_ptp_ns = ptp_ns;
+#if CONFIG_IDF_TARGET_ESP32C6
+    /* C6 SYSTIMER uses the 40 MHz crystal divided by 2.5, or 62.5 ns/tick. */
+    uint64_t ticks = esp_timer_impl_get_counter_reg();
+    return (int64_t)(ticks / 2 * 125 + (ticks & 1) * 62);
+#else
+    return esp_timer_get_time() * 1000;
+#endif
 }
 
 static int sw_now_timespec(struct timespec *ts)
 {
-    if (!ts) {
-        errno = EFAULT;
+    if (!ts) { errno = EFAULT; return -1; }
+    ptp_clock_affine_t snapshot;
+    int64_t local_ns;
+    portENTER_CRITICAL(&s_clock_lock);
+    if (!s_initialized) {
+        portEXIT_CRITICAL(&s_clock_lock);
+        errno = EINVAL;
         return -1;
     }
-    int64_t ns = sw_now_ns();
-    ts->tv_sec = (time_t)(ns / 1000000000LL);
-    ts->tv_nsec = (long)(ns % 1000000000LL);
-    if (ts->tv_nsec < 0) {
-        ts->tv_sec -= 1;
-        ts->tv_nsec += 1000000000LL;
-    }
+    snapshot = s_clock;
+    local_ns = ptp_clock_local_ns();
+    portEXIT_CRITICAL(&s_clock_lock);
+    int64_t now_ns = ptp_clock_affine_now(&snapshot, local_ns);
+    ts->tv_sec = (time_t)(now_ns / 1000000000LL);
+    ts->tv_nsec = (long)(now_ns % 1000000000LL);
+    if (ts->tv_nsec < 0) { --ts->tv_sec; ts->tv_nsec += 1000000000L; }
     return 0;
 }
 
 int ptp_clock_sw_init(const struct timespec *initial_ts)
 {
-    int64_t initial_ns = 0;
-    if (initial_ts) {
-        initial_ns = (int64_t)initial_ts->tv_sec * 1000000000LL
-                   + (int64_t)initial_ts->tv_nsec;
-    }
-    s_rate_ppb = 0;
-    reanchor_to(initial_ns);
+    int64_t initial_ns = initial_ts ?
+        (int64_t)initial_ts->tv_sec * 1000000000LL + initial_ts->tv_nsec : 0;
+    portENTER_CRITICAL(&s_clock_lock);
+    s_clock = (ptp_clock_affine_t){.local_ns = ptp_clock_local_ns(),
+                                  .ptp_ns = initial_ns};
     s_initialized = true;
+    portEXIT_CRITICAL(&s_clock_lock);
     ptpd_set_sw_clock_now(sw_now_timespec);
     return 0;
 }
 
 int ptp_clock_sw_now(struct timespec *ts)
 {
-    if (!s_initialized) {
-        errno = EINVAL;
-        return -1;
-    }
     return sw_now_timespec(ts);
 }
 
 int ptp_clock_sw_settime(const struct timespec *ts)
 {
-    if (!s_initialized || !ts) {
-        errno = EINVAL;
-        return -1;
+    if (!ts) { errno = EINVAL; return -1; }
+    portENTER_CRITICAL(&s_clock_lock);
+    if (!s_initialized) {
+        portEXIT_CRITICAL(&s_clock_lock);
+        errno = EINVAL; return -1;
     }
-    int64_t ns = (int64_t)ts->tv_sec * 1000000000LL + (int64_t)ts->tv_nsec;
-    reanchor_to(ns);
+    s_clock.local_ns = ptp_clock_local_ns();
+    s_clock.ptp_ns = (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+    portEXIT_CRITICAL(&s_clock_lock);
     return 0;
 }
 
 int ptp_clock_sw_adjtime_offset(int64_t delta_ns)
 {
+    portENTER_CRITICAL(&s_clock_lock);
     if (!s_initialized) {
-        errno = EINVAL;
-        return -1;
+        portEXIT_CRITICAL(&s_clock_lock);
+        errno = EINVAL; return -1;
     }
-    /* Re-anchor at the current time, then apply the delta to the
-     * anchor so the next read sees the slewed value without picking
-     * up a synthetic rate spike. */
-    s_anchor_ptp_ns = sw_now_ns() + delta_ns;
-    s_anchor_local_us = esp_timer_get_time();
+    ptp_clock_affine_reanchor(&s_clock, ptp_clock_local_ns(), delta_ns);
+    portEXIT_CRITICAL(&s_clock_lock);
     return 0;
 }
 
 int ptp_clock_sw_adjtime_rate(int32_t rate_ppb)
 {
+    portENTER_CRITICAL(&s_clock_lock);
     if (!s_initialized) {
-        errno = EINVAL;
+        portEXIT_CRITICAL(&s_clock_lock);
+        errno = EINVAL; return -1;
+    }
+    ptp_clock_affine_adjust_rate(&s_clock, ptp_clock_local_ns(), rate_ppb);
+    portEXIT_CRITICAL(&s_clock_lock);
+    return 0;
+}
+
+int ptp_clock_sw_discipline(int64_t local_anchor, int64_t reference_anchor,
+    int32_t rate_ppb, bool step, int64_t *phase_error, int32_t *applied_rate)
+{
+    if (!phase_error || !applied_rate || local_anchor < 0 || reference_anchor < 0 ||
+        reference_anchor > INT64_MAX - INT64_C(3000000000) ||
+        rate_ppb < -200000 || rate_ppb > 200000) return -1;
+    portENTER_CRITICAL(&s_clock_lock);
+    int64_t now_ns = ptp_clock_local_ns();
+    if (!s_initialized || now_ns < local_anchor || now_ns - local_anchor > INT64_C(2000000000)) {
+        portEXIT_CRITICAL(&s_clock_lock);
         return -1;
     }
-    /* RELATIVE adjustment to current rate, matching IDF's
-     * clock_adjtime(CLOCK_PTP_SYSTEM, ADJ_FREQUENCY=ppb) semantics on
-     * EMAC PTP (emac_hal_ptp_adj_freq multiplies current addend by
-     * (1 + ppb/1e9)). The servo's freq_ppb formula relies on this
-     * relative interpretation — passing it through as absolute makes
-     * each call clobber the integrator and the loop oscillates. */
-    int64_t now = sw_now_ns();
-    int64_t cur = s_rate_ppb;
-    int64_t delta = cur * (int64_t)rate_ppb / 1000000000LL + (int64_t)rate_ppb;
-    int64_t new_rate = cur + delta;
-    if (new_rate > 100000000) new_rate = 100000000;
-    if (new_rate < -100000000) new_rate = -100000000;
-    s_rate_ppb = (int32_t)new_rate;
-    reanchor_to(now);
+    ptp_clock_affine_discipline(&s_clock, now_ns, local_anchor, reference_anchor,
+        rate_ppb, step, phase_error);
+    *applied_rate = s_clock.rate_ppb;
+    portEXIT_CRITICAL(&s_clock_lock);
     return 0;
 }

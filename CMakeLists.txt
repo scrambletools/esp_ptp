@@ -13,3 +13,7 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)
 # The link succeeds because those builds pull espressif__esp_hosted
 # in transitively (the host application uses esp_wifi_remote, which
 # depends on esp_hosted).
+
+# C6 keeps the fractional SYSTIMER tick discarded by esp_timer_get_time().
+idf_component_get_property(ptp_timer_dir esp_timer COMPONENT_DIR)
+target_include_directories(${COMPONENT_LIB} PRIVATE "${ptp_timer_dir}/private_include")
