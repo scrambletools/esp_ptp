@@ -440,6 +440,67 @@ menu "PTP Daemon Configuration"
             default y if (ESP_PTP_PORT1_MEDIUM_WIFI_FTM && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
             default n
 
+        config ESP_PTP_PEER_LOSS_TEST
+            bool "Finite peer-delay request loss diagnostic"
+            default n
+            help
+                Skip peer-delay requests from boot second60 through66.
+                Responses to the neighbor and received Sync remain active.
+                For bench expiry/recovery testing only; restore off afterward.
+
     endif # ESP_PTP
 
 endmenu # PTP Daemon Configuration
+
+config ESP_PTP_INTERVAL_PROBE
+    bool "Run finite associated-station capability interval probe"
+    default n
+    help
+        Diagnostic only. Sends a finite interval request sequence after binding
+        to a peer and logs every received capability indication. Restores the
+        initial interval at the end. Leave disabled for production builds.
+
+config ESP_PTP_CAPABLE_TX_TRACE
+    bool "Trace capability transport submission timing"
+    default n
+    help
+        Log queue, submission and completion times for capability messages.
+        Diagnostic only, leave disabled for normal builds.
+
+config ESP_PTP_CAPABLE_RX_TRACE
+    bool "Trace received capability indications"
+    default n
+    help
+        Diagnostic only. Log each parsed capability indication outside the
+        timestamp hot path, without sending interval requests.
+
+config ESP_PTP_SYNC_INTERVAL_PROBE
+    bool "Use synchronization stop/reset sequence for interval probe"
+    depends on ESP_PTP_INTERVAL_PROBE
+    default n
+    help
+        Diagnostic only. Sends subtype2 requests from the bound endpoint,
+        tests invalid identity, stop, unchanged and reset, then restores default.
+
+config ESP_PTP_SOURCE_LOSS_PROBE
+    bool "Run finite wired source-loss diagnostic"
+    default n
+    help
+        Diagnostic only. After first valid upstream timing, wait 30 seconds,
+        discard received Announce for the configured duration, recover for twelve seconds,
+        then discard Sync and Follow_Up for four seconds. Pdelay and management
+        continue. Runs once per boot. Never enable in normal builds.
+
+config ESP_PTP_SOURCE_LOSS_ANNOUNCE_SECONDS
+    int "Announce-loss diagnostic duration (seconds)"
+    depends on ESP_PTP_SOURCE_LOSS_PROBE
+    range 8 60
+    default 8
+
+config ESP_PTP_ANNOUNCE_PATH_PROBE
+    bool "Run finite AP Announce path-omission diagnostic"
+    default n
+    help
+        Diagnostic only. Thirty seconds after upstream source selection,
+        omit the AP Announce Path Trace TLV for eight seconds, then restore it.
+        Source identity and timing are unchanged. Never enable in normal builds.

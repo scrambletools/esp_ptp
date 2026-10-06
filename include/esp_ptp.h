@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include "ptp_path_trace.h"
 #ifndef FAR
 #define FAR
 #endif
@@ -73,9 +74,27 @@ struct ptpd_status_s {
 
   bool peer_is_endpoint;
 
-  /* Is there a valid remote clock source active? */
+  /* Which AVB Lite fallback condition moved this port to standard PTP
+   * (profiles/avb_lite.md §2.2): 0 none, 1 Endpoint Declaration TLV
+   * received, 2 nine Pdelay_Req unanswered, 3 two or more Pdelay
+   * responders, 4 standard PTP configured. */
+  uint8_t avb_lite_fallback_reason;
 
+  /* PTP domain number of this port. */
+  uint8_t domain;
+
+  /* Selected Announce source, independent of servo acquisition/holdover. */
+  bool clock_source_selected;
+  ptp_path_trace_t selected_path;
+
+  /* Legacy consumer gate; FTM additionally requires fresh, settled timing.
+   * This is not protocol asCapable. Wired validity semantics are unchanged. */
   bool clock_source_valid;
+
+  /* Management capability indication, independent of FTM servo readiness.
+   * Wi-Fi remains false until media negotiation and Signaling are verified.
+   * Wired ports require fresh qualified peer-delay exchanges. */
+  bool as_capable;
 
   /* Information about selected best clock source */
 
@@ -174,7 +193,15 @@ bool ptpd_port_link_up(int port_index);
  * — the IDF Wi-Fi netif has no L2TAP backend, so a Wi-Fi STA
  * endpoint can't fan 0x88f7 frames into ptpd via the L2TAP socket
  * the way the Ethernet path does; the dispatcher calls this instead.
- * Safe to call from a Wi-Fi RX context — short synchronous body. */
+ * Copies into a bounded queue without waiting; returns -ENOBUFS if full.
+ * Parsing and profile filtering run in the daemon. Signaling retains the
+ * ingress port; existing timing handlers still dispatch through port zero. */
+/* Preserve link-layer sender metadata. Wi-Fi STA gPTP admission requires it.
+ * A link or daemon generation change during enqueue returns -ESTALE. The
+ * legacy entry point below marks the sender unknown and cannot qualify a
+ * Wi-Fi STA sender. */
+int ptp_inject_received_frame_from(int port_index, const uint8_t *frame,
+                                  uint16_t len, const uint8_t source_mac[6]);
 int ptp_inject_received_frame(int port_index, const uint8_t *frame,
                               uint16_t len);
 

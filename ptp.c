@@ -54,6 +54,17 @@
 #include <sys/poll.h>
 
 #include "ptp.h"
+#include "ptp_path_trace.h"
+#include "ptp_message_bounds.h"
+#include "ptp_signaling.h"
+#include "ptp_gptp_wire.h"
+#include "ptp_capable_receive.h"
+#include "ptp_wired_capable.h"
+#include "ptp_wifi_neighbor.h"
+#include "ptp_wifi_peers.h"
+#include "ptp_peer_exchange.h"
+#include "ptp_peer_rate.h"
+#include "ptp_peer_capability.h"
 
 /* True once ptp_clock_sw_init() succeeds; routes time ops through the
  * SW clock backend. On C6 this is the only path that can actually move
@@ -65,6 +76,10 @@ static bool s_use_sw_clock = false;
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_ptp.h"
+#include "ptp_timing_snapshot.h"
+#include "ptp_sync_receipt.h"
+#include "ptp_wired_pi.h"
+#include "freertos/FreeRTOS.h"
 #include "esp_vfs_l2tap.h"
 #include "esp_wifi.h"
 #include "lwip/prot/ethernet.h" // Ethernet headers
@@ -74,6 +89,57 @@ static bool s_use_sw_clock = false;
 #include "esp_timer.h"
 #include "soc/soc_caps.h"
 #include <sys/timex.h>
+
+static ptp_timing_snapshot_t s_timing_snapshot;
+static ptp_timing_snapshot_t s_local_source_snapshot;
+static portMUX_TYPE s_timing_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_peer_lock = portMUX_INITIALIZER_UNLOCKED;
+
+#ifdef CONFIG_ESP_PTP_SOURCE_LOSS_PROBE
+#include "ptp_source_loss_probe.h"
+static ptp_source_loss_probe_t s_source_loss_probe;
+#endif
+
+static void ptp_invalidate_timing(void)
+{
+  portENTER_CRITICAL(&s_timing_lock);
+  ++s_timing_snapshot.generation;
+  s_timing_snapshot.valid = false;
+  s_local_source_snapshot.valid = false;
+  portEXIT_CRITICAL(&s_timing_lock);
+}
+
+uint32_t ptpd_timing_generation(void)
+{
+  portENTER_CRITICAL(&s_timing_lock);
+  uint32_t generation = s_timing_snapshot.generation;
+  portEXIT_CRITICAL(&s_timing_lock);
+  return generation;
+}
+
+bool ptpd_timing_snapshot(ptp_timing_snapshot_t *snapshot)
+{
+  if (!snapshot) return false;
+  portENTER_CRITICAL(&s_timing_lock);
+  *snapshot = s_timing_snapshot;
+  portEXIT_CRITICAL(&s_timing_lock);
+  int64_t now_us = esp_timer_get_time();
+  if (now_us < snapshot->received_us || now_us - snapshot->received_us > 500000)
+    snapshot->valid = false;
+  return snapshot->valid;
+}
+
+bool ptpd_time_source_snapshot(ptp_timing_snapshot_t *snapshot)
+{
+  if (!snapshot) return false;
+  portENTER_CRITICAL(&s_timing_lock);
+  *snapshot = s_local_source_snapshot.valid ? s_local_source_snapshot : s_timing_snapshot;
+  portEXIT_CRITICAL(&s_timing_lock);
+  int64_t now_us = esp_timer_get_time();
+  if (now_us < snapshot->received_us || now_us - snapshot->received_us > 500000)
+    snapshot->valid = false;
+  return snapshot->valid;
+}
 
 /* Hardware PTP clock backend (esp_eth_clock + CLOCK_PTP_SYSTEM) is
  * only present on chips with an on-chip MAC (e.g. ESP32-P4). On
@@ -277,14 +343,8 @@ static void ptpd_lateness_tick(void) {
  ****************************************************************************/
 
 #define ADJ_FREQ_MAX 512000
-#define PTP_FREQ_P_DIV 100
-#define PTP_FREQ_I_DIV 1000
-/* The wifi/SW-clock path disciplines to a reference carrying ms-scale
- * cross-chip gap noise. The wired gains above turn that into hundreds of
- * ppm of per-Sync rate jitter (the proportional term alone is ~10 ppm per
- * ms of offset). Use much gentler gains there so the loop averages the
- * noise and locks the rate; the phase still wobbles at the gap-noise
- * level, which is expected (and adequate for media-clock recovery). */
+/* The beacon reference carries cross-chip timing noise. Preserve its
+ * gentler controller independently of the wired hardware controller. */
 #define PTP_FREQ_P_DIV_SW 2000
 #define PTP_FREQ_I_DIV_SW 8000    /* gentle integrator: heavily averages the gap noise
                                    * so the recovered rate stays clean (slower acquire) */
@@ -295,6 +355,7 @@ typedef struct {
   int32_t kp;
   int32_t ki;
   int32_t drift_acc;
+  int64_t wired_integral_q16;
 } pi_cntrl_t;
 
 typedef union {
@@ -305,7 +366,7 @@ typedef union {
   struct ptp_delay_req_s delay_req;
   struct ptp_delay_resp_s delay_resp;
   struct ptp_delay_resp_follow_up_s delay_resp_follow_up;
-  uint8_t raw[128];
+  uint8_t raw[256];
 } ptp_msgbuf;
 
 /* Carrier structure for querying PTPD status */
@@ -359,6 +420,14 @@ struct ptp_port_s {
   struct timespec last_socket_alive;
   struct timespec last_received_announce;
   struct timespec last_received_sync;
+  /* Historical observations only; not yet a neighbor capability state. */
+  struct timespec last_received_capable_indication;
+  ptp_capable_message_t last_capable_indication;
+  ptp_capable_receive_t capable_receive;
+  ptp_wired_capable_t wired_capable;
+  ptp_wifi_neighbor_t wifi_neighbor;
+  ptp_wifi_peers_t wifi_peers;
+  unsigned capable_indication_count;
 
   /* Last transmitted packet timestamps (CLOCK_MONOTONIC). */
   struct timespec last_transmitted_sync;
@@ -372,7 +441,6 @@ struct ptp_port_s {
    * endpoint, no boundary-clock-aware bridge sits between us on this
    * port). Triggers fallback from gPTP to standard PTP. */
   bool peer_is_endpoint;
-  unsigned int pdelay_req_attempts_unanswered;
 
   /* Pdelay_Resp source clockIdentity cardinality on this port. ≥2
    * distinct responders within a window indicates a flooding (non-
@@ -398,16 +466,24 @@ struct ptp_port_s {
 
   /* Latest received packet on this port and its timestamp (CLOCK_REALTIME). */
   struct timespec rxtime;
+  uint8_t rx_source_mac[6];
+  bool rx_source_mac_valid;
+  uint32_t rx_association;
   ptp_msgbuf rxbuf;
 
   /* Buffered sync packet for two-step clock setting (server sends the
    * accurate timestamp in a separate follow-up message). */
   struct ptp_sync_s twostep_packet;
   struct timespec twostep_rxtime;
+  int64_t twostep_received_us;
+  ptp_sync_receipt_t sync_receipt;
+  bool twostep_pending;
 
   /* Buffered delay_resp packet for two-step peer delay measurement. */
-  struct ptp_delay_resp_s twostep_delay_resp_packet;
-  struct timespec twostep_delay_resp_rxtime;
+  ptp_peer_exchange_t peer_exchange;
+  ptp_peer_rate_t peer_rate;
+  ptp_peer_capability_t peer_capability;
+  bool capability_reported, last_reported_capability;
 };
 
 struct ptp_state_s {
@@ -462,12 +538,15 @@ struct ptp_state_s {
 
   bool selected_source_valid;            /* True if operating as client */
   struct ptp_announce_s selected_source; /* Currently selected server */
+  ptp_path_trace_t selected_path;
+  struct timespec last_selected_announce;
 
   /* gPTP → standard PTP fallback gate. One-shot per session: set true after
    * either AVB Lite §2.2 condition fires; cleared on Ethernet link-up so the
    * check re-arms for the new link. */
 
   bool gptp_fallback_done;
+  uint8_t avb_lite_fallback_reason; /* §2.2 condition that latched, 0 none */
   bool eth_event_handler_registered;
   bool wifi_event_handler_registered;
 };
@@ -493,14 +572,156 @@ static const char *TAG = "ptpd";
 
 static struct ptp_state_s *s_state;
 
+/* The RX callback publishes bounded copies; only the daemon parses them. */
+#define PTP_INJECT_DEPTH 8
+struct ptp_injected_frame_s {
+  uint16_t length;
+  uint8_t port_index;
+  uint32_t link_generation;
+  uint8_t source_mac[6];
+  bool source_mac_valid;
+  struct timespec received;
+  ptp_msgbuf message;
+};
+static struct ptp_injected_frame_s s_injected[PTP_INJECT_DEPTH];
+static portMUX_TYPE s_injected_lock = portMUX_INITIALIZER_UNLOCKED;
+static unsigned s_injected_head, s_injected_count;
+static uint32_t s_injected_generation[CONFIG_ESP_PTP_NUM_PORTS];
+static bool s_injected_enabled;
+
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+static uint16_t s_peer_ingress_sequence, s_peer_ingress_count;
+
+/* Receive-boundary diagnostic, independent of daemon allocation lifetime. */
+void ptpd_note_wired_peer_follow_up(const uint8_t *message, size_t length) {
+  if (!message || length < sizeof(struct ptp_delay_resp_follow_up_s)) return;
+  uint16_t sequence = ((uint16_t)message[30] << 8) | message[31];
+  portENTER_CRITICAL(&s_peer_lock);
+  if (sequence == s_peer_ingress_sequence && s_peer_ingress_count < UINT16_MAX)
+    s_peer_ingress_count++;
+  portEXIT_CRITICAL(&s_peer_lock);
+}
+
+uint32_t ptp_wifi_link_generation(int port_index) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) return 0;
+  portENTER_CRITICAL(&s_injected_lock);
+  uint32_t generation = s_injected_generation[port_index];
+  portEXIT_CRITICAL(&s_injected_lock);
+  return generation;
+}
+
 static void ptp_clean_after_step(FAR struct ptp_state_s *state);
 static void ptp_reset_for_profile(FAR struct ptp_state_s *state);
+static bool ptp_wired_capability(FAR struct ptp_state_s *state);
 
 static inline bool ptp_is_gptp(FAR const struct ptp_state_s *state) {
   return state->active_ptp_profile == ptp_profile_gptp;
+}
+
+bool ptpd_wifi_sta_timing_snapshot(int port_index, ptp_wifi_sta_timing_t *snapshot) {
+  if (!snapshot || port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS)
+    return false;
+  bool copied = false;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (s_state) {
+    const struct ptp_port_s *port = &s_state->port[port_index];
+    const ptp_wifi_neighbor_t *neighbor = &port->wifi_neighbor;
+    if (port->enabled && port->link_up && ptp_is_gptp(s_state) &&
+        port->medium == ptp_port_medium_wifi_ftm &&
+        port->wifi_mode == ptp_port_wifi_mode_sta && neighbor->associated && neighbor->bound) {
+      ptp_wifi_sta_timing_t next = {.association = neighbor->association,
+          .revision = neighbor->sync_revision, .stopped = neighbor->sync_stopped};
+      memcpy(next.bssid, neighbor->bssid, 6);
+      *snapshot = next;
+      copied = true;
+    }
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  return copied;
+}
+
+bool ptpd_wifi_association_snapshot(int port_index,
+                                    ptp_wifi_association_snapshot_t *snapshot) {
+  if (!snapshot || port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS)
+    return false;
+  bool copied = false;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (s_state) {
+    const struct ptp_port_s *port = &s_state->port[port_index];
+    if (port->enabled && port->link_up && ptp_is_gptp(s_state) &&
+        port->medium == ptp_port_medium_wifi_ftm &&
+        port->wifi_mode == ptp_port_wifi_mode_ap &&
+        ptp_wifi_peers_publishable(&port->wifi_peers))
+      copied = ptp_wifi_peers_snapshot(&port->wifi_peers, port_index + 1,
+                                       CONFIG_ESP_PTP_NUM_PORTS, snapshot);
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  return copied;
+}
+
+bool ptpd_wifi_association_reconcile(int port_index, uint32_t radio_boot,
+    uint32_t radio_generation, const uint8_t macs[][6], unsigned count) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) return false;
+  bool accepted = false, changed = false;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (s_state) {
+    struct ptp_port_s *port = &s_state->port[port_index];
+    if (port->enabled && port->link_up && ptp_is_gptp(s_state) &&
+        port->medium == ptp_port_medium_wifi_ftm && port->wifi_mode == ptp_port_wifi_mode_ap) {
+      uint32_t previous = port->wifi_peers.generation;
+      accepted = ptp_wifi_peers_reconcile(&port->wifi_peers, radio_boot,
+                                           radio_generation, macs, count);
+      changed = accepted && previous != port->wifi_peers.generation;
+    }
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  if (changed) {
+    portENTER_CRITICAL(&s_injected_lock);
+    ++s_injected_generation[port_index];
+    portEXIT_CRITICAL(&s_injected_lock);
+  }
+  return accepted;
+}
+
+uint32_t ptpd_wifi_announce_begin(int port_index, const uint8_t mac[6],
+    uint32_t association, uint32_t revision, uint32_t information_revision,
+    int8_t initial, int64_t now_us,
+    int8_t *advertised, uint16_t *sequence) {
+  if (!mac || !advertised || !sequence || port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) return 0;
+  uint32_t token = 0;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (s_state) {
+    struct ptp_port_s *port = &s_state->port[port_index];
+    ptp_wifi_peer_t *peer = ptp_wifi_peers_find(&port->wifi_peers, mac);
+    if (port->enabled && port->link_up && ptp_is_gptp(s_state) &&
+        port->medium == ptp_port_medium_wifi_ftm && port->wifi_mode == ptp_port_wifi_mode_ap &&
+        ptp_wifi_peers_publishable(&port->wifi_peers) &&
+        peer && peer->association == association)
+      token = ptp_announce_begin(&peer->announce, initial, revision, information_revision, now_us, advertised, sequence);
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  return token;
+}
+
+bool ptpd_wifi_announce_finish(int port_index, const uint8_t mac[6],
+    uint32_t association, uint32_t token, bool accepted, int64_t now_us) {
+  if (!mac || port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) return false;
+  bool current = false;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (s_state) {
+    struct ptp_port_s *port = &s_state->port[port_index];
+    ptp_wifi_peer_t *peer = ptp_wifi_peers_find(&port->wifi_peers, mac);
+    if (port->enabled && port->link_up && ptp_is_gptp(s_state) &&
+        port->medium == ptp_port_medium_wifi_ftm && port->wifi_mode == ptp_port_wifi_mode_ap &&
+        ptp_wifi_peers_publishable(&port->wifi_peers) &&
+        peer && peer->association == association)
+      current = ptp_announce_finish(&peer->announce, token, accepted, now_us);
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  return current;
 }
 
 static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
@@ -517,9 +738,11 @@ static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
   }
 
   if (!ptp_is_gptp(state)) {
+    state->avb_lite_fallback_reason = 4; /* standard PTP by configuration */
     return; /* configured as standard PTP: no gPTP fallback to arm */
   }
 
+  state->avb_lite_fallback_reason = 0;
   state->gptp_fallback_done = false;
   state->port[0].last_transmitted_delayreq.tv_sec = 0;
   state->port[0].last_transmitted_delayreq.tv_nsec = 0;
@@ -527,7 +750,9 @@ static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
   /* AVB Lite fallback re-evaluation on link-up (profiles/avb_lite.md §2.2). */
 
   state->port[0].peer_is_endpoint = false;
-  state->port[0].pdelay_req_attempts_unanswered = 0;
+  portENTER_CRITICAL(&s_peer_lock);
+  state->port[0].peer_exchange.lost_responses = 0;
+  portEXIT_CRITICAL(&s_peer_lock);
   state->port[0].pdelay_resp_responder_count = 0;
   state->port[0].pdelay_multi_responder = false;
   memset(state->port[0].pdelay_resp_responders, 0,
@@ -562,6 +787,13 @@ static void ptp_set_port_link(FAR struct ptp_state_s *state, int port_index,
   if (p->link_up == up) {
     return;
   }
+  portENTER_CRITICAL(&s_peer_lock);
+  ptp_peer_invalidate(&p->peer_exchange);
+  p->capable_receive.valid = false;
+  portEXIT_CRITICAL(&s_peer_lock);
+  portENTER_CRITICAL(&s_injected_lock);
+  ++s_injected_generation[port_index];
+  portEXIT_CRITICAL(&s_injected_lock);
   p->link_up = up;
   ptpinfo("port %d link %s\n", port_index, up ? "up" : "down");
 }
@@ -606,12 +838,43 @@ static void ptp_wifi_event_handler(void *arg, esp_event_base_t event_base,
   switch (event_id) {
   case WIFI_EVENT_STA_CONNECTED:
     if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+      const wifi_event_sta_connected_t *connected = event_data;
+      portENTER_CRITICAL(&s_peer_lock);
+      ptp_wifi_neighbor_associate(&p->wifi_neighbor, connected ? connected->bssid : NULL);
+      p->capable_receive.valid = false;
+      portEXIT_CRITICAL(&s_peer_lock);
+      portENTER_CRITICAL(&s_injected_lock);
+      ++s_injected_generation[port];
+      portEXIT_CRITICAL(&s_injected_lock);
       ptp_set_port_link(state, port, true);
     }
     break;
+  case WIFI_EVENT_STA_STOP:
   case WIFI_EVENT_STA_DISCONNECTED:
     if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+      portENTER_CRITICAL(&s_peer_lock);
+      ptp_wifi_neighbor_associate(&p->wifi_neighbor, NULL);
+      p->capable_receive.valid = false;
+      portEXIT_CRITICAL(&s_peer_lock);
       ptp_set_port_link(state, port, false);
+    }
+    break;
+  case WIFI_EVENT_AP_STACONNECTED:
+  case WIFI_EVENT_AP_STADISCONNECTED:
+    if (p->wifi_mode == ptp_port_wifi_mode_ap && event_data) {
+      portENTER_CRITICAL(&s_peer_lock);
+      if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        const wifi_event_ap_staconnected_t *connected = event_data;
+        ptp_wifi_peers_join(&p->wifi_peers, connected->mac);
+      } else {
+        const wifi_event_ap_stadisconnected_t *disconnected = event_data;
+        ptp_wifi_peers_leave(&p->wifi_peers, disconnected->mac);
+      }
+      portEXIT_CRITICAL(&s_peer_lock);
+      /* Conservatively retire queued frames on every association change. */
+      portENTER_CRITICAL(&s_injected_lock);
+      ++s_injected_generation[port];
+      portEXIT_CRITICAL(&s_injected_lock);
     }
     break;
   case WIFI_EVENT_AP_START:
@@ -621,6 +884,9 @@ static void ptp_wifi_event_handler(void *arg, esp_event_base_t event_base,
     break;
   case WIFI_EVENT_AP_STOP:
     if (p->wifi_mode == ptp_port_wifi_mode_ap) {
+      portENTER_CRITICAL(&s_peer_lock);
+      ptp_wifi_peers_clear(&p->wifi_peers);
+      portEXIT_CRITICAL(&s_peer_lock);
       ptp_set_port_link(state, port, false);
     }
     break;
@@ -630,8 +896,41 @@ static void ptp_wifi_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 static void ptp_reset_for_profile(FAR struct ptp_state_s *state) {
+  /* Retire radio work before resetting interval state for the new profile. */
+  portENTER_CRITICAL(&s_injected_lock);
+  for (int index = 0; index < CONFIG_ESP_PTP_NUM_PORTS; ++index)
+    ++s_injected_generation[index];
+  portEXIT_CRITICAL(&s_injected_lock);
+  portENTER_CRITICAL(&s_peer_lock);
+  for (int index = 0; index < CONFIG_ESP_PTP_NUM_PORTS; ++index) {
+    state->port[index].capable_receive.valid = false;
+    uint32_t wired_serial = state->port[index].wired_capable.transmit.serial;
+    memset(&state->port[index].wired_capable, 0, sizeof(state->port[index].wired_capable));
+    state->port[index].wired_capable.transmit.serial = wired_serial;
+    uint32_t sta_serial = state->port[index].wifi_neighbor.transmit.serial;
+    memset(&state->port[index].wifi_neighbor.transmit, 0,
+           sizeof(state->port[index].wifi_neighbor.transmit));
+    state->port[index].wifi_neighbor.transmit.serial = sta_serial;
+    ptp_sync_interval_reset(&state->port[index].wifi_neighbor.sync_stopped,
+                             &state->port[index].wifi_neighbor.sync_revision);
+    for (unsigned slot = 0; slot < PTP_WIFI_PEERS_MAX; ++slot) {
+      ptp_wifi_peer_t *peer = &state->port[index].wifi_peers.entries[slot];
+      peer->capable.valid = false;
+      ptp_sync_interval_reset(&peer->sync_stopped, &peer->sync_revision);
+      ptp_announce_reset(&peer->announce);
+      ptp_capable_schedule_t *schedule = &peer->transmit;
+      uint32_t serial = schedule->serial;
+      memset(schedule, 0, sizeof(*schedule));
+      schedule->serial = serial;
+    }
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  ptp_invalidate_timing();
   state->selected_source_valid = false;
+  state->port[0].twostep_pending = false;
   memset(&state->selected_source, 0, sizeof(state->selected_source));
+  memset(&state->selected_path, 0, sizeof(state->selected_path));
+  memset(&state->last_selected_announce, 0, sizeof(state->last_selected_announce));
   state->port[0].path_delay_avgcount = 0;
   state->port[0].path_delay_ns = 0;
   state->port[0].peer_delay_avgcount = 0;
@@ -729,6 +1028,7 @@ static void ptp_create_eth_frame_to(struct ptp_state_s *state,
 
   memcpy(eth_frame, &eth_hdr, sizeof(eth_hdr));
   memcpy(eth_frame + sizeof(eth_hdr), ptp_msg, ptp_msg_len);
+  ptp_gptp_wire_normalize(eth_frame + sizeof(eth_hdr), ptp_msg_len, ptp_is_gptp(state));
 }
 
 static void ptp_create_eth_frame(struct ptp_state_s *state, uint8_t *eth_frame,
@@ -825,6 +1125,8 @@ static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg,
     payload_len = ptp_msg_len;
   }
 
+  memcpy(state->port[0].rx_source_mac, eth_frame + ETH_ADDR_LEN, ETH_ADDR_LEN);
+  state->port[0].rx_source_mac_valid = true;
   memcpy(ptp_msg, &eth_frame[ETH_HEADER_LEN], payload_len);
 
   return (int)payload_len;
@@ -946,9 +1248,22 @@ static int64_t timespec_delta_ns(FAR const struct timespec *ts1,
   return delta_s * NSEC_PER_SEC + (ts1->tv_nsec - ts2->tv_nsec);
 }
 
+static int64_t ptp_announce_receipt_timeout_ns(const struct ptp_announce_s *msg) {
+  int8_t interval = (int8_t)msg->header.logmessageinterval;
+  if (interval < -24 || interval > 24)
+    return INT64_C(3000000) * CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS;
+  int64_t timeout_ns = INT64_C(3000000000);
+  if (interval >= 0)
+    return timeout_ns << interval;
+  int64_t divisor = INT64_C(1) << -interval;
+  return (timeout_ns + divisor - 1) / divisor;
+}
+
 /* Check if the currently selected source is still valid */
 
 static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
+  if (ptp_is_gptp(state) && state->port[0].medium == ptp_port_medium_eth_hwts &&
+      !ptp_wired_capability(state)) return false;
   struct timespec time_now;
   struct timespec delta;
 
@@ -957,23 +1272,23 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
     return false; /* Uninitialized value */
   }
 
-  /* Note: this uses monotonic clock to track the timeout even when
-   *       system clock is adjusted.
-   *
-   * Use the more recent of last_received_sync and last_received_announce.
-   * Wired endpoints get Sync at 8 Hz and refresh last_received_sync
-   * continuously; Wi-Fi STAs receiving §12.2 Announces (no Sync on the
-   * 0x88f7 socket) refresh last_received_announce continuously, while
-   * last_received_sync is only updated on BTCA *switch* events. Looking
-   * at both prevents the Wi-Fi case from spuriously timing out after
-   * CONFIG_ESP_PTP_TIMEOUT_MS while a stable source is still
-   * being announced. */
+  /* Announce receipt is independent of Sync and unrelated peer traffic. */
   clock_gettime(CLOCK_MONOTONIC, &time_now);
+  if (ptp_is_gptp(state)) {
+    int64_t announce_age = timespec_delta_ns(&time_now, &state->last_selected_announce);
+    if (announce_age < 0 ||
+        announce_age >= ptp_announce_receipt_timeout_ns(&state->selected_source))
+      return false;
+    if (state->selected_source.btc_priority1 < 255 &&
+        !ptp_sync_receipt_current(&state->port[0].sync_receipt, esp_timer_get_time()))
+      return false;
+    return true;
+  }
   struct timespec last_evt = state->port[0].last_received_sync;
-  if (state->port[0].last_received_announce.tv_sec > last_evt.tv_sec ||
-      (state->port[0].last_received_announce.tv_sec == last_evt.tv_sec &&
-       state->port[0].last_received_announce.tv_nsec > last_evt.tv_nsec)) {
-    last_evt = state->port[0].last_received_announce;
+  if (state->last_selected_announce.tv_sec > last_evt.tv_sec ||
+      (state->last_selected_announce.tv_sec == last_evt.tv_sec &&
+       state->last_selected_announce.tv_nsec > last_evt.tv_nsec)) {
+    last_evt = state->last_selected_announce;
   }
   clock_timespec_subtract(&time_now, &last_evt, &delta);
 
@@ -984,6 +1299,28 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
 
   return true;
 }
+
+bool ptpd_ftm_source_observed(int port_index, const uint8_t source_port[10],
+                             uint8_t domain, int8_t log_interval, int64_t received_us, uint32_t *generation)
+{
+  if (!s_state || !source_port || !generation || !s_use_sw_clock ||
+      port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS ||
+      !s_state->port[port_index].link_up || !s_state->selected_source_valid ||
+      !ptp_is_gptp(s_state) || s_state->selected_source.btc_priority1 == 255 ||
+      domain != CONFIG_ESP_PTP_DOMAIN ||
+      memcmp(source_port, s_state->selected_source.header.sourceidentity, 8) ||
+      memcmp(source_port + 8, s_state->selected_source.header.sourceportindex, 2)) return false;
+  if (!ptp_sync_receipt_observe(&s_state->port[port_index].sync_receipt,
+      received_us, log_interval, esp_timer_get_time())) return false;
+  ptp_timing_snapshot_t snapshot;
+  ptpd_timing_snapshot(&snapshot);
+  *generation = snapshot.generation;
+  clock_gettime(CLOCK_MONOTONIC, &s_state->port[port_index].last_received_sync);
+  return true;
+}
+
+extern void ptp_ftm_daemon_tick(void) __attribute__((weak));
+extern bool ptp_ftm_clock_ready(uint32_t generation) __attribute__((weak));
 
 /* Increment sequence number for packet type, and copy to header */
 
@@ -1264,12 +1601,40 @@ static int ptp_port_init_wifi_ftm(FAR struct ptp_state_s *state, int port_index,
     }
   }
 
+  if (p->wifi_mode == ptp_port_wifi_mode_ap) {
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+      portENTER_CRITICAL(&s_peer_lock);
+      uint32_t generation = p->wifi_peers.generation;
+      portEXIT_CRITICAL(&s_peer_lock);
+      wifi_sta_list_t stations = {0};
+      esp_err_t listed = esp_wifi_ap_get_sta_list(&stations);
+      portENTER_CRITICAL(&s_peer_lock);
+      bool current = p->wifi_peers.generation == generation;
+      if (listed == ESP_OK && current)
+        for (int index = 0; index < stations.num; ++index)
+          if (!ptp_wifi_peers_find(&p->wifi_peers, stations.sta[index].mac))
+            ptp_wifi_peers_join(&p->wifi_peers, stations.sta[index].mac);
+      portEXIT_CRITICAL(&s_peer_lock);
+      if (listed != ESP_OK || current) break;
+    }
+  }
+
   /* STA-mode wifi_ftm port: hand off the §12.7 beacon-IE parser, the
    * FTM initiator loop, and the FTM_REPORT handler to the dedicated
    * Wi-Fi STA transport module. Application code (e.g.
    * ESP-AVB-Endpoint) no longer needs to know about §12.7 IE bytes or
    * FTM cadence — bringing the port up is the only integration call. */
   if (p->wifi_mode == ptp_port_wifi_mode_sta) {
+    portENTER_CRITICAL(&s_peer_lock);
+    uint32_t association = p->wifi_neighbor.association;
+    portEXIT_CRITICAL(&s_peer_lock);
+    wifi_ap_record_t current_ap;
+    esp_err_t associated = esp_wifi_sta_get_ap_info(&current_ap);
+    portENTER_CRITICAL(&s_peer_lock);
+    if (associated == ESP_OK && p->wifi_neighbor.association == association &&
+        !p->wifi_neighbor.associated)
+      ptp_wifi_neighbor_associate(&p->wifi_neighbor, current_ap.bssid);
+    portEXIT_CRITICAL(&s_peer_lock);
     if (ptp_wifi_sta_start(port_index) != 0) {
       ptpwarn("port %d (wifi_ftm STA): ptp_wifi_sta_start failed — "
               "Sync via beacon-IE / FTM pair injection will not run\n",
@@ -1394,6 +1759,12 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->own_identity.btc_priority1 = 255;
 #endif
 
+  portENTER_CRITICAL(&s_injected_lock);
+  s_injected_head = s_injected_count = 0;
+  for (unsigned port = 0; port < CONFIG_ESP_PTP_NUM_PORTS; ++port)
+    ++s_injected_generation[port];
+  s_injected_enabled = true;
+  portEXIT_CRITICAL(&s_injected_lock);
   s_state = state;
 
   /* Run Pdelay_Req from esp_timer so the main poll loop can't starve
@@ -1451,34 +1822,6 @@ static int ptp_destroy_state(FAR struct ptp_state_s *state) {
     state->port[0].ptp_socket = -1;
   }
   return OK;
-}
-
-/* Track the source clockIdentity of a received Pdelay_Resp; if the count of
- * distinct responders crosses 2, latch pdelay_multi_responder.
- * Per profiles/avb_lite.md §2.2 cond 3 — spec-compliant AVB bridge presents
- * exactly one boundary-clock peer per port. */
-static void ptp_record_pdelay_responder(FAR struct ptp_state_s *state,
-                                        FAR const uint8_t *sourceidentity) {
-  if (state->port[0].pdelay_multi_responder) {
-    return;
-  }
-  for (unsigned i = 0; i < state->port[0].pdelay_resp_responder_count; i++) {
-    if (memcmp(state->port[0].pdelay_resp_responders[i], sourceidentity, 8) ==
-        0) {
-      return; /* already tracked */
-    }
-  }
-  if (state->port[0].pdelay_resp_responder_count <
-      PTP_PDELAY_RESP_MAX_TRACKED) {
-    memcpy(
-        state->port[0]
-            .pdelay_resp_responders[state->port[0].pdelay_resp_responder_count],
-        sourceidentity, 8);
-  }
-  state->port[0].pdelay_resp_responder_count++;
-  if (state->port[0].pdelay_resp_responder_count >= 2) {
-    state->port[0].pdelay_multi_responder = true;
-  }
 }
 
 static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
@@ -1619,7 +1962,7 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
  * lastGmPhaseChange, scaledLastGmFreqChange, sequenceId) are zero. */
 static void
 ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
-                                    FAR struct ptp_follow_up_s *out) {
+                                    FAR struct ptp_follow_up_s *out, int port_index) {
   memset(out, 0, sizeof(*out));
 
   /* Common header — start from cached own_identity template */
@@ -1636,11 +1979,8 @@ ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
     out->header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
   }
 
-  /* sourceClockIdentity: upstream BTC if synced, else our own. */
-  if (state->selected_source_valid) {
-    memcpy(out->header.sourceidentity, state->selected_source.btc_identity,
-           sizeof(out->header.sourceidentity));
-  }
+  out->header.sourceportindex[0] = (port_index + 1) >> 8;
+  out->header.sourceportindex[1] = port_index + 1;
 
   /* preciseOriginTimestamp — current PTP-disciplined time */
   struct timespec ts;
@@ -1657,6 +1997,42 @@ ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
   tlv->orgidentity[1] = 0x80;
   tlv->orgidentity[2] = 0xc2; /* IEEE 802.1 OUI */
   tlv->orgsubtype[2] = 1;     /* FollowUp Information per §11.4.4.3 */
+  ptp_gptp_wire_normalize((uint8_t *)out, sizeof(*out), ptp_is_gptp(state));
+}
+
+/* Originate from the running hardware clock while the local clock is selected.
+ * Keep this separate from received timing, so holdover is not an observation. */
+static void ptp_publish_local_source(FAR struct ptp_state_s *state)
+{
+  bool eligible = ptp_is_gptp(state) && !s_use_sw_clock &&
+      !state->selected_source_valid && state->own_identity.btc_priority1 < 255;
+  if (!eligible) {
+    portENTER_CRITICAL(&s_timing_lock);
+    s_local_source_snapshot.valid = false;
+    portEXIT_CRITICAL(&s_timing_lock);
+    return;
+  }
+  struct timespec origin;
+  if (ptp_gettime(state, &origin) != OK || origin.tv_sec < 0) return;
+  ptp_timing_snapshot_t next = {
+    .received_us = esp_timer_get_time(),
+    .reference_ns = timespec_to_ns(&origin),
+    .local_receive_ns = timespec_to_ns(&origin),
+    .trim_ppb = state->freq_trim_ppb,
+    .hardware_clock = true,
+    .valid = true,
+  };
+  struct ptp_follow_up_s message;
+  ptp_marshal_follow_up_for_beacon_ie(state, &message, 0);
+  timespec_to_ptp_format(&origin, message.origintimestamp);
+  memcpy(next.follow_up, &message, sizeof(next.follow_up));
+  memcpy(next.btc_identity, state->own_identity.btc_identity, 8);
+  memcpy(next.own_identity, state->own_identity.header.sourceidentity, 8);
+  portENTER_CRITICAL(&s_timing_lock);
+  if (!s_timing_snapshot.generation) s_timing_snapshot.generation = 1;
+  next.generation = s_timing_snapshot.generation;
+  s_local_source_snapshot = next;
+  portEXIT_CRITICAL(&s_timing_lock);
 }
 
 /* Send PTP server synchronization packet */
@@ -1740,6 +2116,16 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
 /* Send delay request packet to selected source */
 
 static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
+#if CONFIG_ESP_PTP_PEER_LOSS_TEST
+  static bool testing;
+  int64_t test_time = esp_timer_get_time();
+  bool suppress = test_time >= 60000000LL && test_time < 66000000LL;
+  if (testing != suppress) {
+    testing = suppress;
+    ptpinfo("PDELAY_LOSS_TEST,%u", suppress);
+  }
+  if (suppress) return OK;
+#endif
   ptp_msgbuf req;
   int ret;
   size_t req_len;
@@ -1761,11 +2147,6 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
     req.header.controlfield = 5;
     req_len = sizeof(struct ptp_pdelay_req_s);
 
-    /* Reset per-cycle responder set so the §2.2 cond 3 (cardinality) check
-     * sees only the responders for this single Pdelay_Req. */
-    state->port[0].pdelay_resp_responder_count = 0;
-    memset(state->port[0].pdelay_resp_responders, 0,
-           sizeof(state->port[0].pdelay_resp_responders));
   } else {
     req.header.messagetype = PTP_MSGTYPE_DELAY_REQ;
     ptp_gettime(state, &state->port[0].delayreq_time);
@@ -1777,16 +2158,58 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
 
   ptp_increment_sequence(&state->delay_req_seq, &req.header);
 
-  ret = ptp_net_send(state, &req, req_len, &state->port[0].delayreq_time);
+  const bool peer_request = ptp_is_gptp(state);
+  struct timespec transmit_time = {.tv_nsec = -1};
+  uint32_t request_generation = 0;
+  unsigned expired_losses = 0;
+  bool missing_follow_up = false;
+  unsigned expired_sequence = 0, response_rejections = 0, response_count = 0;
+  int64_t first_response_us = 0, published_us = 0;
+  unsigned follow_up_ingress = 0, follow_up_count = 0, follow_up_rejections = 0;
+  if (peer_request) {
+    int64_t deadline_us = esp_timer_get_time() +
+        (int64_t)state->port[0].delayreq_interval_ms * 1000;
+    portENTER_CRITICAL(&s_peer_lock);
+    if (ptp_peer_expire(&state->port[0].peer_exchange, esp_timer_get_time())) {
+      expired_losses = state->port[0].peer_exchange.lost_responses;
+      missing_follow_up = state->port[0].peer_exchange.response_seen;
+      expired_sequence = state->port[0].peer_exchange.sequence;
+      response_rejections = state->port[0].peer_exchange.response_rejections;
+      response_count = state->port[0].peer_exchange.response_count;
+      first_response_us = state->port[0].peer_exchange.first_response_us;
+      published_us = state->port[0].peer_exchange.published_us;
+      follow_up_ingress = s_peer_ingress_count;
+      follow_up_count = state->port[0].peer_exchange.follow_up_count;
+      follow_up_rejections = state->port[0].peer_exchange.follow_up_rejections;
+    }
+    s_peer_ingress_sequence = ptp_get_sequence(&req.header);
+    s_peer_ingress_count = 0;
+    request_generation = ptp_peer_begin(&state->port[0].peer_exchange,
+        ptp_get_sequence(&req.header), &req.header, deadline_us);
+    portEXIT_CRITICAL(&s_peer_lock);
+  }
+  if (expired_losses) {
+    ptpinfo("PDELAY_LOST,%u,%u", expired_losses, missing_follow_up);
+    ptpinfo("PDELAY_LOST_DETAIL,%u,%u,%u,%lld,%lld", expired_sequence,
+            response_rejections, response_count, (long long)first_response_us,
+            (long long)published_us);
+    ptpinfo("PDELAY_LOST_FU,%u,%u,%u,%u", expired_sequence,
+            follow_up_ingress, follow_up_count, follow_up_rejections);
+  }
+  ret = ptp_net_send(state, &req, req_len,
+                    peer_request ? &transmit_time : &state->port[0].delayreq_time);
+  if (peer_request) {
+    portENTER_CRITICAL(&s_peer_lock);
+    if (ret <= 0 || !ptp_peer_publish(&state->port[0].peer_exchange, request_generation,
+                                     &transmit_time, esp_timer_get_time()))
+      ptp_peer_cancel(&state->port[0].peer_exchange, request_generation);
+    portEXIT_CRITICAL(&s_peer_lock);
+  }
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
   } else {
     clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_transmitted_delayreq);
-    if (ptp_is_gptp(state) && !state->gptp_fallback_done) {
-      /* For AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2). */
-      state->port[0].pdelay_req_attempts_unanswered++;
-    }
     ptpdebug("Sent delay req, seq %ld", (long)ptp_get_sequence(&req.header));
   }
 
@@ -1853,22 +2276,26 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
     ptpwarn("Endpoint Declaration TLV seen on Pdelay channel; "
             "switching to standard PTP mode\n");
     state->gptp_fallback_done = true;
+    state->avb_lite_fallback_reason = 1;
     state->active_ptp_profile = ptp_profile_standard;
     ptp_reset_for_profile(state);
     return;
   }
 
-  /* AVB Lite fallback condition 2 (profiles/avb_lite.md §2.2):
-   * nine consecutive Pdelay_Req attempts with no Pdelay_Resp received,
-   * per the 802.1AS-2020 §11.5.3 allowedLostResponses default. The
-   * original value of 3 (802.1AS-2011) let a ~3 s ingress blip on a
-   * healthy AVB link spring the fallback latch permanently. */
+  /* AVB Lite policy: nine expired, incomplete peer exchanges. Count only
+   * published requests after their deadline, not the request still in flight.
+   * This policy is separate from gPTP asCapable fault tolerance. */
 
-  if (state->port[0].pdelay_req_attempts_unanswered >= 9) {
+  portENTER_CRITICAL(&s_peer_lock);
+  ptp_peer_expire(&state->port[0].peer_exchange, esp_timer_get_time());
+  unsigned unanswered = state->port[0].peer_exchange.lost_responses;
+  portEXIT_CRITICAL(&s_peer_lock);
+  if (unanswered >= 9) {
     ptpwarn(
-        "No Pdelay_Resp after %u attempts; switching to standard PTP mode\n",
-        state->port[0].pdelay_req_attempts_unanswered);
+        "Incomplete peer exchanges after %u deadlines; switching to standard PTP mode\n",
+        unanswered);
     state->gptp_fallback_done = true;
+    state->avb_lite_fallback_reason = 2;
     state->active_ptp_profile = ptp_profile_standard;
     ptp_reset_for_profile(state);
     return;
@@ -1883,14 +2310,157 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
     ptpwarn(
         "Pdelay_Resp from multiple sources; switching to standard PTP mode\n");
     state->gptp_fallback_done = true;
+    state->avb_lite_fallback_reason = 3;
     state->active_ptp_profile = ptp_profile_standard;
     ptp_reset_for_profile(state);
   }
 }
 
+/* Radio completion records contain values only, never daemon pointers. */
+static void ptp_wifi_capable_completions(struct ptp_state_s *state) {
+  ptp_wifi_capable_result_t result;
+  for (unsigned count = 0; count < PTP_WIFI_PEERS_MAX * CONFIG_ESP_PTP_NUM_PORTS &&
+       ptp_wifi_capable_result(&result); ++count) {
+    if (result.port_index < 0 || result.port_index >= CONFIG_ESP_PTP_NUM_PORTS ||
+        result.generation != ptp_wifi_link_generation(result.port_index)) continue;
+    portENTER_CRITICAL(&s_peer_lock);
+    struct ptp_port_s *port = &state->port[result.port_index];
+    if (port->wifi_mode == ptp_port_wifi_mode_ap)
+      ptp_wifi_peers_sent(&port->wifi_peers, result.destination, result.association,
+          result.token, result.accepted, result.completed_us);
+    else if (port->wifi_mode == ptp_port_wifi_mode_sta)
+      ptp_wifi_neighbor_sent(&port->wifi_neighbor, result.destination, result.association,
+          result.token, result.accepted, result.completed_us);
+    portEXIT_CRITICAL(&s_peer_lock);
+  }
+}
+
+static void ptp_wifi_ap_capable_send(struct ptp_state_s *state, int index, bool enabled) {
+  struct ptp_port_s *port = &state->port[index];
+  for (unsigned slot = 0; slot < PTP_WIFI_PEERS_MAX; ++slot) {
+    /* Snapshot generation before association state, so a concurrent event retires work. */
+    uint32_t generation = ptp_wifi_link_generation(index);
+    int64_t now_us = esp_timer_get_time();
+    uint8_t destination[6], source_port[10], target[10], message[PTP_CAPABLE_MESSAGE_LENGTH];
+    portENTER_CRITICAL(&s_peer_lock);
+    ptp_wifi_peer_t *peer = &port->wifi_peers.entries[slot];
+    bool publishable = ptp_wifi_peers_publishable(&port->wifi_peers);
+    uint32_t token = ptp_capable_schedule_begin(&peer->transmit,
+                                               enabled && publishable && peer->associated, now_us);
+    uint32_t association = peer->association;
+    uint16_t sequence = peer->transmit.sequence;
+    int8_t interval = peer->transmit.advertised_interval;
+    bool bound = peer->bound;
+    memcpy(target, peer->port_identity, 10);
+    memcpy(destination, peer->mac, 6);
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (!token) continue;
+    memcpy(source_port, state->own_identity.header.sourceidentity, 8);
+    uint16_t logical_port = ptp_wifi_association_port(index + 1, CONFIG_ESP_PTP_NUM_PORTS, slot);
+    source_port[8] = logical_port >> 8;
+    source_port[9] = logical_port;
+#ifdef CONFIG_ESP_PTP_INTERVAL_PROBE
+    if (enabled && bound && publishable) ptp_wifi_interval_probe_start(index, true, port->intf_hw_addr,
+        source_port, destination, target, generation);
+#else
+    (void)bound;
+#endif
+    size_t length = ptp_signaling_write_capable(message, sizeof(message), source_port,
+        CONFIG_ESP_PTP_DOMAIN, sequence, interval);
+    if (!length || ptp_wifi_send_capable_peer(index, true, port->intf_hw_addr, destination,
+          generation, association, token, message, length) != 0) {
+      portENTER_CRITICAL(&s_peer_lock);
+      ptp_wifi_peers_sent(&port->wifi_peers, destination, association, token, false, now_us);
+      portEXIT_CRITICAL(&s_peer_lock);
+    }
+  }
+}
+
+static void ptp_wifi_sta_capable_send(struct ptp_state_s *state, int index, bool enabled) {
+  struct ptp_port_s *port = &state->port[index];
+  uint32_t generation = ptp_wifi_link_generation(index);
+  int64_t now_us = esp_timer_get_time();
+  uint8_t destination[6], target[10], source_port[10], message[PTP_CAPABLE_MESSAGE_LENGTH];
+  portENTER_CRITICAL(&s_peer_lock);
+  ptp_wifi_neighbor_t *neighbor = &port->wifi_neighbor;
+  uint32_t token = ptp_capable_schedule_begin(&neighbor->transmit,
+                                             enabled && neighbor->associated, now_us);
+  uint32_t association = neighbor->association;
+  uint16_t sequence = neighbor->transmit.sequence;
+  int8_t interval = neighbor->transmit.advertised_interval;
+  bool bound = neighbor->bound;
+  memcpy(destination, neighbor->bssid, 6);
+  memcpy(target, neighbor->port_identity, 10);
+  portEXIT_CRITICAL(&s_peer_lock);
+  memcpy(source_port, state->own_identity.header.sourceidentity, 8);
+  source_port[8] = (index + 1) >> 8;
+  source_port[9] = index + 1;
+#ifdef CONFIG_ESP_PTP_INTERVAL_PROBE
+  if (enabled && bound) ptp_wifi_interval_probe_start(index, false, port->intf_hw_addr,
+      source_port, destination, target, generation);
+#else
+  (void)bound;
+#endif
+  if (!token) return;
+  size_t length = ptp_signaling_write_capable(message, sizeof(message), source_port,
+      CONFIG_ESP_PTP_DOMAIN, sequence, interval);
+  if (!length || ptp_wifi_send_capable_peer(index, false, port->intf_hw_addr, destination,
+        generation, association, token, message, length) != 0) {
+    portENTER_CRITICAL(&s_peer_lock);
+    ptp_wifi_neighbor_sent(&port->wifi_neighbor, destination, association, token, false, now_us);
+    portEXIT_CRITICAL(&s_peer_lock);
+  }
+}
+
+static void ptp_wired_capable_send(struct ptp_state_s *state) {
+  struct ptp_port_s *port = &state->port[0];
+  int64_t now_us = esp_timer_get_time();
+  portENTER_CRITICAL(&s_peer_lock);
+  uint32_t lifecycle = port->peer_exchange.lifecycle;
+  const uint8_t *identity = port->peer_rate.anchored &&
+      port->peer_rate.lifecycle == lifecycle ? port->peer_rate.responder : NULL;
+  ptp_wired_capable_bind(&port->wired_capable, lifecycle, identity);
+  bool enabled = ptp_is_gptp(state) && port->enabled && port->link_up && port->ptp_socket >= 0;
+  uint32_t token = ptp_capable_schedule_begin(&port->wired_capable.transmit, enabled, now_us);
+  uint16_t sequence = port->wired_capable.transmit.sequence;
+  int8_t interval = port->wired_capable.transmit.advertised_interval;
+  portEXIT_CRITICAL(&s_peer_lock);
+  if (!token) return;
+  uint8_t source_port[10], message[PTP_CAPABLE_MESSAGE_LENGTH];
+  memcpy(source_port, state->own_identity.header.sourceidentity, 8);
+  memcpy(source_port + 8, state->own_identity.header.sourceportindex, 2);
+  size_t length = ptp_signaling_write_capable(message, sizeof(message), source_port,
+      CONFIG_ESP_PTP_DOMAIN, sequence, interval);
+  bool accepted = length && ptp_net_send(state, message, length, NULL) > 0;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (port->peer_exchange.lifecycle == lifecycle)
+    ptp_capable_schedule_finish(&port->wired_capable.transmit, token, accepted,
+                                esp_timer_get_time());
+  portEXIT_CRITICAL(&s_peer_lock);
+}
+
 /* Check if we need to send packets */
 
 static int ptp_periodic_send(FAR struct ptp_state_s *state) {
+  /* Capability discovery continues while the physical peer is unqualified. */
+  if (state->port[0].medium == ptp_port_medium_eth_hwts)
+    ptp_wired_capable_send(state);
+
+  /* Wireless discovery uses unicast and never waits for a radio RPC here. */
+  ptp_wifi_capable_completions(state);
+  for (int index = 0; index < CONFIG_ESP_PTP_NUM_PORTS; ++index) {
+    struct ptp_port_s *port = &state->port[index];
+    if (port->medium != ptp_port_medium_wifi_ftm) continue;
+    bool enabled = ptp_is_gptp(state) && port->enabled && port->link_up &&
+        (port->wifi_mode == ptp_port_wifi_mode_ap ||
+         port->wifi_mode == ptp_port_wifi_mode_sta);
+    if (port->wifi_mode == ptp_port_wifi_mode_ap) {
+      ptp_wifi_ap_capable_send(state, index, enabled);
+      continue;
+    }
+    ptp_wifi_sta_capable_send(state, index, enabled);
+  }
+
 #if defined(CONFIG_ESP_PTP_SERVER) ||                                    \
     defined(CONFIG_ESP_PTP_GPTP_PROFILE)
   /* If there is no better timetransmitter clock on the network,
@@ -1900,7 +2470,8 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
    * on an eth_hwts port. wifi_ftm uses the egress-cb path below. */
   if (!state->selected_source_valid && state->port[0].enabled &&
       state->port[0].medium == ptp_port_medium_eth_hwts &&
-      state->port[0].ptp_socket >= 0) {
+      state->port[0].ptp_socket >= 0 &&
+      (!ptp_is_gptp(state) || ptp_wired_capability(state))) {
     struct timespec time_now;
     struct timespec delta;
 
@@ -1914,7 +2485,8 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
 
     clock_timespec_subtract(&time_now, &state->port[0].last_transmitted_sync,
                             &delta);
-    if (timespec_to_ms(&delta) > CONFIG_ESP_PTP_SYNC_INTERVAL_MS) {
+    if (timespec_to_ms(&delta) > CONFIG_ESP_PTP_SYNC_INTERVAL_MS &&
+        (!ptp_is_gptp(state) || state->own_identity.btc_priority1 < 255)) {
       state->port[0].last_transmitted_sync = time_now;
       ptp_send_sync(state);
     }
@@ -1927,6 +2499,10 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
   for (int p = 0; p < CONFIG_ESP_PTP_NUM_PORTS; p++) {
     struct ptp_port_s *port = &state->port[p];
     if (!port->enabled)
+      continue;
+    if (ptp_is_gptp(state) &&
+        (state->selected_source_valid ? state->selected_source.btc_priority1 :
+         state->own_identity.btc_priority1) == 255)
       continue;
     if (port->medium != ptp_port_medium_wifi_ftm)
       continue;
@@ -1942,7 +2518,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     port->last_transmitted_sync = time_now;
 
     struct ptp_follow_up_s fu;
-    ptp_marshal_follow_up_for_beacon_ie(state, &fu);
+    ptp_marshal_follow_up_for_beacon_ie(state, &fu, p);
     port->sync_egress_cb(p, (const uint8_t *)&fu, sizeof(fu),
                          port->sync_egress_ctx);
   }
@@ -1956,6 +2532,7 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     struct ptp_port_s *port = &state->port[p];
     if (!port->enabled)
       continue;
+
     if (port->medium != ptp_port_medium_wifi_ftm)
       continue;
     if (port->wifi_mode != ptp_port_wifi_mode_ap)
@@ -1965,9 +2542,11 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     clock_gettime(CLOCK_MONOTONIC, &time_now);
     clock_timespec_subtract(&time_now, &port->last_transmitted_announce,
                             &delta);
-    if (timespec_to_ms(&delta) <= CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS) {
-      continue;
-    }
+    /* Refresh the shared body faster than per-peer transmission deadlines. */
+    int publish_ms = CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS / 4;
+    if (publish_ms < 1) publish_ms = 1;
+    if (publish_ms > 125) publish_ms = 125;
+    if (timespec_to_ms(&delta) < publish_ms) continue;
     port->last_transmitted_announce = time_now;
 
     /* Build Announce body. Prefer the selected upstream source's
@@ -1978,9 +2557,17 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     memset(&msg, 0, sizeof(msg));
     if (state->selected_source_valid) {
       msg = state->selected_source;
+      unsigned steps = ((unsigned)msg.stepsremoved[0] << 8) | msg.stepsremoved[1];
+      if (steps == 65535) continue;
+      ++steps;
+      msg.stepsremoved[0] = steps >> 8;
+      msg.stepsremoved[1] = steps;
     } else {
       msg = state->own_identity;
     }
+    memcpy(msg.header.sourceidentity, state->own_identity.header.sourceidentity, 8);
+    msg.header.sourceportindex[0] = (p + 1) >> 8;
+    msg.header.sourceportindex[1] = p + 1;
     msg.header.messagetype = PTP_MSGTYPE_ANNOUNCE;
     msg.header.messagelength[1] = sizeof(msg);
     msg.header.logmessageinterval =
@@ -1989,21 +2576,49 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
       msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP;
       msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
     }
-    ptp_increment_sequence(&state->announce_seq, &msg.header);
+    /* The worker assigns each logical port its own transmit sequence. */
     struct timespec origin_ts;
     ptp_gettime(state, &origin_ts);
     timespec_to_ptp_format(&origin_ts, msg.origintimestamp);
-    struct ptp_pathtrace_tlv_s pathtrace_tlv;
-    memset(&pathtrace_tlv, 0, sizeof(pathtrace_tlv));
-    pathtrace_tlv.type[1] = 8;
-    pathtrace_tlv.length[1] = 8;
-    memcpy(pathtrace_tlv.pathsequence,
-           state->selected_source_valid ? state->selected_source.btc_identity
-                                        : state->own_identity.btc_identity,
-           sizeof(pathtrace_tlv.pathsequence));
-    msg.pathtracetlv = pathtrace_tlv;
-
-    ptp_wifi_ap_send_announce(p, port->intf_hw_addr, &msg, sizeof(msg));
+    uint8_t wire[PTP_ANNOUNCE_MAX_LENGTH] = {0};
+    _Static_assert(offsetof(struct ptp_announce_s, pathtracetlv) == PTP_ANNOUNCE_BODY_LENGTH,
+                   "Announce body layout changed");
+    memcpy(wire, &msg, PTP_ANNOUNCE_BODY_LENGTH);
+    ptp_path_trace_t empty_path = {0};
+    const ptp_path_trace_t *path = state->selected_source_valid
+                                      ? &state->selected_path : &empty_path;
+    size_t tlv_length = 0;
+    bool trace_known = !state->selected_source_valid || path->count;
+#ifdef CONFIG_ESP_PTP_ANNOUNCE_PATH_PROBE
+    static int64_t path_probe_start[CONFIG_ESP_PTP_NUM_PORTS];
+    static unsigned path_probe_phase[CONFIG_ESP_PTP_NUM_PORTS];
+    int64_t probe_now = esp_timer_get_time();
+    if (!path_probe_start[p] && state->selected_source_valid) {
+      path_probe_start[p] = probe_now;
+      ptpinfo("ANNPATH,%d,0", p);
+    }
+    if (path_probe_start[p]) {
+      int64_t elapsed = probe_now - path_probe_start[p];
+      unsigned phase = elapsed < 30000000 ? 0 : elapsed < 38000000 ? 1 : 2;
+      if (phase != path_probe_phase[p]) {
+        path_probe_phase[p] = phase;
+        ptpinfo("ANNPATH,%d,%u", p, phase);
+      }
+      if (phase == 1) trace_known = false;
+    }
+#endif
+    /* An unknown upstream path stays unknown through this relay. */
+    if (trace_known) {
+      tlv_length = ptp_path_trace_write(
+          wire + PTP_ANNOUNCE_BODY_LENGTH, sizeof(wire) - PTP_ANNOUNCE_BODY_LENGTH,
+          path, state->own_identity.header.sourceidentity);
+      if (!tlv_length) continue;
+    }
+    size_t wire_length = PTP_ANNOUNCE_BODY_LENGTH + tlv_length;
+    wire[2] = wire_length >> 8;
+    wire[3] = wire_length;
+    ptp_gptp_wire_normalize(wire, wire_length, ptp_is_gptp(state));
+    ptp_wifi_ap_send_announce(p, port->intf_hw_addr, wire, wire_length);
   }
 
   /* Post-fallback endpoint beacon (profiles/avb_lite.md §2.3): after
@@ -2034,25 +2649,80 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
 /* Process received PTP announcement */
 
 static int ptp_process_announce(FAR struct ptp_state_s *state,
-                                FAR struct ptp_announce_s *msg) {
-  clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_announce);
-
-  if (is_better_clock(msg, &state->own_identity)) {
-    if (!state->selected_source_valid ||
-        is_better_clock(msg, &state->selected_source)) {
-      ptpinfo("Switching to better PTP time source\n");
-
-      state->selected_source = *msg;
-      state->port[0].last_received_sync = state->port[0].last_received_announce;
-      state->port[0].path_delay_avgcount = 0;
-      state->port[0].path_delay_ns = 0;
-      state->port[0].peer_delay_avgcount = 0;
-      state->port[0].peer_delay_ns = 0;
-      state->correction_ns = 0;
-      state->port[0].delayreq_time.tv_sec = 0;
-    }
+                                FAR struct ptp_announce_s *msg, size_t length) {
+  ptp_path_trace_t path;
+  if (!ptp_path_trace_parse((const uint8_t *)msg, length,
+                            state->own_identity.header.sourceidentity, &path))
+    return OK;
+  unsigned steps = ((unsigned)msg->stepsremoved[0] << 8) | msg->stepsremoved[1];
+  if (ptp_is_gptp(state) &&
+      (steps >= 255 || !memcmp(msg->header.sourceidentity,
+                               state->own_identity.header.sourceidentity, 8)))
+    return OK;
+  if (state->port[0].medium == ptp_port_medium_wifi_ftm &&
+      state->port[0].wifi_mode == ptp_port_wifi_mode_sta &&
+      state->port[0].rx_source_mac_valid) {
+    uint8_t identity[10];
+    memcpy(identity, msg->header.sourceidentity, 8);
+    memcpy(identity + 8, msg->header.sourceportindex, 2);
+    portENTER_CRITICAL(&s_peer_lock);
+    bool changed_neighbor = !state->port[0].wifi_neighbor.bound ||
+        memcmp(state->port[0].wifi_neighbor.port_identity, identity, 10);
+    bool bound = ptp_wifi_neighbor_bind(&state->port[0].wifi_neighbor,
+        state->port[0].rx_association, state->port[0].rx_source_mac, identity);
+    if (bound && memcmp(state->port[0].capable_receive.message.source_port, identity, 10))
+      state->port[0].capable_receive.valid = false;
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (!bound) return OK;
+    if (changed_neighbor)
+      ptpinfo("WIFI_NEIGHBOR,%u", state->port[0].rx_association);
   }
+  clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_announce);
+  bool same_port = !memcmp(msg->header.sourceidentity,
+                          state->selected_source.header.sourceidentity, 8) &&
+                   !memcmp(msg->header.sourceportindex,
+                           state->selected_source.header.sourceportindex, 2);
+  bool same_root = !memcmp(msg->btc_identity, state->selected_source.btc_identity, 8);
+  if (!is_better_clock(msg, &state->own_identity)) {
+    if (same_port) {
+      ptp_invalidate_timing();
+      state->selected_source_valid = false;
+      memset(&state->selected_source, 0, sizeof(state->selected_source));
+      memset(&state->selected_path, 0, sizeof(state->selected_path));
+    }
+    return OK;
+  }
+  if (!same_port && state->selected_source_valid &&
+      !is_better_clock(msg, &state->selected_source))
+    return OK;
 
+  bool changed = !state->selected_source_valid || !same_port || !same_root;
+  bool vector_changed = memcmp(&msg->btc_priority1, &state->selected_source.btc_priority1, 14) ||
+      memcmp(msg->stepsremoved, state->selected_source.stepsremoved, 2);
+  if (changed || vector_changed)
+    ptp_sync_receipt_start(&state->port[0].sync_receipt, esp_timer_get_time(),
+        INT64_C(3000) * CONFIG_ESP_PTP_SYNC_INTERVAL_MS);
+  bool path_changed = state->selected_path.count != path.count ||
+                      memcmp(state->selected_path.identities, path.identities,
+                             path.count * 8);
+  if (changed) {
+    ptpinfo("Switching PTP time source\n");
+    ptp_invalidate_timing();
+    state->port[0].twostep_pending = false;
+    state->port[0].last_received_sync = state->port[0].last_received_announce;
+    state->port[0].path_delay_avgcount = 0;
+    state->port[0].path_delay_ns = 0;
+    state->correction_ns = 0;
+    state->port[0].delayreq_time.tv_sec = 0;
+  }
+  memset(&state->selected_source, 0, sizeof(state->selected_source));
+  memcpy(&state->selected_source, msg, PTP_ANNOUNCE_BODY_LENGTH);
+  state->selected_path = path;
+  if (changed || path_changed) {
+    ptpinfo("Selected Announce path: %u clock(s)", path.count);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, path.identities, path.count * 8, ESP_LOG_INFO);
+  }
+  state->last_selected_announce = state->port[0].last_received_announce;
   return OK;
 }
 
@@ -2070,37 +2740,37 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   /* The ESP-IDF hardware clock applies ADJ_FREQUENCY relative to its current
    * addend. Keep the PI output as an absolute trim and apply only its delta;
    * applying the complete output every Sync accumulates rate error. */
-  /* Gentler gains on the gap-noisy wifi/SW path; wired keeps the tight
-   * gains its sub-µs reference can use. */
-  const int64_t p_div = s_use_sw_clock ? PTP_FREQ_P_DIV_SW : PTP_FREQ_P_DIV;
-  const int64_t i_div = s_use_sw_clock ? PTP_FREQ_I_DIV_SW : PTP_FREQ_I_DIV;
-  state->offset_pi.drift_acc += offset_ns / i_div;
-  if (state->offset_pi.drift_acc > ADJ_FREQ_MAX) {
-    state->offset_pi.drift_acc = ADJ_FREQ_MAX;
-  } else if (state->offset_pi.drift_acc < -ADJ_FREQ_MAX) {
-    state->offset_pi.drift_acc = -ADJ_FREQ_MAX;
-  }
-  int64_t target_trim = offset_ns / p_div + state->offset_pi.drift_acc;
-  if (target_trim > ADJ_FREQ_MAX) {
-    target_trim = ADJ_FREQ_MAX;
-  } else if (target_trim < -ADJ_FREQ_MAX) {
-    target_trim = -ADJ_FREQ_MAX;
-  }
-  int32_t trim_delta = (int32_t)target_trim - state->freq_trim_ppb;
-
-  /* Record interval diagnostics; these values are not an adjustment input
-   * because short Sync-to-Sync measurements contain scheduling jitter. */
+  /* Scale wired integration by elapsed local time. The remote/local
+   * interval difference remains diagnostic, not a frequency estimate. */
   int64_t remote_time_ns = timespec_to_ns(remote_timestamp);
   int64_t local_time_ns = timespec_to_ns(local_timestamp);
   int64_t remote_delta_ns = remote_time_ns - state->remote_time_ns_prev;
   int64_t local_delta_ns = local_time_ns - state->local_time_ns_prev;
   int64_t tick_diff = remote_delta_ns - local_delta_ns;
 
+  int64_t target_trim;
+  int64_t saved_integral = state->offset_pi.wired_integral_q16;
   if (s_use_sw_clock) {
-    /* SW backend caps at +/- 1e8 ppb; let it clamp by returning -1. The
-     * rate adjustment is cumulative, so it must be applied exactly once
-     * per Sync — applying it twice doubles every correction and the loop
-     * never settles. */
+    /* Keep the existing controller for noisy beacon observations. */
+    state->offset_pi.drift_acc += offset_ns / PTP_FREQ_I_DIV_SW;
+    if (state->offset_pi.drift_acc > ADJ_FREQ_MAX) state->offset_pi.drift_acc = ADJ_FREQ_MAX;
+    if (state->offset_pi.drift_acc < -ADJ_FREQ_MAX) state->offset_pi.drift_acc = -ADJ_FREQ_MAX;
+    target_trim = offset_ns / PTP_FREQ_P_DIV_SW + state->offset_pi.drift_acc;
+    if (target_trim > ADJ_FREQ_MAX) target_trim = ADJ_FREQ_MAX;
+    if (target_trim < -ADJ_FREQ_MAX) target_trim = -ADJ_FREQ_MAX;
+  } else {
+    int64_t interval_ns = state->local_time_ns_prev && local_delta_ns > 0 ?
+        local_delta_ns : (int64_t)CONFIG_ESP_PTP_SYNC_INTERVAL_MS * 1000000;
+    target_trim = ptp_wired_pi_step(&state->offset_pi.wired_integral_q16,
+                                   offset_ns, interval_ns);
+    state->offset_pi.drift_acc = state->offset_pi.wired_integral_q16 / 65536;
+  }
+  int32_t trim_delta = s_use_sw_clock ? (int32_t)target_trim - state->freq_trim_ppb :
+      ptp_trim_relative_delta(state->freq_trim_ppb, (int32_t)target_trim);
+
+  if (s_use_sw_clock) {
+    /* The software backend clamps the cumulative rate at +/- 1e8 ppb.
+     * Apply the change once per accepted observation. */
     if (ptp_clock_sw_adjtime_rate((int32_t)trim_delta) == 0) {
       state->freq_trim_ppb = (int32_t)target_trim;
     }
@@ -2111,6 +2781,9 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
     };
     if (clock_adjtime(PTPD_CLOCK_ID, &tx) == 0) {
       state->freq_trim_ppb = (int32_t)target_trim;
+    } else {
+      state->offset_pi.wired_integral_q16 = saved_integral;
+      state->offset_pi.drift_acc = saved_integral / 65536;
     }
   }
 
@@ -2174,10 +2847,15 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
 }
 
 static void ptp_clean_after_step(FAR struct ptp_state_s *state) {
+  portENTER_CRITICAL(&s_peer_lock);
+  ptp_peer_invalidate(&state->port[0].peer_exchange);
+  portEXIT_CRITICAL(&s_peer_lock);
+  ptp_invalidate_timing();
   state->remote_time_ns_prev = 0;
   state->local_time_ns_prev = 0;
 
   state->offset_pi.drift_acc = 0;
+  state->offset_pi.wired_integral_q16 = (int64_t)state->freq_trim_ppb * 65536;
   state->last_offset_ns = 0;
 }
 
@@ -2248,7 +2926,9 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
 
   if (memcmp(msg->header.sourceidentity,
              state->selected_source.header.sourceidentity,
-             sizeof(msg->header.sourceidentity)) != 0) {
+             sizeof(msg->header.sourceidentity)) != 0 ||
+      memcmp(msg->header.sourceportindex,
+             state->selected_source.header.sourceportindex, 2) != 0) {
     /* This packet wasn't from the currently selected source */
     ESP_LOGD(TAG, "This packet wasn't from the currently selected source");
     return OK;
@@ -2257,12 +2937,15 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
   /* Update timeout tracking */
 
   clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_sync);
+  state->port[0].twostep_pending = false;
 
   if (msg->header.flags[0] & PTP_FLAGS0_TWOSTEP) {
     /* We need to wait for a follow-up packet before setting the clock. */
 
     state->port[0].twostep_rxtime = state->port[0].rxtime;
     state->port[0].twostep_packet = *msg;
+    state->port[0].twostep_received_us = esp_timer_get_time();
+    state->port[0].twostep_pending = true;
     ptpdebug("Waiting for follow-up");
     return OK;
   }
@@ -2277,9 +2960,14 @@ static int ptp_process_followup(FAR struct ptp_state_s *state,
                                 FAR struct ptp_follow_up_s *msg) {
   struct timespec remote_time;
 
+  int64_t age_us = esp_timer_get_time() - state->port[0].twostep_received_us;
+  if (!state->port[0].twostep_pending || age_us < 0 || age_us > 1000000) return OK;
+
   if (memcmp(msg->header.sourceidentity,
              state->port[0].twostep_packet.header.sourceidentity,
-             sizeof(msg->header.sourceidentity)) != 0) {
+             sizeof(msg->header.sourceidentity)) != 0 ||
+      memcmp(msg->header.sourceportindex,
+             state->port[0].twostep_packet.header.sourceportindex, 2) != 0) {
     return OK; /* This packet wasn't from the currently selected source */
   }
 
@@ -2292,17 +2980,60 @@ static int ptp_process_followup(FAR struct ptp_state_s *state,
     return OK;
   }
 
+  if (ptp_is_gptp(state) &&
+      (!ptp_timing_payload_valid((const uint8_t *)msg, sizeof(*msg)) ||
+       !ptp_sync_receipt_interval((int8_t)state->port[0].twostep_packet.header.logmessageinterval)))
+    return OK;
+
   /* Update local clock based on the remote timestamp we received now
    * and the local timestamp of when the sync packet was received.
    * For gPTP, we can also examine the information TLV for other changes
    */
 
   ptp_format_to_timespec(msg->origintimestamp, &remote_time);
+  state->port[0].twostep_pending = false;
   if (ptp_is_gptp(state)) {
     state->correction_ns = get_correction_ns(msg->header.correction);
   }
-  return ptp_update_local_clock(state, &remote_time,
-                                &state->port[0].twostep_rxtime);
+  ptp_timing_snapshot_t previous;
+  ptpd_timing_snapshot(&previous);
+  int result = ptp_update_local_clock(state, &remote_time,
+                                      &state->port[0].twostep_rxtime);
+  ptp_timing_snapshot_t current;
+  ptpd_timing_snapshot(&current);
+  if (result == OK && ptp_is_gptp(state) &&
+      ptp_timing_payload_valid((const uint8_t *)msg, sizeof(*msg))) {
+    int64_t received_us = esp_timer_get_time();
+    ptp_sync_receipt_observe(&state->port[0].sync_receipt,
+        received_us, (int8_t)state->port[0].twostep_packet.header.logmessageinterval,
+        received_us);
+  }
+  if (result == OK && current.generation == previous.generation &&
+      ptp_is_gptp(state) && state->selected_source_valid &&
+      ptp_timing_payload_valid((const uint8_t *)msg, sizeof(*msg))) {
+    ptp_timing_snapshot_t next = {
+      .generation = current.generation ? current.generation : 1,
+      .received_us = esp_timer_get_time(),
+      .reference_ns = timespec_to_ns(&remote_time),
+      .local_receive_ns = timespec_to_ns(&state->port[0].twostep_rxtime),
+      .correction_ns = state->correction_ns,
+      .peer_delay_ns = state->port[0].peer_delay_ns,
+      .trim_ppb = state->freq_trim_ppb,
+      .drift_ppb = state->offset_pi.drift_acc,
+      .hardware_clock = !s_use_sw_clock,
+      .valid = true,
+    };
+    next.offset_ns = next.reference_ns + next.correction_ns + next.peer_delay_ns - next.local_receive_ns;
+    memcpy(next.btc_identity, state->selected_source.btc_identity, 8);
+    memcpy(next.own_identity, state->own_identity.header.sourceidentity, 8);
+    memcpy(next.follow_up, msg, sizeof(next.follow_up));
+    if (current.received_us && (memcmp(current.btc_identity, next.btc_identity, 8) ||
+        memcmp(current.follow_up + 58, next.follow_up + 58, 2))) ++next.generation;
+    portENTER_CRITICAL(&s_timing_lock);
+    if (s_timing_snapshot.generation == current.generation) s_timing_snapshot = next;
+    portEXIT_CRITICAL(&s_timing_lock);
+  }
+  return result;
 }
 
 static int ptp_process_delay_req(FAR struct ptp_state_s *state,
@@ -2423,45 +3154,27 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
   uint16_t sequence;
 
   if (ptp_is_gptp(state)) {
-    /* gPTP peer delay responses are valid from any peer */
-    if (memcmp(msg->reqidentity, state->own_identity.header.sourceidentity,
-               sizeof(msg->reqidentity)) != 0) {
-      return OK; /* This packet wasn't for us */
+    portENTER_CRITICAL(&s_peer_lock);
+    int admission = ptp_peer_response(&state->port[0].peer_exchange, msg,
+                                      &state->port[0].rxtime, esp_timer_get_time());
+    if (state->port[0].peer_exchange.multiple)
+      state->port[0].peer_capability.qualified = false;
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (admission == PTP_PEER_MULTIPLE) {
+      state->port[0].pdelay_multi_responder = true;
+      return OK;
     }
+    if (admission != PTP_PEER_ACCEPTED) return OK;
+    ptpdebug("Waiting for delay response follow-up");
   } else {
     if (!state->selected_source_valid ||
         memcmp(msg->header.sourceidentity,
-               state->selected_source.header.sourceidentity,
-               sizeof(msg->header.sourceidentity)) != 0 ||
-        memcmp(msg->reqidentity, state->own_identity.header.sourceidentity,
-               sizeof(msg->reqidentity)) != 0) {
-      return OK; /* This packet wasn't for us */
-    }
-  }
-
-  if (ptp_is_gptp(state)) {
-    /* AVB Lite §2.2 cond 2 reset — receiving a Pdelay_Resp clears the
-     * unanswered-attempt counter. We deliberately do NOT latch
-     * gptp_fallback_done here: §2.2 cond 1 (Endpoint Declaration TLV) must
-     * still be evaluated in subsequent ptp_check_profile_fallback calls. */
-    state->port[0].pdelay_req_attempts_unanswered = 0;
-  }
-
-  sequence = ptp_get_sequence(&msg->header);
-
-  if (sequence != state->delay_req_seq) {
-    ptpwarn("Ignoring out-of-sequence delay resp (%d vs. expected %d)\n",
-            (int)sequence, (int)state->delay_req_seq);
-    return OK;
-  }
-
-  if (ptp_is_gptp(state)) {
-    /* We need to wait for a resp follow-up to calc peer delay. */
-
-    state->port[0].twostep_delay_resp_rxtime = state->port[0].rxtime;
-    state->port[0].twostep_delay_resp_packet = *msg;
-    ptpdebug("Waiting for delay response follow-up");
-  } else {
+               state->selected_source.header.sourceidentity, 8) ||
+        memcmp(msg->reqidentity, state->own_identity.header.sourceidentity, 8) ||
+        memcmp(msg->reqportindex, state->own_identity.header.sourceportindex, 2))
+      return OK;
+    sequence = ptp_get_sequence(&msg->header);
+    if (sequence != state->delay_req_seq) return OK;
     /* Path delay is calculated as the average between delta for sync
      * message and delta for delay req message.
      * (IEEE-1588 section 11.3: Delay request-response mechanism)
@@ -2516,66 +3229,96 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
 
 static int
 ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
-                                 FAR struct ptp_delay_resp_follow_up_s *msg) {
+                                 FAR struct ptp_delay_resp_follow_up_s *msg,
+                                 uint32_t expected_generation) {
   if (!ptp_is_gptp(state)) {
     return OK;
   }
 
   int64_t peer_delay_roundtrip;
   int64_t peer_delay_reflection;
-  int64_t peer_delay;
+  double peer_delay = 0;
+  ptp_peer_rate_t rate;
   struct timespec remote_txtime;
   struct timespec remote_rxtime;
 
-  if (memcmp(msg->reqidentity, state->own_identity.header.sourceidentity,
-             sizeof(msg->reqidentity)) != 0)
-
-  {
-    return OK; /* This packet wasn't for us */
-  }
-
-  if (ptp_get_sequence(&msg->header) !=
-      ptp_get_sequence(&state->port[0].twostep_delay_resp_packet.header)) {
-    ptpwarn("PTP delay response follow-up packet sequence %ld does not "
-            "match initial sync packet sequence %ld, ignoring\n",
-            (long)ptp_get_sequence(&msg->header),
-            (long)ptp_get_sequence(
-                &state->port[0].twostep_delay_resp_packet.header));
+  ptp_peer_measurement_t measurement;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (expected_generation &&
+      state->port[0].peer_exchange.generation != expected_generation) {
+    portEXIT_CRITICAL(&s_peer_lock);
     return OK;
   }
+  bool accepted = ptp_peer_finish(&state->port[0].peer_exchange, msg,
+                                 esp_timer_get_time(), &measurement);
+  int64_t early_us = state->port[0].peer_exchange.published_us -
+                     state->port[0].peer_exchange.first_response_us;
+  rate = state->port[0].peer_rate;
+  if (state->port[0].peer_exchange.multiple)
+    state->port[0].peer_capability.qualified = false;
+  portEXIT_CRITICAL(&s_peer_lock);
+  if (!accepted) return OK;
 
-  /* gPTP peer_delay = ((t4 - t1) - (t3 - t2)) / 2 */
-
-  peer_delay_roundtrip = timespec_delta_ns(
-      &state->port[0].twostep_delay_resp_rxtime, &state->port[0].delayreq_time);
-  ptp_format_to_timespec(
-      state->port[0].twostep_delay_resp_packet.receivetimestamp,
-      &remote_rxtime);
+  peer_delay_roundtrip = timespec_delta_ns(&measurement.receive,
+                                          &measurement.transmit);
+  ptp_format_to_timespec(measurement.response.receivetimestamp, &remote_rxtime);
   ptp_format_to_timespec(msg->origintimestamp, &remote_txtime);
+  if (remote_txtime.tv_sec < remote_rxtime.tv_sec ||
+      remote_txtime.tv_sec - remote_rxtime.tv_sec > 1) return OK;
   peer_delay_reflection = timespec_delta_ns(&remote_txtime, &remote_rxtime);
-  peer_delay = (peer_delay_roundtrip - peer_delay_reflection) / 2;
+  if (peer_delay_roundtrip < 0 || peer_delay_roundtrip > 1000000000LL ||
+      peer_delay_reflection < 0 || peer_delay_reflection > 1000000000LL)
+    return OK;
+  const double response_correction = ptp_peer_correction(
+      measurement.response.header.correction);
+  const double follow_up_correction = ptp_peer_correction(msg->header.correction);
+  uint8_t responder[10];
+  memcpy(responder, msg->header.sourceidentity, 8);
+  memcpy(responder + 8, msg->header.sourceportindex, 2);
+  bool rate_valid = ptp_peer_rate_update(&rate, measurement.lifecycle, responder,
+      &remote_txtime, follow_up_correction, &measurement.receive);
+  bool delay_valid = rate_valid && ptp_peer_delay_local(rate.ratio,
+      peer_delay_roundtrip, peer_delay_reflection, response_correction,
+      follow_up_correction, &peer_delay) &&
+      peer_delay < CONFIG_ESP_PTP_MAX_PEER_DELAY_NS;
 
-  if (peer_delay >= 0 && peer_delay < CONFIG_ESP_PTP_MAX_PEER_DELAY_NS) {
-    if (state->port[0].peer_delay_avgcount <
-        CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT) {
-      state->port[0].peer_delay_avgcount++;
+  long rounded_delay = delay_valid ? (long)llround(peer_delay) : 0;
+  portENTER_CRITICAL(&s_peer_lock);
+  bool current = state->port[0].peer_exchange.generation == measurement.generation &&
+      state->port[0].peer_exchange.lifecycle == measurement.lifecycle &&
+      !state->port[0].peer_exchange.multiple;
+  if (current) {
+    if (state->port[0].peer_rate.lifecycle != rate.lifecycle ||
+        memcmp(state->port[0].peer_rate.responder, rate.responder, 10)) {
+      state->port[0].peer_delay_avgcount = 0;
+      state->port[0].peer_delay_ns = 0;
     }
-
-    state->port[0].peer_delay_ns +=
-        (peer_delay - state->port[0].peer_delay_ns) /
-        state->port[0].peer_delay_avgcount;
-
-    ptpdebug("Peer delay: %ld ns (avg: %ld ns)", (long)peer_delay,
-            (long)state->port[0].peer_delay_ns);
-  } else {
-    ptpwarn("Peer delay out of range: %lld ns\n", (long long)peer_delay);
+    state->port[0].peer_rate = rate;
+    if (delay_valid) {
+      if (state->port[0].peer_delay_avgcount < CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT)
+        state->port[0].peer_delay_avgcount++;
+      state->port[0].peer_delay_ns +=
+          (rounded_delay - state->port[0].peer_delay_ns) /
+          state->port[0].peer_delay_avgcount;
+    }
+    state->port[0].peer_capability = (ptp_peer_capability_t){
+      .lifecycle = measurement.lifecycle,
+      .received_us = esp_timer_get_time(),
+      .qualified = delay_valid && state->port[0].peer_delay_ns <= 800 &&
+          measurement.response.header.messagetype == 0x13 &&
+          measurement.response.header.reserved1 == 0 &&
+          msg->header.messagetype == 0x1a && msg->header.reserved1 == 0 &&
+          memcmp(responder, state->own_identity.header.sourceidentity, 8) != 0,
+    };
   }
-
-  /* Update correction field */
-
-  double correction_ns;
-  correction_ns = get_correction_ns(msg->header.correction);
-  memcpy(&state->correction_ns, &correction_ns, sizeof(correction_ns));
+  portEXIT_CRITICAL(&s_peer_lock);
+  static unsigned early_completions;
+  if (current && early_us > 0 && ((early_completions++ % 16) == 0))
+    ptpinfo("PDELAY_EARLY,%u,%lld", early_completions, (long long)early_us);
+  if (current && rate_valid && (rate.updates == 1 || !(rate.updates % 16)))
+    ptpinfo("PDELAY_RATE,%u,%ld,%ld,%d", rate.updates,
+            (long)llround((rate.ratio - 1.0) * 1e9),
+            (long)llround(peer_delay), delay_valid);
 
   return OK;
 }
@@ -2583,11 +3326,20 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
 /* Determine received packet type and process it */
 
 static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
-                                 ssize_t length) {
+                                 ssize_t length, int ingress_port) {
+  if (ingress_port < 0 || ingress_port >= CONFIG_ESP_PTP_NUM_PORTS) return -EINVAL;
   if (length < sizeof(struct ptp_header_s)) {
     ptpwarn("Ignoring invalid PTP packet, length only %d bytes\n", (int)length);
     return OK;
   }
+
+  size_t bounded_length = ptp_message_bounded_length(state->port[0].rxbuf.raw,
+                                                     (size_t)length);
+  if (!bounded_length) return OK;
+  length = bounded_length;
+  if (ptp_is_gptp(state) &&
+      (state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_MASK) == PTP_MSGTYPE_FOLLOW_UP &&
+      !ptp_timing_payload_valid(state->port[0].rxbuf.raw, bounded_length)) return OK;
 
   if (state->port[0].rxbuf.header.domain != CONFIG_ESP_PTP_DOMAIN) {
     /* Part of different clock domain, ignore. Hexdump the first
@@ -2604,7 +3356,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
   if (msg_is_gptp != ptp_is_gptp(state)) {
     /* Frame passed the domain check, so content is sane — the socket
      * is alive even though policy rejects the frame. */
-    clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_socket_alive);
+    clock_gettime(CLOCK_MONOTONIC, &state->port[ingress_port].last_socket_alive);
     /* §2.3 endpoint beacons are deliberately SDOID-tagged for gPTP
      * receivers; a fallen-back peer sees them here at steady state.
      * Expected traffic — keep it out of the capped reject log. */
@@ -2617,24 +3369,178 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     return OK;
   }
 
-  clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_multicast);
+  /* STA timing belongs to the currently associated AP. */
+  struct ptp_port_s *ingress = &state->port[ingress_port];
+  if (ptp_is_gptp(state) && ingress->medium == ptp_port_medium_wifi_ftm &&
+      ingress->wifi_mode == ptp_port_wifi_mode_sta) {
+    portENTER_CRITICAL(&s_peer_lock);
+    bool associated_sender = state->port[0].rx_source_mac_valid &&
+        ptp_wifi_neighbor_accepts(&ingress->wifi_neighbor, state->port[0].rx_source_mac);
+    state->port[0].rx_association = ingress->wifi_neighbor.association;
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (!associated_sender) return OK;
+  }
+
+  if (ptp_is_gptp(state) && ingress->medium == ptp_port_medium_wifi_ftm &&
+      ingress->wifi_mode == ptp_port_wifi_mode_ap) {
+    portENTER_CRITICAL(&s_peer_lock);
+    ptp_wifi_peer_t *peer = state->port[0].rx_source_mac_valid ?
+        ptp_wifi_peers_find(&ingress->wifi_peers, state->port[0].rx_source_mac) : NULL;
+    bool associated_sender = peer != NULL && ptp_wifi_peers_publishable(&ingress->wifi_peers);
+    state->port[0].rx_association = peer ? peer->association : 0;
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (!associated_sender) return OK;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &state->port[ingress_port].last_received_multicast);
+
+  /* Timing state currently belongs to the bootstrap port only. */
+  uint8_t timing_type = state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_MASK;
+#ifdef CONFIG_ESP_PTP_SOURCE_LOSS_PROBE
+  if (ingress_port == 0 && ptp_is_gptp(state) &&
+      state->port[0].medium == ptp_port_medium_eth_hwts &&
+      ptp_source_loss_probe_drop(&s_source_loss_probe, timing_type)) return OK;
+#endif
+  if (timing_type == PTP_MSGTYPE_ANNOUNCE || timing_type == PTP_MSGTYPE_SYNC ||
+      timing_type == PTP_MSGTYPE_FOLLOW_UP) {
+    if (ingress_port != 0) return OK;
+    if (ptp_is_gptp(state) && state->port[0].medium == ptp_port_medium_eth_hwts &&
+        !ptp_wired_capability(state)) {
+      state->port[0].twostep_pending = false;
+      return OK;
+    }
+  }
 
   /* Rout the packet to the appropriate handler */
 
   switch (state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_MASK) {
+  case PTP_MSGTYPE_SIGNALING: {
+    uint8_t local_port[10];
+    memcpy(local_port, state->own_identity.header.sourceidentity, 8);
+    local_port[8] = (uint8_t)((ingress_port + 1) >> 8);
+    local_port[9] = (uint8_t)(ingress_port + 1);
+    if (ingress->medium == ptp_port_medium_wifi_ftm &&
+        ingress->wifi_mode == ptp_port_wifi_mode_ap) {
+      portENTER_CRITICAL(&s_peer_lock);
+      ptp_wifi_peer_t *peer = state->port[0].rx_source_mac_valid ?
+          ptp_wifi_peers_find(&ingress->wifi_peers, state->port[0].rx_source_mac) : NULL;
+      uint16_t logical_port = peer && peer->association == state->port[0].rx_association ?
+          ptp_wifi_association_port(ingress_port + 1, CONFIG_ESP_PTP_NUM_PORTS,
+              (unsigned)(peer - ingress->wifi_peers.entries)) : 0;
+      portEXIT_CRITICAL(&s_peer_lock);
+      if (!logical_port) return OK;
+      local_port[8] = logical_port >> 8;
+      local_port[9] = logical_port;
+    }
+    ptp_capable_message_t indication;
+    int decoded = ptp_signaling_read_capable(state->port[0].rxbuf.raw, length,
+        CONFIG_ESP_PTP_DOMAIN, local_port, &indication);
+    ptp_capable_message_t interval_request;
+    int interval_decoded = ptp_signaling_read_capable_interval(state->port[0].rxbuf.raw,
+        length, CONFIG_ESP_PTP_DOMAIN, local_port, &interval_request);
+    ptp_interval_message_t timing_request;
+    int timing_decoded = ptp_signaling_read_message_interval(state->port[0].rxbuf.raw,
+        length, CONFIG_ESP_PTP_DOMAIN, local_port, &timing_request);
+    /* Validate all known TLVs before any can change association state. */
+    if (decoded == PTP_SIGNALING_MALFORMED || interval_decoded == PTP_SIGNALING_MALFORMED ||
+        timing_decoded == PTP_SIGNALING_MALFORMED)
+      return OK;
+    if (decoded == PTP_SIGNALING_CAPABLE) {
+      struct ptp_port_s *port = &state->port[ingress_port];
+      bool indication_bound = false;
+      /* Bind indications to the measured wired peer or associated STA neighbor. */
+      portENTER_CRITICAL(&s_peer_lock);
+      if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_eth_hwts && port->peer_rate.valid &&
+          port->peer_rate.lifecycle == port->peer_exchange.lifecycle)
+        indication_bound = ptp_capable_receive(&port->capable_receive, &indication,
+            port->peer_rate.responder, port->peer_exchange.lifecycle,
+            esp_timer_get_time());
+      else if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_wifi_ftm &&
+          port->wifi_mode == ptp_port_wifi_mode_sta && port->wifi_neighbor.bound &&
+          state->port[0].rx_association == port->wifi_neighbor.association &&
+          state->port[0].rx_source_mac_valid &&
+          ptp_wifi_neighbor_accepts(&port->wifi_neighbor, state->port[0].rx_source_mac))
+        indication_bound = ptp_capable_receive(&port->capable_receive, &indication,
+            port->wifi_neighbor.port_identity, port->wifi_neighbor.association,
+            esp_timer_get_time());
+      else if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_wifi_ftm &&
+          port->wifi_mode == ptp_port_wifi_mode_ap && state->port[0].rx_source_mac_valid)
+        indication_bound = ptp_wifi_peers_capable(&port->wifi_peers, state->port[0].rx_source_mac,
+            state->port[0].rx_association, &indication, esp_timer_get_time());
+      portEXIT_CRITICAL(&s_peer_lock);
+#if defined(CONFIG_ESP_PTP_INTERVAL_PROBE) || defined(CONFIG_ESP_PTP_CAPABLE_RX_TRACE)
+      ptpinfo("CAPTEST_RX,%lld,%u,%d", esp_timer_get_time(),
+          ((unsigned)state->port[0].rxbuf.raw[30] << 8) | state->port[0].rxbuf.raw[31],
+          (int)indication.log_interval);
+#endif
+      port->last_capable_indication = indication;
+      clock_gettime(CLOCK_MONOTONIC, &port->last_received_capable_indication);
+      if ((port->capable_indication_count++ % 32) == 0)
+        ptpinfo("Capability indication on port %d, log interval %d, bound %u, media verification pending",
+                ingress_port, (int)indication.log_interval, indication_bound);
+    }
+    if (timing_decoded == PTP_SIGNALING_MESSAGE_INTERVAL) {
+      struct ptp_port_s *port = &state->port[ingress_port];
+      portENTER_CRITICAL(&s_peer_lock);
+      if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_wifi_ftm &&
+          port->wifi_mode == ptp_port_wifi_mode_ap && state->port[0].rx_source_mac_valid) {
+        ptp_wifi_peers_sync_interval(&port->wifi_peers, state->port[0].rx_source_mac,
+            state->port[0].rx_association, &timing_request);
+        ptp_wifi_peers_announce_interval(&port->wifi_peers, state->port[0].rx_source_mac,
+            state->port[0].rx_association, &timing_request,
+            msec_to_log_period(CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS));
+      }
+      else if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_wifi_ftm &&
+          port->wifi_mode == ptp_port_wifi_mode_sta && state->port[0].rx_source_mac_valid)
+        ptp_wifi_neighbor_sync_interval(&port->wifi_neighbor, state->port[0].rx_source_mac,
+            state->port[0].rx_association, &timing_request);
+      portEXIT_CRITICAL(&s_peer_lock);
+    }
+    if (interval_decoded == PTP_SIGNALING_CAPABLE_INTERVAL) {
+      struct ptp_port_s *port = &state->port[ingress_port];
+      portENTER_CRITICAL(&s_peer_lock);
+      if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_wifi_ftm &&
+          port->wifi_mode == ptp_port_wifi_mode_ap && state->port[0].rx_source_mac_valid)
+        ptp_wifi_peers_interval(&port->wifi_peers, state->port[0].rx_source_mac,
+            state->port[0].rx_association, &interval_request);
+      else if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_wifi_ftm &&
+          port->wifi_mode == ptp_port_wifi_mode_sta && state->port[0].rx_source_mac_valid)
+        ptp_wifi_neighbor_interval(&port->wifi_neighbor, state->port[0].rx_source_mac,
+            state->port[0].rx_association, &interval_request);
+      else if (port->enabled && port->link_up && ptp_is_gptp(state) &&
+          port->medium == ptp_port_medium_eth_hwts && port->peer_rate.valid &&
+          port->peer_rate.lifecycle == port->peer_exchange.lifecycle) {
+        ptp_wired_capable_bind(&port->wired_capable, port->peer_exchange.lifecycle,
+                               port->peer_rate.responder);
+        ptp_wired_capable_request(&port->wired_capable, port->peer_exchange.lifecycle,
+                                  &interval_request);
+      }
+      portEXIT_CRITICAL(&s_peer_lock);
+    }
+    return OK;
+  }
+
 #if defined(CONFIG_ESP_PTP_CLIENT) ||                                    \
     defined(CONFIG_ESP_PTP_GPTP_PROFILE) // gPTP always acts as a client
   case PTP_MSGTYPE_ANNOUNCE:
     s_ptpd_rx_announce++;
     ptpdebug("Got announce packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
-    return ptp_process_announce(state, &state->port[0].rxbuf.announce);
+    return ptp_process_announce(state, &state->port[0].rxbuf.announce, length);
 
   case PTP_MSGTYPE_SYNC:
     ptpd_lateness_record_rx_sync();
     ptpdebug("Got sync packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
-    if (!state->selected_source_valid) {
+    if (!state->selected_source_valid ||
+        (ptp_is_gptp(state) && state->selected_source.btc_priority1 == 255)) {
       return OK;
     } // ignore if operating as a server in gPTP profile
     return ptp_process_sync(state, &state->port[0].rxbuf.sync);
@@ -2643,23 +3549,24 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     s_ptpd_rx_followup++;
     ptpdebug("Got follow-up packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
-    if (!state->selected_source_valid) {
+    if (!state->selected_source_valid ||
+        (ptp_is_gptp(state) && state->selected_source.btc_priority1 == 255)) {
       return OK;
     } // ignore if operating as a server in gPTP profile
     return ptp_process_followup(state, &state->port[0].rxbuf.follow_up);
 
   case PTP_MSGTYPE_DELAY_RESP:
   case PTP_MSGTYPE_PDELAY_RESP:
+    if (ingress_port != 0) return OK;
+    if (ptp_is_gptp(state) &&
+        (state->port[0].rxbuf.header.messagetype & PTP_MSGTYPE_MASK) != PTP_MSGTYPE_PDELAY_RESP)
+      return OK;
     s_ptpd_rx_pdelay_resp++;
     ptpdebug("Got delay-resp, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
     if (ptp_msg_has_endpoint_decl_tlv(state->port[0].rxbuf.raw, length,
                                       sizeof(struct ptp_delay_resp_s))) {
       state->port[0].peer_is_endpoint = true;
-    }
-    if (!state->gptp_fallback_done) {
-      ptp_record_pdelay_responder(state,
-                                  state->port[0].rxbuf.header.sourceidentity);
     }
     return ptp_process_delay_resp(state, &state->port[0].rxbuf.delay_resp);
 #endif
@@ -2680,6 +3587,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 #endif
 
   case PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP:
+    if (ingress_port != 0) return OK;
     s_ptpd_rx_pdelay_fup++;
     ptpdebug("Got peer delay resp follow-up, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
@@ -2689,7 +3597,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
       state->port[0].peer_is_endpoint = true;
     }
     return ptp_process_delay_resp_follow_up(
-        state, &state->port[0].rxbuf.delay_resp_follow_up);
+        state, &state->port[0].rxbuf.delay_resp_follow_up, 0);
   default:
     ptpinfo("Ignoring unknown PTP packet type: 0x%02x\n",
             state->port[0].rxbuf.header.messagetype);
@@ -2701,6 +3609,41 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 
 /* Process status information request */
 
+/* 12.4 for the STA port: media support, a granted small burst and a fresh
+ * gPTP-capable indication from the bound neighbor. Independent of the servo. */
+static bool ptp_wifi_capability(FAR struct ptp_state_s *state, int index)
+{
+  struct ptp_port_s *port = &state->port[index];
+  if (port->medium != ptp_port_medium_wifi_ftm ||
+      port->wifi_mode != ptp_port_wifi_mode_sta || !port->enabled ||
+      !port->link_up || !ptp_is_gptp(state)) return false;
+  ptp_wifi_media_t media;
+  if (!ptp_wifi_sta_media(index, &media)) return false;
+  portENTER_CRITICAL(&s_peer_lock);
+  bool neighbor = port->wifi_neighbor.associated && port->wifi_neighbor.bound &&
+      ptp_neighbor_capable(&port->capable_receive, port->wifi_neighbor.port_identity,
+                           port->wifi_neighbor.association, esp_timer_get_time());
+  portEXIT_CRITICAL(&s_peer_lock);
+  return ptp_wifi_as_capable(&media, neighbor, CONFIG_ESP_PTP_DOMAIN);
+}
+
+static bool ptp_wired_capability(FAR struct ptp_state_s *state)
+{
+  portENTER_CRITICAL(&s_peer_lock);
+  bool capable = state->port[0].medium == ptp_port_medium_eth_hwts &&
+      ptp_peer_capable(&state->port[0].peer_capability,
+          state->port[0].peer_exchange.lifecycle, esp_timer_get_time(),
+          (int64_t)state->port[0].delayreq_interval_ms * 1000,
+          state->port[0].enabled, state->port[0].link_up,
+          ptp_is_gptp(state), CONFIG_ESP_PTP_DOMAIN,
+          ptp_neighbor_capable(&state->port[0].capable_receive,
+              state->port[0].peer_rate.responder,
+              state->port[0].peer_exchange.lifecycle, esp_timer_get_time()));
+  portEXIT_CRITICAL(&s_peer_lock);
+
+  return capable;
+}
+
 static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   FAR struct ptpd_status_s *status;
 
@@ -2711,7 +3654,21 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   status = state->status_req.dest;
   status->ptp_profile = state->active_ptp_profile;
   status->peer_is_endpoint = state->port[0].peer_is_endpoint;
-  status->clock_source_valid = state->selected_source_valid;
+  status->avb_lite_fallback_reason = state->avb_lite_fallback_reason;
+  status->domain = CONFIG_ESP_PTP_DOMAIN;
+  status->clock_source_selected = state->selected_source_valid;
+  memset(&status->selected_path, 0, sizeof(status->selected_path));
+  if (status->clock_source_selected) status->selected_path = state->selected_path;
+  status->clock_source_valid = status->clock_source_selected &&
+      (!ptp_is_gptp(state) || state->selected_source.btc_priority1 < 255);
+  if (status->clock_source_valid && s_use_sw_clock && ptp_ftm_clock_ready) {
+    ptp_timing_snapshot_t timing;
+    ptpd_timing_snapshot(&timing);
+    status->clock_source_valid = ptp_ftm_clock_ready(timing.generation);
+  }
+
+  status->as_capable = state->port[0].medium == ptp_port_medium_wifi_ftm
+      ? ptp_wifi_capability(state, 0) : ptp_wired_capability(state);
 
   /* Copy own identity info to status struct */
 
@@ -2720,7 +3677,8 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   memcpy(status->own_identity_info.id, o->header.sourceidentity,
          sizeof(status->own_identity_info.id));
 
-  status->own_identity_info.utcoffset = o->utcoffset[0];
+  status->own_identity_info.utcoffset =
+      (int16_t)(((uint16_t)o->utcoffset[0] << 8) | o->utcoffset[1]);
   status->own_identity_info.priority1 = o->btc_priority1;
   status->own_identity_info.clockclass = o->btc_quality[0];
   status->own_identity_info.accuracy = o->btc_quality[1];
@@ -2734,7 +3692,8 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
       ((uint16_t)o->stepsremoved[0] << 8) | o->stepsremoved[1];
   status->own_identity_info.timesource = o->timesource;
 
-  if (status->clock_source_valid) {
+  memset(&status->clock_source_info, 0, sizeof(status->clock_source_info));
+  if (status->clock_source_selected) {
     /* Copy relevant parts of selected source announce info to status struct */
 
     FAR struct ptp_announce_s *s = &state->selected_source;
@@ -2762,7 +3721,7 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   /* Copy latest adjustment info */
 
   status->last_clock_update = state->last_delta_timestamp;
-  status->last_delta_ns = state->last_delta_ns;
+  status->last_delta_ns = state->last_offset_ns; /* servo offset from the BTC */
   status->last_adjtime_ns = state->last_adjtime_ns;
   status->drift_ppb = state->drift_ppb;
   status->path_delay_ns = state->port[0].path_delay_ns;
@@ -2844,6 +3803,39 @@ static void ptp_daemon(void *task_param) {
 
   while (!state->stop) {
     ptpd_lateness_tick();
+#ifdef CONFIG_ESP_PTP_SOURCE_LOSS_PROBE
+    ptp_timing_snapshot_t probe_timing;
+    bool probe_ready = state->port[0].medium == ptp_port_medium_eth_hwts &&
+        ptp_is_gptp(state) && state->selected_source_valid &&
+        ptpd_timing_snapshot(&probe_timing);
+    if (ptp_source_loss_probe_tick(&s_source_loss_probe, esp_timer_get_time(), probe_ready))
+      ptpinfo("SOURCELOSS,%u,%u,%u", s_source_loss_probe.phase,
+          s_source_loss_probe.dropped[1], s_source_loss_probe.dropped[3]);
+#endif
+    if (state->port[0].medium == ptp_port_medium_eth_hwts) {
+      bool capable = ptp_wired_capability(state);
+      if (ptp_is_gptp(state) && !capable) {
+        if (state->selected_source_valid || state->port[0].twostep_pending)
+          ptp_invalidate_timing();
+        state->selected_source_valid = false;
+        state->port[0].twostep_pending = false;
+      }
+      if (!state->port[0].capability_reported ||
+          capable != state->port[0].last_reported_capability) {
+        ptpinfo("PDELAY_CAPABLE,%u", capable);
+        state->port[0].capability_reported = true;
+        state->port[0].last_reported_capability = capable;
+      }
+    } else if (state->port[0].medium == ptp_port_medium_wifi_ftm &&
+               state->port[0].wifi_mode == ptp_port_wifi_mode_sta) {
+      bool capable = ptp_wifi_capability(state, 0);
+      if (!state->port[0].capability_reported ||
+          capable != state->port[0].last_reported_capability) {
+        ptpinfo("WIFI_CAPABLE,%u", capable);
+        state->port[0].capability_reported = true;
+        state->port[0].last_reported_capability = capable;
+      }
+    }
     state->port[0].can_send_delayreq = ptp_is_gptp(state);
 
     pollfds[0].fd = state->port[0].ptp_socket;
@@ -2857,11 +3849,49 @@ static void ptp_daemon(void *task_param) {
      * gap and they never lock to us. Tighten the wait while BTC. */
 #define PTPD_BTC_POLL_CAP_MS 25
     int wait_ms = poll_timeout;
+    if (ptp_ftm_daemon_tick && state->port[0].medium == ptp_port_medium_wifi_ftm && wait_ms > 50)
+      wait_ms = 50;
     if (!state->selected_source_valid && ptp_is_gptp(state) &&
         state->port[0].medium == ptp_port_medium_eth_hwts &&
         wait_ms > PTPD_BTC_POLL_CAP_MS) {
       wait_ms = PTPD_BTC_POLL_CAP_MS;
     }
+    portENTER_CRITICAL(&s_peer_lock);
+    bool pending_peer_follow_up = state->port[0].peer_exchange.follow_up_pending &&
+        !state->port[0].peer_exchange.multiple &&
+        esp_timer_get_time() < state->port[0].peer_exchange.deadline_us;
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (pending_peer_follow_up && wait_ms > 1) wait_ms = 1;
+    /* Capability deadlines must not depend on incoming Ethernet traffic. */
+    ptp_wifi_capable_completions(state);
+    int64_t capable_now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_peer_lock);
+    if (ptp_is_gptp(state) && state->port[0].medium == ptp_port_medium_eth_hwts &&
+        state->port[0].enabled && state->port[0].link_up && state->port[0].ptp_socket >= 0)
+      wait_ms = ptp_capable_schedule_wait_ms(&state->port[0].wired_capable.transmit,
+                                            capable_now, wait_ms);
+    for (int index = 0; index < CONFIG_ESP_PTP_NUM_PORTS; ++index) {
+      struct ptp_port_s *port = &state->port[index];
+      if (!ptp_is_gptp(state) || !port->enabled || !port->link_up ||
+          port->medium != ptp_port_medium_wifi_ftm) continue;
+      if (port->wifi_mode == ptp_port_wifi_mode_sta) {
+        if (port->wifi_neighbor.associated)
+          wait_ms = ptp_capable_schedule_wait_ms(&port->wifi_neighbor.transmit, capable_now, wait_ms);
+        continue;
+      }
+      if (port->wifi_mode != ptp_port_wifi_mode_ap ||
+          !ptp_wifi_peers_publishable(&port->wifi_peers)) continue;
+      for (unsigned slot = 0; slot < PTP_WIFI_PEERS_MAX; ++slot) {
+        ptp_wifi_peer_t *peer = &port->wifi_peers.entries[slot];
+        if (peer->associated)
+          wait_ms = ptp_capable_schedule_wait_ms(&peer->transmit, capable_now, wait_ms);
+      }
+    }
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (ptp_is_gptp(state) && state->selected_source_valid &&
+        state->selected_source.btc_priority1 < 255)
+      wait_ms = ptp_sync_receipt_wait_ms(&state->port[0].sync_receipt,
+                                        esp_timer_get_time(), wait_ms);
     ret = poll(pollfds, 1, wait_ms);
 
     if (pollfds[0].revents) {
@@ -2874,9 +3904,40 @@ static void ptp_daemon(void *task_param) {
                          sizeof(state->port[0].rxbuf), &state->port[0].rxtime);
 
       if (ret > 0) {
-        ptp_process_rx_packet(state, ret);
+        ptp_process_rx_packet(state, ret, 0);
       }
     }
+
+    /* Bound each drain so a busy producer cannot starve periodic work. */
+    for (unsigned drained = 0; drained < PTP_INJECT_DEPTH; ++drained) {
+      struct ptp_injected_frame_s incoming;
+      portENTER_CRITICAL(&s_injected_lock);
+      bool available = s_injected_count != 0;
+      if (available) {
+        incoming = s_injected[s_injected_head];
+        s_injected_head = (s_injected_head + 1) % PTP_INJECT_DEPTH;
+        --s_injected_count;
+      }
+      bool current = available && incoming.link_generation ==
+          s_injected_generation[incoming.port_index];
+      portEXIT_CRITICAL(&s_injected_lock);
+      if (!available) break;
+      if (!current) continue;
+      state->port[0].rxbuf = incoming.message;
+      state->port[0].rxtime = incoming.received;
+      memcpy(state->port[0].rx_source_mac, incoming.source_mac, 6);
+      state->port[0].rx_source_mac_valid = incoming.source_mac_valid;
+      ptp_process_rx_packet(state, incoming.length, incoming.port_index);
+    }
+
+    struct ptp_delay_resp_follow_up_s deferred_follow_up;
+    uint32_t deferred_generation;
+    portENTER_CRITICAL(&s_peer_lock);
+    bool deferred = ptp_peer_take_follow_up(&state->port[0].peer_exchange,
+        esp_timer_get_time(), &deferred_follow_up, &deferred_generation);
+    portEXIT_CRITICAL(&s_peer_lock);
+    if (deferred)
+      ptp_process_delay_resp_follow_up(state, &deferred_follow_up, deferred_generation);
 
     /* Starvation check runs UNCONDITIONALLY every loop iteration —
      * gating it on the poll outcome or on read() success would mask
@@ -2904,12 +3965,28 @@ static void ptp_daemon(void *task_param) {
       }
     }
 
+    if (ptp_ftm_daemon_tick) ptp_ftm_daemon_tick();
+    bool source_was_valid = state->selected_source_valid;
+    state->selected_source_valid = is_selected_source_valid(state);
+    if (source_was_valid && !state->selected_source_valid) {
+      if (ptp_is_gptp(state) && state->selected_source.btc_priority1 < 255 &&
+          !ptp_sync_receipt_current(&state->port[0].sync_receipt, esp_timer_get_time()))
+        ptpinfo("SYNCTIMEOUT,%" PRId64 ",%" PRId64 ",%" PRId64,
+            esp_timer_get_time(), state->port[0].sync_receipt.received_us,
+            state->port[0].sync_receipt.interval_us);
+      ptp_invalidate_timing();
+    }
+    ptp_publish_local_source(state);
     ptp_periodic_send(state);
     ptp_check_profile_fallback(state);
-
-    state->selected_source_valid = is_selected_source_valid(state);
     ptp_process_statusreq(state);
   } // while (!state->stop)
+  portENTER_CRITICAL(&s_injected_lock);
+  s_injected_enabled = false;
+  s_injected_count = 0;
+  for (unsigned port = 0; port < CONFIG_ESP_PTP_NUM_PORTS; ++port)
+    ++s_injected_generation[port];
+  portEXIT_CRITICAL(&s_injected_lock);
   ptp_destroy_state(state);
   free(state);
 
@@ -3059,40 +4136,47 @@ int ptpd_inject_peer_delay(int port_index, int64_t peer_delay_ns) {
   return OK;
 }
 
-/* Push a Wi-Fi-received PTP frame (Ethernet header already stripped)
- * into the daemon's RX path. Used by per-medium modules that don't
- * have an L2TAP socket. The frame is copied into
- * port[0]'s rxbuf and routed through the same ptp_process_rx_packet
- * the EMAC RX loop uses, so received Announce / Sync / Follow_Up
- * messages flow into the existing BMCA / servo state machine. */
-int ptp_inject_received_frame(int port_index, const uint8_t *frame,
-                              uint16_t len) {
-  if (s_state == NULL) {
-    return -ESRCH;
+/* Queue a Wi-Fi PTP frame for daemon-owned selection and servo processing.
+ * Preserve the callback-time software timestamp, not the dequeue time.
+ * Timing handlers still use logical port zero; Signaling retains ingress. */
+int ptp_inject_received_frame_from(int port_index, const uint8_t *frame,
+                                  uint16_t len, const uint8_t source_mac[6]) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS ||
+      !frame || len < sizeof(struct ptp_header_s) ||
+      len > sizeof(((ptp_msgbuf *)0)->raw)) return -EINVAL;
+  portENTER_CRITICAL(&s_injected_lock);
+  uint32_t generation = s_injected_generation[port_index];
+  portEXIT_CRITICAL(&s_injected_lock);
+  struct timespec received;
+  if (ptp_gettime(NULL, &received) != 0) return -EIO;
+  portENTER_CRITICAL(&s_injected_lock);
+  int result = OK;
+  if (!s_injected_enabled) {
+    result = -ESRCH;
+  } else if (generation != s_injected_generation[port_index]) {
+    result = -ESTALE;
+  } else if (s_injected_count == PTP_INJECT_DEPTH) {
+    result = -ENOBUFS;
+  } else {
+    unsigned tail = (s_injected_head + s_injected_count) % PTP_INJECT_DEPTH;
+    s_injected[tail].length = len;
+    s_injected[tail].port_index = (uint8_t)port_index;
+    s_injected[tail].received = received;
+    s_injected[tail].link_generation = generation;
+    s_injected[tail].source_mac_valid = source_mac != NULL;
+    memset(s_injected[tail].source_mac, 0, 6);
+    if (source_mac) memcpy(s_injected[tail].source_mac, source_mac, 6);
+    memset(&s_injected[tail].message, 0, sizeof(ptp_msgbuf));
+    memcpy(s_injected[tail].message.raw, frame, len);
+    ++s_injected_count;
   }
-  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) {
-    return -EINVAL;
-  }
-  if (len < sizeof(struct ptp_header_s) ||
-      len > sizeof(s_state->port[port_index].rxbuf.raw)) {
-    return -EINVAL;
-  }
-  /* Quick gate: only forward PTP frames whose profile matches ours.
-   * Avoids waking BMCA on stray non-gPTP traffic. Returns +1 to
-   * distinguish "filtered by profile mismatch" from "processed OK". */
-  uint8_t mt = frame[0];
-  bool msg_is_gptp = (mt & PTP_MSGTYPE_SDOID_GPTP) != 0;
-  if (msg_is_gptp != ptp_is_gptp(s_state)) {
-    return 1;
-  }
-  memcpy(s_state->port[0].rxbuf.raw, frame, len);
-  /* Wi-Fi RX has no MAC-layer hardware timestamp surfaced to user
-   * space — best we can do is "now" in the local PTP-disciplined
-   * clock. Announce processing doesn't use rxtime, so this is only
-   * relevant if Sync / Follow_Up arrive on this path (rare on a
-   * §12.1.2 Wi-Fi link where Sync rides the beacon IE instead). */
-  ptp_gettime(s_state, &s_state->port[0].rxtime);
-  return ptp_process_rx_packet(s_state, len);
+  portEXIT_CRITICAL(&s_injected_lock);
+  return result;
+}
+
+int ptp_inject_received_frame(int port_index, const uint8_t *frame, uint16_t len)
+{
+  return ptp_inject_received_frame_from(port_index, frame, len, NULL);
 }
 
 int ptpd_inject_sync(int port_index, FAR const uint8_t *follow_up_info,

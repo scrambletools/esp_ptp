@@ -48,6 +48,13 @@
 
 #include "esp_ptp.h"
 #include "ptp.h"
+#include "ptp_wifi_association.h"
+#include "ptp_path_trace.h"
+#include "ptp_timing_snapshot.h"
+#include "ptp_signaling.h"
+#include "ptp_ftm_counter.h"
+#include "ptp_ftm_session.h"
+#include "ptp_ftm_rtt.h"
 #include "ptp_rpc_proto.h"
 
 /* esp_wifi_internal_tx is not in any public IDF header. Same forward-
@@ -87,50 +94,73 @@ static int wifi_ap_send_unicast_ptp(const uint8_t src_mac[6],
   return (r == ESP_OK) ? (int)sizeof(frame) : -1;
 }
 
-static int ap_send_announce_now(int port_index, const uint8_t src_mac[6],
-                                void *ptp_msg, uint16_t ptp_msg_len) {
-  wifi_sta_list_t sta_list;
-  memset(&sta_list, 0, sizeof(sta_list));
-  esp_err_t r = esp_wifi_ap_get_sta_list(&sta_list);
-  if (r != ESP_OK) {
-    /* The wifi_remote bridge may not have an AP up yet, or the
-     * coprocessor RPC isn't ready. Drop silently — the next tick
-     * retries; no Announce will be missed once STAs associate. */
-    return 0;
-  }
-  if (sta_list.num == 0) {
-    return 0; /* No STAs to send to. */
-  }
-
-  int sent = 0;
-  for (int i = 0; i < sta_list.num; i++) {
-    int rc = wifi_ap_send_unicast_ptp(src_mac, sta_list.sta[i].mac, ptp_msg,
-                                      ptp_msg_len);
-    if (rc > 0)
-      sent++;
-  }
-
-  static uint32_t s_seen = 0;
-  if ((++s_seen % 30) == 1) {
-    ESP_LOGI(TAG,
-             "Sent unicast Announce to %d/%d associated STA(s) on port %d "
-             "(seen=%u)",
-             sent, sta_list.num, port_index, (unsigned)s_seen);
-  }
-  return sent;
-}
-
-/* §12.2 Announce republish runs on a dedicated task so the blocking
- * esp_wifi_ap_get_sta_list RPC never stalls the PTPD main loop. The
- * daemon builds the Announce in its own context and hands it off via a
- * length-1 overwrite mailbox — only the most recent Announce matters. */
-#define PTP_AP_ANNOUNCE_MAX 160
+#define PTP_AP_ANNOUNCE_MAX PTP_ANNOUNCE_MAX_LENGTH
 typedef struct {
   int port_index;
+  uint32_t generation;
+  uint32_t source_generation;
+  int64_t queued_us;
+  ptp_wifi_association_snapshot_t peers;
+  int8_t initial_interval;
   uint8_t src_mac[6];
   uint16_t len;
   uint8_t msg[PTP_AP_ANNOUNCE_MAX];
 } ap_announce_item_t;
+
+/* Owned by the one Announce worker. Ignore timestamps and sequence changes. */
+static struct {
+  uint32_t revision;
+  uint16_t length;
+  uint8_t message[PTP_AP_ANNOUNCE_MAX];
+} s_announce_information[CONFIG_ESP_PTP_NUM_PORTS];
+
+static uint32_t ap_announce_information(ap_announce_item_t *item) {
+  if (item->port_index < 0 || item->port_index >= CONFIG_ESP_PTP_NUM_PORTS) return 0;
+  unsigned port = item->port_index;
+  const uint8_t *previous = s_announce_information[port].message;
+  if (!s_announce_information[port].revision || s_announce_information[port].length != item->len ||
+      previous[4] != item->msg[4] || memcmp(previous + 6, item->msg + 6, 2) ||
+      memcmp(previous + 20, item->msg + 20, 8) ||
+      memcmp(previous + 44, item->msg + 44, item->len - 44)) {
+    memcpy(s_announce_information[port].message, item->msg, item->len);
+    s_announce_information[port].length = item->len;
+    if (!++s_announce_information[port].revision) ++s_announce_information[port].revision;
+  }
+  return s_announce_information[port].revision;
+}
+
+static int ap_send_announce_now(ap_announce_item_t *item) {
+  int64_t started_us = esp_timer_get_time();
+  if (started_us < item->queued_us || started_us - item->queued_us >= 1000000 ||
+      item->generation != ptp_wifi_link_generation(item->port_index) ||
+      item->source_generation != ptpd_timing_generation()) return 0;
+  uint32_t information_revision = ap_announce_information(item);
+  if (!information_revision) return 0;
+  int sent = 0;
+  for (unsigned index = 0; index < item->peers.count; ++index) {
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < item->queued_us || now_us - item->queued_us >= 1000000 ||
+        item->generation != ptp_wifi_link_generation(item->port_index) ||
+        item->source_generation != ptpd_timing_generation()) break;
+    const ptp_wifi_association_entry_t *peer = &item->peers.entries[index];
+    int8_t advertised;
+    uint16_t sequence;
+    uint32_t token = ptpd_wifi_announce_begin(item->port_index, peer->mac,
+        peer->association, peer->announce_revision, information_revision,
+        item->initial_interval, now_us, &advertised, &sequence);
+    if (!token) continue;
+    item->msg[28] = peer->port_number >> 8;
+    item->msg[29] = peer->port_number;
+    item->msg[30] = sequence >> 8;
+    item->msg[31] = sequence;
+    item->msg[33] = (uint8_t)advertised;
+    bool accepted = wifi_ap_send_unicast_ptp(item->src_mac, peer->mac, item->msg, item->len) > 0;
+    ptpd_wifi_announce_finish(item->port_index, peer->mac, peer->association,
+                              token, accepted, esp_timer_get_time());
+    if (accepted) ++sent;
+  }
+  return sent;
+}
 
 static QueueHandle_t s_announce_mbox;
 
@@ -139,44 +169,124 @@ static void ap_announce_task(void *arg) {
   ap_announce_item_t item;
   for (;;) {
     if (xQueueReceive(s_announce_mbox, &item, portMAX_DELAY) == pdTRUE) {
-      ap_send_announce_now(item.port_index, item.src_mac, item.msg, item.len);
+      ap_send_announce_now(&item);
     }
   }
 }
 
-/* Daemon-context hook: copy the Announce into the mailbox and return
- * immediately. The blocking get-STA-list RPC + unicast sends run on
- * ap_announce_task, off the PTPD loop. */
+/* Copy peer identities with the message; the worker does no station-list RPC. */
 int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
                               void *ptp_msg, uint16_t ptp_msg_len) {
+  if (!src_mac || !ptp_msg || ptp_msg_len < PTP_ANNOUNCE_BODY_LENGTH ||
+      ptp_msg_len > PTP_AP_ANNOUNCE_MAX) return -1;
+  ap_announce_item_t item = {.port_index = port_index,
+      .generation = ptp_wifi_link_generation(port_index),
+      .source_generation = ptpd_timing_generation(),
+      .queued_us = esp_timer_get_time(), .len = ptp_msg_len};
+  if (!ptpd_wifi_association_snapshot(port_index, &item.peers)) return -1;
+  if (!item.peers.count) return 0;
+  memcpy(item.src_mac, src_mac, sizeof(item.src_mac));
+  memcpy(item.msg, ptp_msg, ptp_msg_len);
+  item.initial_interval = (int8_t)item.msg[33];
   if (s_announce_mbox == NULL) {
     s_announce_mbox = xQueueCreate(1, sizeof(ap_announce_item_t));
-    if (s_announce_mbox == NULL) {
-      ESP_LOGE(TAG, "failed to create Announce mailbox");
-      return -1;
-    }
-    /* Core 0: PTPD is pinned to core 1, so the blocking RPC can never
-     * stall the wired gPTP loop. */
+    if (s_announce_mbox == NULL) return -1;
     if (xTaskCreatePinnedToCore(ap_announce_task, "ptp_ann_pub", 4096, NULL, 5,
                                 NULL, 0) != pdPASS) {
-      ESP_LOGE(TAG, "failed to create Announce publish task");
       vQueueDelete(s_announce_mbox);
       s_announce_mbox = NULL;
       return -1;
     }
   }
-  ap_announce_item_t item;
-  memset(&item, 0, sizeof(item));
-  item.port_index = port_index;
-  memcpy(item.src_mac, src_mac, sizeof(item.src_mac));
-  if (ptp_msg_len > sizeof(item.msg)) {
-    ptp_msg_len = sizeof(item.msg);
+  return xQueueOverwrite(s_announce_mbox, &item) == pdTRUE ? 0 : -1;
+}
+
+typedef struct {
+  int port_index;
+  bool ap;
+  ptp_wifi_capable_result_t result;
+  uint32_t generation;
+  int64_t queued_us;
+  uint8_t source[6];
+  uint8_t message[PTP_CAPABLE_MESSAGE_LENGTH];
+} wifi_capable_item_t;
+
+static QueueHandle_t s_capable_queue;
+static QueueHandle_t s_capable_results;
+#define WIFI_CAPABLE_QUEUE_DEPTH (16 * CONFIG_ESP_PTP_NUM_PORTS)
+
+static bool wifi_capable_current(const wifi_capable_item_t *item) {
+  int64_t age = esp_timer_get_time() - item->queued_us;
+  return age >= 0 && age < 1000000 &&
+      item->generation == ptp_wifi_link_generation(item->port_index);
+}
+
+static bool wifi_capable_send_to(const wifi_capable_item_t *item,
+                                 const uint8_t destination[6]) {
+  if (!wifi_capable_current(item)) return false;
+  uint8_t frame[ETH_HDR_LEN + PTP_CAPABLE_MESSAGE_LENGTH];
+  memcpy(frame, destination, 6);
+  memcpy(frame + 6, item->source, 6);
+  frame[12] = 0x88;
+  frame[13] = 0xf7;
+  memcpy(frame + ETH_HDR_LEN, item->message, sizeof(item->message));
+#ifdef CONFIG_ESP_PTP_CAPABLE_TX_TRACE
+  int64_t submitted_us = esp_timer_get_time();
+#endif
+  int result = esp_wifi_internal_tx(item->ap ? 1 : 0, frame, sizeof(frame));
+#ifdef CONFIG_ESP_PTP_CAPABLE_TX_TRACE
+  ESP_LOGI("cap_probe", "CAPTX,%lld,%lld,%lld,%u,%d,%d", item->queued_us,
+      submitted_us, esp_timer_get_time(),
+      ((unsigned)item->message[30] << 8) | item->message[31],
+      (int)(int8_t)item->message[54], result);
+#endif
+  return result == ESP_OK;
+}
+
+static void wifi_capable_task(void *argument) {
+  (void)argument;
+  wifi_capable_item_t item;
+  for (;;) {
+    if (xQueueReceive(s_capable_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+    item.result.accepted = wifi_capable_send_to(&item, item.result.destination);
+    item.result.completed_us = esp_timer_get_time();
+    xQueueSend(s_capable_results, &item.result, 0);
   }
-  memcpy(item.msg, ptp_msg, ptp_msg_len);
-  item.len = ptp_msg_len;
-  /* Overwrite mailbox: non-blocking; latest Announce supersedes any pending. */
-  xQueueOverwrite(s_announce_mbox, &item);
-  return 0;
+}
+
+/* Daemon is the sole producer. Queue saturation drops this interval's message. */
+static bool wifi_capable_prepare(void) {
+  if (s_capable_queue) return true;
+  s_capable_queue = xQueueCreate(WIFI_CAPABLE_QUEUE_DEPTH, sizeof(wifi_capable_item_t));
+  s_capable_results = xQueueCreate(WIFI_CAPABLE_QUEUE_DEPTH, sizeof(ptp_wifi_capable_result_t));
+  if (s_capable_queue && s_capable_results &&
+      xTaskCreatePinnedToCore(wifi_capable_task, "ptp_cap_pub", 4096, NULL,
+                              5, NULL, 0) == pdPASS) return true;
+  if (s_capable_queue) vQueueDelete(s_capable_queue);
+  if (s_capable_results) vQueueDelete(s_capable_results);
+  s_capable_queue = NULL;
+  s_capable_results = NULL;
+  return false;
+}
+
+int ptp_wifi_send_capable_peer(int port_index, bool ap, const uint8_t src_mac[6],
+    const uint8_t destination[6], uint32_t generation, uint32_t association,
+    uint32_t token, const uint8_t *message, uint16_t length) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS || !src_mac ||
+      !destination || !association || !token || !message ||
+      length != PTP_CAPABLE_MESSAGE_LENGTH || !wifi_capable_prepare()) return -1;
+  wifi_capable_item_t item = {.port_index = port_index, .ap = ap,
+      .generation = generation, .queued_us = esp_timer_get_time(),
+      .result = {.port_index = port_index, .generation = generation,
+                 .association = association, .token = token}};
+  memcpy(item.result.destination, destination, 6);
+  memcpy(item.source, src_mac, sizeof(item.source));
+  memcpy(item.message, message, sizeof(item.message));
+  return xQueueSend(s_capable_queue, &item, 0) == pdTRUE ? 0 : -1;
+}
+
+bool ptp_wifi_capable_result(ptp_wifi_capable_result_t *result) {
+  return result && s_capable_results && xQueueReceive(s_capable_results, result, 0) == pdTRUE;
 }
 
 /* ===========================================================================
@@ -192,10 +302,131 @@ int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
 #define FTM_BURST_PERIOD_100MS 2
 #define FTM_FRM_COUNT 16
 
+/* Optional FTM transport consumes the same driver-owned report exactly once. */
+extern bool ptp_ftm_report_hook(const wifi_event_ftm_report_t *report) __attribute__((weak));
+extern void ptp_ftm_begin_hook(const uint8_t peer[6]) __attribute__((weak));
+extern bool ptp_ftm_discipline_enabled(void) __attribute__((weak));
+extern void ptp_ftm_reset_hook(void) __attribute__((weak));
+
 static int s_port_index = -1;
 static EventGroupHandle_t s_events;
 #define BIT_STA_CONNECTED BIT0
 #define BIT_FTM_REPORT_OK BIT1
+ESP_EVENT_DEFINE_BASE(PTP_FTM_CONTROL);
+enum { FTM_CONTROL_START, FTM_CONTROL_CANCEL };
+static ptp_ftm_session_t s_ftm_session;
+static ptp_wifi_sta_timing_t s_ftm_timing;
+
+/* 12.3/12.4 inputs: this radio initiates FTM, the peer's Extended Capabilities
+ * come from the association record, and the grant follows the session result
+ * for the frames-per-burst value actually requested. */
+static portMUX_TYPE s_media_lock = portMUX_INITIALIZER_UNLOCKED;
+static ptp_wifi_media_t s_ftm_media = {.ftm_local = true};
+static uint8_t s_ftm_requested_now;
+
+bool ptp_wifi_sta_media(int port_index, ptp_wifi_media_t *media) {
+  if (!media || port_index < 0 || port_index != s_port_index || !s_events ||
+      !(xEventGroupGetBits(s_events) & BIT_STA_CONNECTED)) return false;
+  portENTER_CRITICAL(&s_media_lock);
+  *media = s_ftm_media;
+  portEXIT_CRITICAL(&s_media_lock);
+  return true;
+}
+
+static void ftm_media_reset(void) {
+  portENTER_CRITICAL(&s_media_lock);
+  s_ftm_media = (ptp_wifi_media_t){.ftm_local = true};
+  s_ftm_requested_now = 0;
+  portEXIT_CRITICAL(&s_media_lock);
+}
+static int64_t s_ftm_associated_us;
+static bool s_ftm_waiting_beacon;
+static bool ftm_clock_beacon_fresh(void);
+
+static void cancel_ftm_session(void) {
+  ptp_ftm_session_invalidate(&s_ftm_session);
+  if (s_ftm_session.pending) {
+    esp_err_t result = esp_wifi_ftm_end_session();
+    ESP_LOGI(TAG, "FTM association/timeout cancellation: %s",
+             esp_err_to_name(result));
+  }
+}
+
+/* Run on the same event loop as association changes and report consumption. */
+static void on_ftm_control(void *arg, esp_event_base_t base, int32_t id,
+                           void *data) {
+  (void)arg; (void)base; (void)data;
+  if (id == FTM_CONTROL_CANCEL) {
+    cancel_ftm_session();
+    return;
+  }
+  if (s_ftm_session.pending) return;
+  wifi_ap_record_t ap_info = {0};
+  if (!(xEventGroupGetBits(s_events) & BIT_STA_CONNECTED) ||
+      esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+    xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+    return;
+  }
+  if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) {
+    if (!ptpd_wifi_sta_timing_snapshot(s_port_index, &s_ftm_timing) ||
+        s_ftm_timing.stopped || memcmp(s_ftm_timing.bssid, ap_info.bssid, 6)) {
+      xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+      return;
+    }
+  }
+  if (!s_ftm_associated_us) s_ftm_associated_us = esp_timer_get_time();
+  if (!(ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) &&
+      !ftm_clock_beacon_fresh()) {
+    if (!s_ftm_waiting_beacon)
+      ESP_LOGI(TAG, "FTM waiting for a fresh post-association clock beacon");
+    s_ftm_waiting_beacon = true;
+    xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+    return;
+  }
+  if (s_ftm_waiting_beacon) ESP_LOGI(TAG, "FTM clock beacon ready");
+  s_ftm_waiting_beacon = false;
+  wifi_ftm_initiator_cfg_t config = {
+      .channel = ap_info.primary,
+      .frm_count = FTM_FRM_COUNT,
+      .burst_period = FTM_BURST_PERIOD_100MS,
+  };
+#ifdef WIFI_FTM_VENDOR_IE_MAX_LEN
+  /* The vendor IE carries the Follow_Up (profiles/avb_lite.md, 802.1AS 12.5):
+   * without the IDF FTM vendor IE API this is ranging only. */
+  config.report_vendor_ie = ptp_ftm_report_hook != NULL;
+#else
+  static bool warned_no_vendor_ie;
+  if (!warned_no_vendor_ie) {
+    warned_no_vendor_ie = true;
+    ESP_LOGW(TAG, "FTM vendor IE API not in this IDF; wireless time transfer unavailable, ranging only");
+  }
+#endif
+  static uint8_t ftm_requested_frames = 3;
+  if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) {
+    config.burst_period = 0;
+    config.frm_count = ftm_requested_frames;
+  }
+  memcpy(config.resp_mac, ap_info.bssid, 6);
+  ptp_ftm_session_begin(&s_ftm_session, ap_info.bssid);
+  if (ptp_ftm_begin_hook) ptp_ftm_begin_hook(ap_info.bssid);
+  esp_err_t result = esp_wifi_ftm_initiate_session(&config);
+  portENTER_CRITICAL(&s_media_lock);
+  s_ftm_media.ftm_peer = ap_info.ftm_responder;
+  s_ftm_requested_now = result == ESP_OK ? config.frm_count : 0;
+  portEXIT_CRITICAL(&s_media_lock);
+  if (result != ESP_OK) {
+    if (result == ESP_ERR_INVALID_ARG && config.frm_count == 3) {
+      ftm_requested_frames = 2;
+      ESP_LOGW(TAG, "Three-frame FTM request rejected by SDK, testing two-frame request");
+    } else if (result == ESP_ERR_INVALID_ARG && config.frm_count == 2) {
+      ftm_requested_frames = 8;
+      ESP_LOGW(TAG, "Two-frame FTM request rejected by SDK, testing eight-frame fallback");
+    }
+    s_ftm_session.pending = s_ftm_session.valid = false;
+    ESP_LOGW(TAG, "esp_wifi_ftm_initiate_session: %s", esp_err_to_name(result));
+    xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+  }
+}
 
 /* FTM-derived sync markers. on_vendor_ie writes both as IEs arrive;
  * the FTM_REPORT success handler combines them with FTM t1 to compute
@@ -211,53 +442,31 @@ static EventGroupHandle_t s_events;
  * Both must be non-zero before the FTM handler uses the pair. */
 static int64_t s_gptp_marker_ns;
 static int64_t s_tsf_marker_us;
+static portMUX_TYPE s_tsf_marker_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_tsf_marker_received_us;
 static bool s_seen_gptp;
 static bool s_seen_tsf;
+
+static bool ftm_clock_beacon_fresh(void) {
+  int64_t now_us = esp_timer_get_time();
+  portENTER_CRITICAL(&s_tsf_marker_lock);
+  bool fresh = ptp_ftm_beacon_fresh(s_seen_tsf, s_seen_gptp,
+      s_ftm_associated_us, s_tsf_marker_received_us, now_us);
+  portEXIT_CRITICAL(&s_tsf_marker_lock);
+  return fresh;
+}
+
 /* Latest FTM-derived link delay (ns). The beacon disciplining path adds
  * it to BTC_now; FTM only refines this value, so the clock still tracks
  * when FTM is unavailable (it just loses the ~propagation correction). */
 static int64_t s_peer_delay_ns;
 
-/* AP-bounce detection. The AP's TSF (Timing Synchronization Function)
- * increments monotonically and resets to ~0 when the AP reboots. Each
- * FTM report carries the AP TSF at the FTM TX moment (per-entry t1 in
- * picoseconds). A sustained backward step in t1 across FTM cycles means
- * the AP rebooted while the STA was still associated — in that state
- * the STA's per-STA TX scheduler on the AP side stays corrupted until
- * the STA does a clean leave/rejoin (see Phase B in our investigation
- * trace). On detection, force esp_wifi_disconnect() so the application
- * Wi-Fi handler reconnects through the clean path. */
-static uint64_t s_prev_ap_tsf_ps;
-/* Backward step tolerance: ignore steps smaller than this — small
- * negative deltas can come from out-of-order packet processing or
- * clock corrections, not actual reboot. 1 s is well past any plausible
- * jitter and far below a real AP uptime. */
-#define TSF_BOUNCE_THRESHOLD_PS (1000ULL * 1000ULL * 1000ULL * 1000ULL)
-/* Distinguishing a real AP reboot from a bad FTM sample.
- *
- * This C6 SoftAP FTM responder emits occasional garbage-low t1 values
- * in degraded-FTM windows. They are indistinguishable from a reboot if
- * you only look at the FTM t1 (correlated capture 2026-05-31: the AP TSF
- * never actually reset — the bridge's beacon TSF climbed continuously
- * while the FTM t1 returned 5/8/10 s; ESP3 deauthed itself on the bad
- * samples). The streak counter below is a weak guard (the bad samples
- * arrive in sustained runs ≥3, so a streak alone still trips).
- *
- * PRIMARY discriminator: cross-check against an INDEPENDENT, monotonic
- * copy of the AP TSF — the §12.7 TSF-mapping IE carried in every beacon
- * (s_tsf_marker_us, updated by on_vendor_ie). A genuine reboot zeroes the
- * beacon TSF too; a bad FTM sample leaves it high and advancing. Extra
- * corroboration: a real reboot makes FTM sessions FAIL outright, so a
- * backward t1 inside a *successful* report is almost always a bad sample.
- *
- * SECONDARY guard: still require several CONSECUTIVE corroborated
- * backward readings before tearing the link down — mirrors IEEE
- * 802.1AS-2020 allowedLostResponses / syncReceiptTimeout (both default 3:
- * never fault a link on one bad measurement). While a streak is open we
- * HOLD the baseline at the last trusted t1; any forward reading clears
- * it. */
-#define TSF_BOUNCE_CONSEC_THRESHOLD 3
+/* FTM counter continuity and independent beacon reboot evidence. */
+static uint64_t s_prev_ftm_t1_ps;
+static int64_t s_prev_beacon_tsf_us;
+static bool s_have_ftm_baseline;
 static uint32_t s_tsf_backward_streak;
+#define TSF_BOUNCE_CONSEC_THRESHOLD 3
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
@@ -265,35 +474,85 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
   (void)base;
   switch (id) {
   case WIFI_EVENT_STA_CONNECTED:
+    if (ptp_ftm_reset_hook) ptp_ftm_reset_hook();
+    ftm_media_reset();
+    cancel_ftm_session();
+    s_ftm_associated_us = esp_timer_get_time();
+    s_have_ftm_baseline = false;
+    s_prev_beacon_tsf_us = 0;
+    s_tsf_backward_streak = 0;
     xEventGroupSetBits(s_events, BIT_STA_CONNECTED);
     break;
+  case WIFI_EVENT_STA_STOP:
   case WIFI_EVENT_STA_DISCONNECTED:
+    if (ptp_ftm_reset_hook) ptp_ftm_reset_hook();
+    ftm_media_reset();
+    cancel_ftm_session();
+    if (id == WIFI_EVENT_STA_STOP) s_ftm_session.pending = false;
+    s_ftm_associated_us = 0;
+    s_have_ftm_baseline = false;
+    s_prev_beacon_tsf_us = 0;
+    s_tsf_backward_streak = 0;
     xEventGroupClearBits(s_events, BIT_STA_CONNECTED);
     break;
   case WIFI_EVENT_FTM_REPORT: {
     wifi_event_ftm_report_t *r = (wifi_event_ftm_report_t *)data;
+    /* 12.4 c) 3): only a granted three- or two-frame request counts. The
+     * eight-frame SDK fallback keeps experimental discipline running but
+     * never qualifies the port. */
+    portENTER_CRITICAL(&s_media_lock);
+    bool declined = r->status == FTM_STATUS_CONF_REJECTED ||
+        r->status == FTM_STATUS_UNSUPPORTED || r->status == FTM_STATUS_NO_RESPONSE;
+    s_ftm_media.granted_frames = !declined &&
+        (s_ftm_requested_now == 3 || s_ftm_requested_now == 2) ? s_ftm_requested_now : 0;
+    portEXIT_CRITICAL(&s_media_lock);
+    wifi_ap_record_t current_ap = {0};
+    bool connected = (xEventGroupGetBits(s_events) & BIT_STA_CONNECTED) &&
+        esp_wifi_sta_get_ap_info(&current_ap) == ESP_OK &&
+        memcmp(current_ap.bssid, r->peer_mac, 6) == 0 &&
+        ((ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) ||
+         ftm_clock_beacon_fresh());
+    if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) {
+      ptp_wifi_sta_timing_t current;
+      connected = connected && ptpd_wifi_sta_timing_snapshot(s_port_index, &current) &&
+          !current.stopped && current.association == s_ftm_timing.association &&
+          current.revision == s_ftm_timing.revision &&
+          !memcmp(current.bssid, s_ftm_timing.bssid, 6);
+    }
+    if (!ptp_ftm_session_finish(&s_ftm_session, r->peer_mac, connected)) {
+      if (r->status == FTM_STATUS_SUCCESS)
+        (void)esp_wifi_ftm_get_report(NULL, 0);
+#ifdef WIFI_FTM_VENDOR_IE_MAX_LEN
+      (void)esp_wifi_ftm_get_vendor_data(NULL, 0);
+#endif
+      ESP_LOGI(TAG, "FTM report discarded across association/freshness/timeout boundary: status=%d",
+               r->status);
+      xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+      break;
+    }
+    if (ptp_ftm_report_hook && ptp_ftm_report_hook(r)) {
+      xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+      break;
+    }
     if (r->status == FTM_STATUS_SUCCESS) {
-      /* Per-entry rtt is picosecond-resolution; the aggregate rtt_est
-       * is integer nanoseconds, which truncates to 0 at bench
-       * distances where one-way delay is sub-ns. Average only the
-       * genuinely valid per-entry rtt values, halve for one-way, then
-       * round ps → ns at the daemon boundary. IDF flags an invalid
-       * reading with rtt == UINT32_MAX (and occasionally 0); both must
-       * be excluded or they poison the average and the t1/t2 anchor,
-       * yielding ms-scale peer delays that the servo then rejects. */
+      /* Average only positive signed RTTs for the sub-ns fallback.
+       * Small negative RTTs retain their two's-complement representation
+       * in the unsigned driver field; zero and invalid sentinels also
+       * cannot supply a delay or timestamp anchor. */
       uint64_t avg_rtt_ps = 0;
       uint8_t valid = 0;
       uint8_t n = r->ftm_report_num_entries;
       if (n > 16)
         n = 16;
       uint64_t best_t1_ps = 0;
+      bool have_t1 = false;
       if (n) {
         wifi_ftm_report_entry_t entries[16];
         if (esp_wifi_ftm_get_report(entries, n) == ESP_OK) {
           uint64_t sum_ps = 0;
           int last_valid = -1;
           for (uint8_t i = 0; i < n; ++i) {
-            if (entries[i].rtt && entries[i].rtt != UINT32_MAX) {
+            if (ptp_ftm_rtt_positive(entries[i].rtt)) {
               sum_ps += entries[i].rtt;
               valid++;
               last_valid = i;
@@ -304,83 +563,53 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
           }
           if (last_valid >= 0) {
             best_t1_ps = entries[last_valid].t1;
+            have_t1 = true;
           }
         }
       }
 
-      /* AP-bounce check: if AP TSF stepped backwards by more than the
-       * tolerance, the AP rebooted while we were associated. Tear down
-       * our (now-stale) association so the application reconnects from
-       * scratch — this is the only way to get the AP's per-STA TX
-       * scheduler back to a clean state when the underlying IDF wifi
-       * AP-mode driver has the unicast-stuck bug. */
-      if (best_t1_ps && s_prev_ap_tsf_ps) {
-        if (best_t1_ps + TSF_BOUNCE_THRESHOLD_PS < s_prev_ap_tsf_ps) {
-          /* FTM t1 stepped backward — reboot signature, OR a garbage-low
-           * FTM sample. Cross-check the independent beacon §12.7 TSF
-           * marker: if it is still near the old baseline (not zeroed),
-           * the AP did NOT reboot and this t1 is a bad sample. Default to
-           * "corroborated" only when there is no fresh beacon marker to
-           * check (then the streak guard alone decides). */
-          bool beacon_confirms = true;
-          if (s_seen_tsf && s_tsf_marker_us > 0) {
-            uint64_t tsf_marker_ps = (uint64_t)s_tsf_marker_us * 1000000ULL;
-            beacon_confirms =
-                (tsf_marker_ps + TSF_BOUNCE_THRESHOLD_PS < s_prev_ap_tsf_ps);
-          }
-          if (!beacon_confirms) {
-            /* Bad FTM ranging sample — beacon TSF proves the AP is up.
-             * Ignore it entirely: don't count the streak, hold baseline,
-             * skip this report's pair injection (t1 is untrustworthy). */
-            static uint32_t s_bad_ftm_t1;
-            if ((++s_bad_ftm_t1 % 10) == 1) {
-              ESP_LOGW(TAG,
-                       "FTM t1 backward (now=%llu ps) but beacon TSF still "
-                       "advancing (ap_tsf=%lld us) — bad FTM sample, ignoring "
-                       "(count=%u)",
-                       (unsigned long long)best_t1_ps,
-                       (long long)s_tsf_marker_us, (unsigned)s_bad_ftm_t1);
-            }
-            s_tsf_backward_streak = 0;
+      /* A consumed report must wake the ranging task on every exit path. */
+      xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
+      if (have_t1) {
+        int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&s_tsf_marker_lock);
+        bool fresh_beacon = s_seen_tsf && s_tsf_marker_received_us > 0 &&
+            now_us >= s_tsf_marker_received_us &&
+            now_us - s_tsf_marker_received_us <= 1000000;
+        int64_t beacon_tsf_us = fresh_beacon ? s_tsf_marker_us : 0;
+        portEXIT_CRITICAL(&s_tsf_marker_lock);
+        bool ftm_backward = s_have_ftm_baseline &&
+            ptp_ftm_counter_backward(s_prev_ftm_t1_ps, best_t1_ps);
+        bool beacon_backward = s_have_ftm_baseline && beacon_tsf_us > 0 &&
+            s_prev_beacon_tsf_us > beacon_tsf_us &&
+            s_prev_beacon_tsf_us - beacon_tsf_us > 1000000;
+        if (beacon_backward) {
+          if (++s_tsf_backward_streak < TSF_BOUNCE_CONSEC_THRESHOLD) {
+            ESP_LOGW(TAG, "Beacon TSF moved backward, awaiting confirmation");
             break;
           }
-          /* Beacon corroborates (or none to check). Still require a
-           * sustained streak before tearing the link down. Hold the
-           * baseline at the last trusted t1 while the streak is open, so
-           * one outlier followed by a normal reading clears itself. */
-          if (++s_tsf_backward_streak < TSF_BOUNCE_CONSEC_THRESHOLD) {
-            ESP_LOGW(TAG,
-                     "AP TSF backward (prev=%llu ps, now=%llu ps) "
-                     "streak=%u/%u — awaiting confirmation",
-                     (unsigned long long)s_prev_ap_tsf_ps,
-                     (unsigned long long)best_t1_ps,
-                     (unsigned)s_tsf_backward_streak,
-                     (unsigned)TSF_BOUNCE_CONSEC_THRESHOLD);
-            break; /* hold baseline; skip this report's pair injection */
-          }
-          ESP_LOGW(TAG,
-                   "AP TSF stepped backwards %u cycles (prev=%llu ps, "
-                   "now=%llu ps), beacon TSF corroborates — AP rebooted; "
-                   "forcing clean reassociation",
-                   (unsigned)s_tsf_backward_streak,
-                   (unsigned long long)s_prev_ap_tsf_ps,
-                   (unsigned long long)best_t1_ps);
-          /* Invalidate cached markers so we don't pair-inject against
-           * the (now-meaningless) old bridge time anchor. */
+          ESP_LOGW(TAG, "Beacon TSF reset confirmed, reassociating");
           s_tsf_backward_streak = 0;
+          s_have_ftm_baseline = false;
+          portENTER_CRITICAL(&s_tsf_marker_lock);
           s_seen_tsf = false;
+          s_tsf_marker_received_us = 0;
+          portEXIT_CRITICAL(&s_tsf_marker_lock);
           s_seen_gptp = false;
-          s_prev_ap_tsf_ps = 0;
-          /* Fires WIFI_EVENT_STA_DISCONNECTED → app's handler calls
-           * esp_wifi_connect() for a fresh Auth/Assoc handshake. */
           esp_wifi_disconnect();
-          break; /* skip the rest of this report — markers are gone */
+          break;
         }
-        /* Forward (normal) reading — clear any pending backward streak. */
         s_tsf_backward_streak = 0;
+        if (ftm_backward) {
+          static uint32_t bad_ftm_count;
+          if ((++bad_ftm_count % 10) == 1)
+            ESP_LOGW(TAG, "FTM counter moved backward without beacon reset");
+          break;
+        }
+        s_prev_ftm_t1_ps = best_t1_ps;
+        if (beacon_tsf_us > 0) s_prev_beacon_tsf_us = beacon_tsf_us;
+        s_have_ftm_baseline = true;
       }
-      if (best_t1_ps)
-        s_prev_ap_tsf_ps = best_t1_ps;
       /* Prefer the IDF's calibrated rtt_est: it is the noise-filtered
        * estimate (the basis for dist_est) and is what gPTP's
        * neighborPropDelay expects — single-digit-to-tens of ns at room
@@ -425,7 +654,6 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                  (unsigned)r->rtt_est, (unsigned long long)avg_rtt_ps, valid, n,
                  (long long)peer_delay_ns, rc);
       }
-      xEventGroupSetBits(s_events, BIT_FTM_REPORT_OK);
     } else {
       /* Failure path. In practice num_entries is always 0 here: IDF
        * receives the FTM action frames (it logs "N received measurements")
@@ -518,6 +746,9 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                          const uint8_t sa[6], const vendor_ie_data_t *vnd_ie,
                          int rssi) {
   (void)ctx;
+  /* FTM carries its own source-qualified timing. Do not require or ingest
+   * the private beacon mapping in this mode. */
+  if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) return;
   if (type != WIFI_VND_IE_TYPE_BEACON) {
     return;
   }
@@ -626,8 +857,12 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     for (int i = 0; i < PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN; i++) {
       tsf_us |= ((int64_t)tsf[i]) << (8 * i);
     }
+    int64_t received_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_tsf_marker_lock);
     s_tsf_marker_us = tsf_us;
+    s_tsf_marker_received_us = received_us;
     s_seen_tsf = true;
+    portEXIT_CRITICAL(&s_tsf_marker_lock);
   }
 
   /* Deduplicate against the previous-seen IE. Beacons fire every
@@ -659,6 +894,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
    * selected_source (GM identity/validity) comes from the §12.2 Announce,
    * which inject_sync_pair gates on. STA TSF and local clock are read
    * back-to-back so the injected pair is one instant. */
+  if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) return;
   if (s_seen_gptp && s_seen_tsf) {
     int64_t sta_tsf_us = esp_wifi_get_tsf_time(WIFI_IF_STA);
     struct timespec swn = {0};
@@ -746,49 +982,63 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
  * the FTM exchange and uses the t1..t4 timestamps to compute peer
  * delay (and, via the (gPTP, TSF) marker pair, to inject a sync
  * pair). */
+static void ftm_cadence_wake(void *task) {
+  xTaskNotifyGive((TaskHandle_t)task);
+}
+
 static void ftm_client_task(void *arg) {
   (void)arg;
   xEventGroupWaitBits(s_events, BIT_STA_CONNECTED, pdFALSE, pdTRUE,
                       portMAX_DELAY);
   ESP_LOGI(TAG, "FTM client starting");
 
+  bool precise_cadence = ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled();
+  esp_timer_handle_t cadence_timer = NULL;
+  if (precise_cadence) {
+    esp_timer_create_args_t timer_args = {
+        .callback = ftm_cadence_wake,
+        .arg = xTaskGetCurrentTaskHandle(),
+        .name = "ftm_cadence",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &cadence_timer));
+  }
+  int64_t next_start_us = esp_timer_get_time();
   while (true) {
     if ((xEventGroupGetBits(s_events) & BIT_STA_CONNECTED) == 0) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
 
-    wifi_ap_record_t ap_info = {0};
-    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
+    if (precise_cadence) {
+      ptp_wifi_sta_timing_t policy;
+      if (!ptpd_wifi_sta_timing_snapshot(s_port_index, &policy) || policy.stopped) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        next_start_us = esp_timer_get_time();
+        continue;
+      }
     }
-    static bool s_logged_ap_caps = false;
-    if (!s_logged_ap_caps) {
-      ESP_LOGI(TAG,
-               "AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u "
-               "ftm_responder=%d (advertised in beacon)",
-               ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
-               ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5],
-               ap_info.primary, ap_info.ftm_responder);
-      s_logged_ap_caps = true;
-    }
-    wifi_ftm_initiator_cfg_t cfg = {
-        .channel = ap_info.primary,
-        .frm_count = FTM_FRM_COUNT,
-        .burst_period = FTM_BURST_PERIOD_100MS,
-    };
-    memcpy(cfg.resp_mac, ap_info.bssid, 6);
-    esp_err_t r = esp_wifi_ftm_initiate_session(&cfg);
-    if (r != ESP_OK) {
-      ESP_LOGW(TAG, "esp_wifi_ftm_initiate_session: %s", esp_err_to_name(r));
+    xEventGroupClearBits(s_events, BIT_FTM_REPORT_OK);
+    esp_err_t result = esp_event_post(PTP_FTM_CONTROL, FTM_CONTROL_START,
+                                      NULL, 0, portMAX_DELAY);
+    if (result != ESP_OK) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
-    xEventGroupWaitBits(s_events, BIT_FTM_REPORT_OK, pdTRUE, pdFALSE,
-                        pdMS_TO_TICKS(2000));
+    EventBits_t completed = xEventGroupWaitBits(s_events, BIT_FTM_REPORT_OK,
+        pdTRUE, pdFALSE, pdMS_TO_TICKS(2000));
+    if (!(completed & BIT_FTM_REPORT_OK))
+      (void)esp_event_post(PTP_FTM_CONTROL, FTM_CONTROL_CANCEL,
+                           NULL, 0, portMAX_DELAY);
     /* §12.8.2 cadence: sleep one burst period between sessions. */
-    vTaskDelay(pdMS_TO_TICKS(FTM_BURST_PERIOD_100MS * 100));
+    if (precise_cadence) {
+      int64_t now_us = esp_timer_get_time();
+      next_start_us += 125000;
+      if (next_start_us <= now_us) next_start_us = now_us + 125000;
+      ESP_ERROR_CHECK(esp_timer_start_once(cadence_timer, next_start_us - now_us));
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(FTM_BURST_PERIOD_100MS * 100));
+    }
   }
 }
 
@@ -808,8 +1058,23 @@ int ptp_wifi_sta_start(int port_index) {
    * ptp_wifi_event_handler tracks link state on the same events. */
   esp_err_t r = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                            on_wifi_event, NULL);
-  if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
-    ESP_LOGW(TAG, "esp_event_handler_register failed: %s", esp_err_to_name(r));
+  if (r != ESP_OK) {
+    ESP_LOGE(TAG, "esp_event_handler_register failed: %s", esp_err_to_name(r));
+    vEventGroupDelete(s_events);
+    s_events = NULL;
+    s_port_index = -1;
+    return -1;
+  }
+
+  r = esp_event_handler_register(PTP_FTM_CONTROL, ESP_EVENT_ANY_ID,
+                                  on_ftm_control, NULL);
+  if (r != ESP_OK) {
+    ESP_LOGE(TAG, "FTM control handler registration failed: %s", esp_err_to_name(r));
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event);
+    vEventGroupDelete(s_events);
+    s_events = NULL;
+    s_port_index = -1;
+    return -1;
   }
 
   /* Race: applications typically wait for STA_CONNECTED before calling
@@ -838,6 +1103,108 @@ int ptp_wifi_sta_start(int port_index) {
     ESP_LOGW(TAG, "xTaskCreate ftm_client failed");
   }
 
+  if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled())
+    ESP_LOGI(TAG, "FTM discipline: private beacon timing disabled");
   ESP_LOGI(TAG, "Wi-Fi PTP transport started on port %d", port_index);
   return 0;
+}
+
+#ifdef CONFIG_ESP_PTP_INTERVAL_PROBE
+typedef struct {
+  int port_index;
+  uint32_t generation;
+  bool ap;
+  uint8_t source_mac[6], source_port[10], destination[6], target_port[10];
+} interval_probe_t;
+static interval_probe_t s_interval_probe;
+static bool s_interval_probe_started;
+
+/* Independent wire encoder for the bench, including the actual target identity. */
+static void interval_probe_frame(uint8_t frame[72], const interval_probe_t *probe,
+                                 uint16_t sequence, int8_t interval, bool wrong_identity) {
+  memset(frame, 0, 72);
+  memcpy(frame, probe->destination, 6);
+  memcpy(frame + 6, probe->source_mac, 6);
+  frame[12] = 0x88; frame[13] = 0xf7;
+  uint8_t *message = frame + 14;
+  message[0] = 0x1c; message[1] = 0x12; message[3] = 58;
+  message[4] = CONFIG_ESP_PTP_DOMAIN;
+  memcpy(message + 20, probe->source_port, 10);
+  if (wrong_identity) message[29] ^= 0x40;
+  message[30] = sequence >> 8; message[31] = sequence;
+  message[33] = 127;
+  memcpy(message + 34, probe->target_port, 10);
+  const uint8_t tlv[14] = {0x80,0,0,10,0,0x80,0xc2,0,0,5,0,0,0,0};
+  memcpy(message + 44, tlv, sizeof(tlv));
+  message[54] = (uint8_t)interval;
+}
+
+#ifdef CONFIG_ESP_PTP_SYNC_INTERVAL_PROBE
+static void sync_interval_probe_frame(uint8_t frame[74], const interval_probe_t *probe,
+                                      uint16_t sequence, int8_t interval, bool wrong_identity) {
+  interval_probe_frame(frame, probe, sequence, interval, wrong_identity);
+  uint8_t *message = frame + 14;
+  message[3] = 60;
+  const uint8_t tlv[16] = {0,3,0,12,0,0x80,0xc2,0,0,2,128,0,128,0,0,0};
+  memcpy(message + 44, tlv, sizeof(tlv));
+  message[55] = (uint8_t)interval;
+}
+#endif
+
+static void interval_probe_task(void *argument) {
+  (void)argument;
+  const struct { int8_t interval; bool wrong_identity; unsigned wait_ms; } stages[] = {
+#ifdef CONFIG_ESP_PTP_SYNC_INTERVAL_PROBE
+    {127,true,4000}, {0,false,4000}, {127,false,5000}, {-128,false,3000},
+    {126,false,15000}, {-3,false,3000}, {126,false,0}
+#else
+    {1,false,16000}, {-3,false,3000}, {127,true,2000}, {-4,false,2000},
+    {127,false,3000}, {126,false,5000}, {126,false,0}
+#endif
+  };
+#ifdef CONFIG_ESP_PTP_SYNC_INTERVAL_PROBE
+  ESP_LOGI("cap_probe", "SYNCTEST_START,subtype2");
+#endif
+  vTaskDelay(pdMS_TO_TICKS(30000));
+  for (unsigned index = 0; index < sizeof(stages) / sizeof(stages[0]); ++index) {
+    if (s_interval_probe.generation != ptp_wifi_link_generation(s_interval_probe.port_index)) {
+      ESP_LOGW("cap_probe", "CAPTEST_ABORT,association_changed");
+      vTaskDelete(NULL);
+      return;
+    }
+#ifdef CONFIG_ESP_PTP_SYNC_INTERVAL_PROBE
+    uint8_t frame[74];
+    sync_interval_probe_frame(frame, &s_interval_probe, index + 1,
+                              stages[index].interval, stages[index].wrong_identity);
+#else
+    uint8_t frame[72];
+    interval_probe_frame(frame, &s_interval_probe, index + 1,
+                         stages[index].interval, stages[index].wrong_identity);
+#endif
+    int result = esp_wifi_internal_tx(s_interval_probe.ap ? 1 : 0, frame, sizeof(frame));
+    ESP_LOGI("cap_probe", "CAPTEST_TX,%lld,%u,%d,%u,%d", esp_timer_get_time(),
+             index + 1, stages[index].interval, stages[index].wrong_identity, result);
+    if (stages[index].wait_ms) vTaskDelay(pdMS_TO_TICKS(stages[index].wait_ms));
+  }
+  ESP_LOGI("cap_probe", "CAPTEST_DONE");
+  vTaskDelete(NULL);
+}
+#endif
+
+void ptp_wifi_interval_probe_start(int port_index, bool ap, const uint8_t source_mac[6],
+    const uint8_t source_port[10], const uint8_t destination[6],
+    const uint8_t target_port[10], uint32_t generation) {
+#ifdef CONFIG_ESP_PTP_INTERVAL_PROBE
+  if (s_interval_probe_started) return;
+  s_interval_probe = (interval_probe_t){.port_index = port_index, .generation = generation, .ap = ap};
+  memcpy(s_interval_probe.source_mac, source_mac, 6);
+  memcpy(s_interval_probe.source_port, source_port, 10);
+  memcpy(s_interval_probe.destination, destination, 6);
+  memcpy(s_interval_probe.target_port, target_port, 10);
+  if (xTaskCreate(interval_probe_task, "cap_probe", 3072, NULL, 3, NULL) == pdPASS)
+    s_interval_probe_started = true;
+#else
+  (void)port_index; (void)ap; (void)source_mac; (void)source_port;
+  (void)destination; (void)target_port; (void)generation;
+#endif
 }

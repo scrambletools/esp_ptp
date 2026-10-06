@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <time.h>
+#include <stdbool.h>
 
 /* Time-critical messages (id < 8) go to port 319, others to 320. */
 
@@ -30,6 +31,7 @@
 #define PTP_MSGTYPE_SYNC 0x00
 #define PTP_MSGTYPE_FOLLOW_UP 0x08
 #define PTP_MSGTYPE_ANNOUNCE 0x0b
+#define PTP_MSGTYPE_SIGNALING 0x0c
 #define PTP_MSGTYPE_DELAY_REQ 0x01
 #define PTP_MSGTYPE_DELAY_RESP 0x09
 #define PTP_MSGTYPE_PDELAY_REQ 0x02
@@ -188,6 +190,11 @@ int ptpd_inject_sync_pair(int port_index, int64_t remote_ns, int64_t local_ns);
  * inject_peer_delay + inject_sync_pair. Idempotent. */
 int ptp_wifi_sta_start(int port_index);
 
+/* 12.3 media capability of the STA port's current association. False when
+ * the port is not an associated STA. Never reports clock readiness. */
+#include "ptp_wifi_capable.h"
+bool ptp_wifi_sta_media(int port_index, ptp_wifi_media_t *media);
+
 /* Defined in ptp_beacon_ie.c (only compiled when
  * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y). Registers the §12.7
  * FollowUpInformation beacon-IE publisher as ptpd's sync_egress_cb
@@ -209,6 +216,22 @@ int ptp_beacon_ie_attach(int port_index);
 int ptp_wifi_ap_send_announce(int port_index, const uint8_t src_mac[6],
                               void *ptp_msg, uint16_t ptp_msg_len);
 
+/* Bounded asynchronous capability TX, independent of the Announce mailbox. */
+uint32_t ptp_wifi_link_generation(int port_index);
+
+typedef struct {
+  int port_index;
+  uint8_t destination[6];
+  uint32_t generation, association, token;
+  int64_t completed_us;
+  bool accepted;
+} ptp_wifi_capable_result_t;
+int ptp_wifi_send_capable_peer(int port_index, bool ap, const uint8_t src_mac[6],
+    const uint8_t destination[6], uint32_t generation, uint32_t association,
+    uint32_t token, const uint8_t *message, uint16_t length);
+bool ptp_wifi_capable_result(ptp_wifi_capable_result_t *result);
+
+
 /* Defined in ptp.c. Register a callback fired whenever the daemon
  * would emit a gPTP Sync/Follow_Up on port_index. The callback
  * carries the marshalled FollowUpInformation TLV to the wire (e.g.
@@ -228,12 +251,15 @@ int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
 /* ---- Software clock backend (ptp_clock_sw.c) ----
  *
  * Used when CLOCK_PTP_SYSTEM is not pluggable (e.g. ESP32-C6).
- * Disciplines (offset_ns, rate_ppb) over esp_timer_get_time().
+ * Disciplines an affine mapping over the raw local timer.
  * ptpd_now() routes through this once ptp_clock_sw_init() runs; on
  * EMAC 1588 platforms it is unused. */
 
+/* Raw local clock used by the software backend, not disciplined PTP time. */
+int64_t ptp_clock_local_ns(void);
+
 /* Initialize and select the software clock as the backend for
- * ptpd_now(). Idempotent. After this call ptpd_now() returns the
+ * ptpd_now(). Resets its anchor and rate. After this call ptpd_now() returns the
  * disciplined software time instead of clock_gettime(CLOCK_PTP_SYSTEM).
  * initial_ts may be NULL, in which case the clock starts at 0. */
 int ptp_clock_sw_init(const struct timespec *initial_ts);
@@ -244,14 +270,19 @@ int ptp_clock_sw_now(struct timespec *ts);
 /* Step the software time to ts. Discontinuous — re-anchors immediately. */
 int ptp_clock_sw_settime(const struct timespec *ts);
 
-/* Slew the software time by delta_ns. Continuous — preserves rate. */
+/* Apply an immediate offset to the software time, preserving rate. */
 int ptp_clock_sw_adjtime_offset(int64_t delta_ns);
 
-/* Set the rate offset, in parts-per-billion relative to the local
- * esp_timer. Positive ppb means the software clock runs faster than
- * the local oscillator. Range +/- 1e6 ppb (+/- 1000 ppm) is
- * comfortable; anything beyond ±1e8 is rejected. Re-anchors so the
+/* Adjust the current rate relatively, in parts per billion.
+ * Positive adjustment speeds the software clock up. The accumulated
+ * offset from the local oscillator is clamped to +/- 1e8 ppb.
+ * Re-anchors at the same local instant so the
  * change does not introduce a discontinuity. */
 int ptp_clock_sw_adjtime_rate(int32_t rate_ppb);
 
 #endif /* __APPS_ESP_PTP_PTPV2_H */
+
+/* Default-off finite wireless interval diagnostic, copied association metadata. */
+void ptp_wifi_interval_probe_start(int port_index, bool ap, const uint8_t source_mac[6],
+    const uint8_t source_port[10], const uint8_t destination[6],
+    const uint8_t target_port[10], uint32_t generation);
