@@ -76,7 +76,10 @@ menu "PTP Daemon Configuration"
                     Lower value is higher priority.
                     A higher priority1 clock will be selected without regard to announced
                     clock quality fields.
-                    Refer to Best Master Clock algorithm in IEEE-1588 for details.
+                    IEEE 802.1AS-2020 Table 8-1, also the AVB Lite default: 246 for
+                    a device meant as the BTC, 248 for other BTC-capable devices
+                    that stay on the network, 250 for transient ones, 255 for a
+                    device that can never be the BTC.
 
             config ESP_PTP_PRIORITY2
                 int "PTP server priority2"
@@ -260,6 +263,41 @@ menu "PTP Daemon Configuration"
             endif # ESP_PTP_SEND_DELAYREQ
 
         endif # ESP_PTP_CLIENT
+
+        config ESP_PTP_AVB_LITE_ENDPOINT
+            bool "AVB Lite endpoint: fallback and Endpoint Declaration TLV"
+            default y
+            help
+                Behave as an AVB Lite capable endpoint (profiles/avb_lite.md
+                §2): append the Endpoint Declaration TLV to every Pdelay_Req,
+                Pdelay_Resp and Pdelay_Resp_Follow_Up sent in gPTP mode,
+                evaluate the gPTP to standard PTP fallback conditions, and
+                send the post-fallback beacon. Never applies to bridged
+                ports. Turn off for an endpoint that must stay in gPTP.
+
+        config ESP_PTP_LITE_PRIORITY_TAG
+            bool "Priority-tag PTP in the AVB Lite profile (VLAN 0, PCP 7)"
+            default y
+            help
+                In the standard (AVB Lite) PTP profile, send PTP frames to
+                01:1B:19:00:00:00 and unicast peers with an 802.1Q tag of
+                VLAN 0, priority 7 (profiles/avb_lite.md §5 and §7). gPTP
+                frames and the endpoint beacon stay untagged. Tagged frames
+                bypass L2TAP for transmission, since L2TAP only writes
+                frames of its own ethertype. Receiving tagged PTP is always
+                supported in the standard profile, by timestamping all
+                received frames while that profile is active.
+
+        config ESP_PTP_UNICAST_DELAY_REQ
+            bool "Send Delay_Req unicast to the timetransmitter"
+            default y
+            help
+                In the standard (AVB Lite) PTP profile, send Delay_Req to
+                the MAC address the selected timetransmitter's Announce came
+                from, with the unicast flag set (IEEE 1588-2019 16.9), and
+                fall back to multicast when three unicast requests in a row
+                go unanswered. Unicast Delay_Req received by this clock are
+                always answered with a unicast Delay_Resp.
 
         config ESP_PTP_NUM_PORTS
             int "Number of PTP ports"

@@ -151,6 +151,7 @@ bool ptpd_time_source_snapshot(ptp_timing_snapshot_t *snapshot)
  * ptp_clock_sw.c via ptpd_set_sw_clock_now() + ptpd_now(). */
 #if SOC_EMAC_SUPPORTED
 #include "esp_eth_clock.h"
+#include "esp_eth_mac_esp.h"
 #define PTPD_HAVE_ESP_ETH_CLOCK 1
 #define PTPD_CLOCK_ID CLOCK_PTP_SYSTEM
 #else
@@ -396,6 +397,12 @@ struct ptp_port_s {
       wifi_mode;            /* ap/sta for medium=wifi_ftm, none otherwise */
   uint32_t link_speed_mbps; /* nominal PHY-rate cap */
   char interface_name[16];
+  /* Speed the PHY negotiated, 0 while unknown or down. */
+  uint32_t negotiated_link_mbps;
+  int64_t link_speed_checked_us;
+  /* EMAC timestamps every received frame (needed for tagged PTP). */
+  bool rx_timestamp_all;
+  bool rx_timestamp_mode_set;
 
   /* Link state, queryable via ptpd_port_link_up(). Defaults true so
    * the first TX cycle isn't suppressed before the first link event. */
@@ -468,6 +475,8 @@ struct ptp_port_s {
   struct timespec rxtime;
   uint8_t rx_source_mac[6];
   bool rx_source_mac_valid;
+  uint8_t rx_dest_mac[6];
+  bool rx_dest_mac_valid;
   uint32_t rx_association;
   ptp_msgbuf rxbuf;
 
@@ -540,6 +549,18 @@ struct ptp_state_s {
   struct ptp_announce_s selected_source; /* Currently selected server */
   ptp_path_trace_t selected_path;
   struct timespec last_selected_announce;
+  /* Source MAC of the selected timetransmitter's Announce, the
+   * destination of unicast Delay_Req. */
+  uint8_t selected_source_mac[6];
+  bool selected_source_mac_valid;
+  /* Link speed from the selected timetransmitter's Grandmaster Link
+   * TLV (0 when absent) and the delayAsymmetry derived from it. */
+  uint32_t selected_gm_link_mbps;
+  int64_t delay_asymmetry_ns;
+  /* Unicast Delay_Req bookkeeping, IEEE 1588-2019 16.9. */
+  bool unicast_delay_req_outstanding;
+  uint8_t unicast_delay_req_misses;
+  int64_t unicast_delay_req_retry_us;
 
   /* gPTP → standard PTP fallback gate. One-shot per session: set true after
    * either AVB Lite §2.2 condition fires; cleared on Ethernet link-up so the
@@ -615,6 +636,8 @@ uint32_t ptp_wifi_link_generation(int port_index) {
 
 static void ptp_clean_after_step(FAR struct ptp_state_s *state);
 static void ptp_reset_for_profile(FAR struct ptp_state_s *state);
+static void ptp_reset_unicast_delay_req(FAR struct ptp_state_s *state);
+static void ptp_update_delay_asymmetry(FAR struct ptp_state_s *state);
 static bool ptp_wired_capability(FAR struct ptp_state_s *state);
 
 static inline bool ptp_is_gptp(FAR const struct ptp_state_s *state) {
@@ -931,6 +954,10 @@ static void ptp_reset_for_profile(FAR struct ptp_state_s *state) {
   memset(&state->selected_source, 0, sizeof(state->selected_source));
   memset(&state->selected_path, 0, sizeof(state->selected_path));
   memset(&state->last_selected_announce, 0, sizeof(state->last_selected_announce));
+  state->selected_source_mac_valid = false;
+  state->selected_gm_link_mbps = 0;
+  ptp_reset_unicast_delay_req(state);
+  ptp_update_delay_asymmetry(state);
   state->port[0].path_delay_avgcount = 0;
   state->port[0].path_delay_ns = 0;
   state->port[0].peer_delay_avgcount = 0;
@@ -1038,9 +1065,70 @@ static void ptp_create_eth_frame(struct ptp_state_s *state, uint8_t *eth_frame,
                                              : PTP4L_MULTICAST_ADDR);
 }
 
+#define PTP_VLAN_TAG_LEN 4
+#define PTP_PRIORITY_TAG_PCP 7
+
+/* AVB Lite PTP goes priority-tagged, VLAN 0 PCP 7 (profiles/avb_lite.md
+ * §5). gPTP and the bridge-group beacon stay untagged. */
+static bool ptp_tags_frame(FAR const struct ptp_state_s *state,
+                           const uint8_t *dest_mac) {
+#ifdef CONFIG_ESP_PTP_LITE_PRIORITY_TAG
+  return !ptp_is_gptp(state) &&
+         memcmp(dest_mac, LLDP_MULTICAST_ADDR, ETH_ADDR_LEN) != 0;
+#else
+  (void)state;
+  (void)dest_mac;
+  return false;
+#endif
+}
+
+/* L2TAP writes only frames of its own ethertype, so tagged frames go
+ * straight to the driver, which still returns the descriptor TX
+ * timestamp. */
+static int ptp_net_send_tagged(FAR struct ptp_state_s *state, void *ptp_msg,
+                               uint16_t ptp_msg_len, struct timespec *ts,
+                               const uint8_t *dest_mac) {
+  esp_eth_handle_t eth_handle;
+  if (ptp_get_esp_eth_handle(state, &eth_handle) < 0) {
+    return ERROR;
+  }
+  uint8_t eth_frame[ETH_HEADER_LEN + PTP_VLAN_TAG_LEN + ptp_msg_len];
+  memcpy(eth_frame, dest_mac, ETH_ADDR_LEN);
+  memcpy(eth_frame + ETH_ADDR_LEN, state->port[0].intf_hw_addr, ETH_ADDR_LEN);
+  eth_frame[12] = 0x81;
+  eth_frame[13] = 0x00;
+  eth_frame[14] = PTP_PRIORITY_TAG_PCP << 5; /* VLAN ID 0 */
+  eth_frame[15] = 0x00;
+  eth_frame[16] = ETH_TYPE_PTP >> 8;
+  eth_frame[17] = ETH_TYPE_PTP & 0xFF;
+  uint8_t *payload = eth_frame + ETH_HEADER_LEN + PTP_VLAN_TAG_LEN;
+  memcpy(payload, ptp_msg, ptp_msg_len);
+  ptp_gptp_wire_normalize(payload, ptp_msg_len, ptp_is_gptp(state));
+
+  eth_mac_time_t tx_time = {0};
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  esp_err_t err = esp_eth_transmit_ctrl_vargs(eth_handle, ts ? &tx_time : NULL,
+                                              2, eth_frame,
+                                              (uint32_t)sizeof(eth_frame));
+#pragma GCC diagnostic pop
+  if (err != ESP_OK) {
+    errno = (err == ESP_ERR_TIMEOUT) ? EAGAIN : EIO;
+    return ERROR;
+  }
+  if (ts) {
+    ts->tv_sec = tx_time.seconds;
+    ts->tv_nsec = tx_time.nanoseconds;
+  }
+  return (int)sizeof(eth_frame);
+}
+
 static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
                            uint16_t ptp_msg_len, struct timespec *ts,
                            const uint8_t *dest_mac) {
+  if (ptp_tags_frame(state, dest_mac)) {
+    return ptp_net_send_tagged(state, ptp_msg, ptp_msg_len, ts, dest_mac);
+  }
   uint8_t eth_frame[ptp_msg_len + ETH_HEADER_LEN];
   ptp_create_eth_frame_to(state, eth_frame, ptp_msg, ptp_msg_len, dest_mac);
 
@@ -1082,7 +1170,7 @@ static int ptp_net_send(FAR struct ptp_state_s *state, void *ptp_msg,
 
 static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg,
                         uint16_t ptp_msg_len, struct timespec *ts) {
-  uint8_t eth_frame[ptp_msg_len + ETH_HEADER_LEN];
+  uint8_t eth_frame[ptp_msg_len + ETH_HEADER_LEN + PTP_VLAN_TAG_LEN];
 
   // wrap "Info Records Buffer" into union to ensure proper alignment of data
   // (this is typically needed when accessing double word variables or structs
@@ -1120,14 +1208,31 @@ static int ptp_net_recv(FAR struct ptp_state_s *state, void *ptp_msg,
     return ERROR;
   }
 
-  size_t payload_len = (size_t)ret - ETH_HEADER_LEN;
+  /* Accept PTP priority-tagged as well as untagged (avb_lite.md §5). */
+  size_t header_len = ETH_HEADER_LEN;
+  if (ret > ETH_HEADER_LEN + PTP_VLAN_TAG_LEN && eth_frame[12] == 0x81 &&
+      eth_frame[13] == 0x00 && eth_frame[16] == (ETH_TYPE_PTP >> 8) &&
+      eth_frame[17] == (ETH_TYPE_PTP & 0xFF)) {
+    header_len += PTP_VLAN_TAG_LEN;
+  }
+
+  /* Unicast addressed to another station only shows up in promiscuous
+   * mode; it is not for this clock. */
+  if (!(eth_frame[0] & 0x01) &&
+      memcmp(eth_frame, state->port[0].intf_hw_addr, ETH_ADDR_LEN) != 0) {
+    return ERROR;
+  }
+
+  size_t payload_len = (size_t)ret - header_len;
   if (payload_len > ptp_msg_len) {
     payload_len = ptp_msg_len;
   }
 
+  memcpy(state->port[0].rx_dest_mac, eth_frame, ETH_ADDR_LEN);
+  state->port[0].rx_dest_mac_valid = true;
   memcpy(state->port[0].rx_source_mac, eth_frame + ETH_ADDR_LEN, ETH_ADDR_LEN);
   state->port[0].rx_source_mac_valid = true;
-  memcpy(ptp_msg, &eth_frame[ETH_HEADER_LEN], payload_len);
+  memcpy(ptp_msg, &eth_frame[header_len], payload_len);
 
   return (int)payload_len;
 }
@@ -1871,8 +1976,8 @@ static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
   static const uint8_t orgid[3] = PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES;
   static const uint8_t orgsub[3] = PTP_ENDPOINT_DECL_TLV_SUBTYPE_BYTES;
 
-  tlv->type[0] = (PTP_TLV_TYPE_ORGANIZATION_EXTENSION >> 8) & 0xFF;
-  tlv->type[1] = PTP_TLV_TYPE_ORGANIZATION_EXTENSION & 0xFF;
+  tlv->type[0] = (PTP_TLV_TYPE_ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE >> 8) & 0xFF;
+  tlv->type[1] = PTP_TLV_TYPE_ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE & 0xFF;
   tlv->length[0] = 0x00;
   tlv->length[1] = 0x08;
   memcpy(tlv->orgidentity, orgid, sizeof(orgid));
@@ -1880,6 +1985,36 @@ static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
   tlv->data = PTP_ENDPOINT_DECL_TLV_DATA;
   tlv->pad = 0; /* even lengthField, linuxptp drops odd TLVs */
   return sizeof(struct ptp_endpoint_decl_tlv_s);
+}
+
+/* Find an AVB Lite organization extension TLV by subtype in the TLVs
+ * after base_len. Earlier profile revisions sent type 0x0003, current ones
+ * 0x8000; both are accepted. Returns the TLV value (after its 4-octet
+ * header) when lengthField is at least min_len, else NULL. */
+static FAR const uint8_t *ptp_find_lite_tlv(FAR const uint8_t *msg_buf,
+                                            size_t total_len, size_t base_len,
+                                            const uint8_t subtype[3],
+                                            uint16_t min_len) {
+  static const uint8_t orgid[3] = PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES;
+  size_t offset = base_len;
+
+  while (offset + 4 <= total_len) {
+    uint16_t type = ((uint16_t)msg_buf[offset] << 8) | msg_buf[offset + 1];
+    uint16_t len = ((uint16_t)msg_buf[offset + 2] << 8) | msg_buf[offset + 3];
+    size_t body = offset + 4;
+    if (body + len > total_len) {
+      break; /* malformed / truncated */
+    }
+    if ((type == PTP_TLV_TYPE_ORGANIZATION_EXTENSION ||
+         type == PTP_TLV_TYPE_ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE) &&
+        len >= min_len && len >= 6 &&
+        memcmp(msg_buf + body, orgid, 3) == 0 &&
+        memcmp(msg_buf + body + 3, subtype, 3) == 0) {
+      return msg_buf + body;
+    }
+    offset = body + len;
+  }
+  return NULL;
 }
 
 /* Scan a Pdelay-class message for the AVB Lite Endpoint Declaration TLV.
@@ -1890,26 +2025,110 @@ static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
  */
 static bool ptp_msg_has_endpoint_decl_tlv(FAR const uint8_t *msg_buf,
                                           size_t total_len, size_t base_len) {
-  static const uint8_t orgid[3] = PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES;
   static const uint8_t orgsub[3] = PTP_ENDPOINT_DECL_TLV_SUBTYPE_BYTES;
-  size_t offset = base_len;
+  FAR const uint8_t *value =
+      ptp_find_lite_tlv(msg_buf, total_len, base_len, orgsub, 7);
+  return value != NULL && value[6] == PTP_ENDPOINT_DECL_TLV_DATA;
+}
 
-  while (offset + 4 <= total_len) {
-    uint16_t type = ((uint16_t)msg_buf[offset] << 8) | msg_buf[offset + 1];
-    uint16_t len = ((uint16_t)msg_buf[offset + 2] << 8) | msg_buf[offset + 3];
-    size_t body = offset + 4;
-    if (body + len > total_len) {
-      break; /* malformed / truncated */
-    }
-    if (type == PTP_TLV_TYPE_ORGANIZATION_EXTENSION && len >= 7 &&
-        memcmp(msg_buf + body, orgid, 3) == 0 &&
-        memcmp(msg_buf + body + 3, orgsub, 3) == 0 &&
-        msg_buf[body + 6] == PTP_ENDPOINT_DECL_TLV_DATA) {
-      return true;
-    }
-    offset = body + len;
-  }
+/* Endpoint ports declare themselves in every Pdelay message; bridged
+ * ports never do (profiles/avb_lite.md §2.1). */
+static bool ptp_sends_endpoint_decl(FAR const struct ptp_state_s *state) {
+#ifdef CONFIG_ESP_PTP_AVB_LITE_ENDPOINT
+  return state->port[0].type != ptp_port_type_bridged &&
+         state->port[0].medium == ptp_port_medium_eth_hwts;
+#else
+  (void)state;
   return false;
+#endif
+}
+
+static void ptp_set_message_length(FAR struct ptp_header_s *header,
+                                   size_t length) {
+  header->messagelength[0] = (uint8_t)(length >> 8);
+  header->messagelength[1] = (uint8_t)length;
+}
+
+/* delayAsymmetry from link speeds, profiles/avb_lite.md §5: a store and
+ * forward switch holds a frame for its length at its ingress speed, so
+ * with L octets 4 x L x (1/R_gm - 1/R_local), positive when the
+ * timetransmitter to timereceiver direction takes longer. */
+static void ptp_update_delay_asymmetry(FAR struct ptp_state_s *state) {
+  int64_t asymmetry_ns = 0;
+  int64_t gm_mbps = state->selected_gm_link_mbps;
+  int64_t local_mbps = state->port[0].negotiated_link_mbps;
+  if (!ptp_is_gptp(state) && gm_mbps > 0 && local_mbps > 0 &&
+      gm_mbps != local_mbps) {
+#ifdef CONFIG_ESP_PTP_LITE_PRIORITY_TAG
+    const int64_t frame_octets = 66;
+#else
+    const int64_t frame_octets = 64;
+#endif
+    asymmetry_ns = 4 * frame_octets * 1000 * (local_mbps - gm_mbps) /
+                   (gm_mbps * local_mbps);
+  }
+  if (asymmetry_ns != state->delay_asymmetry_ns) {
+    state->delay_asymmetry_ns = asymmetry_ns;
+    ptpinfo("Delay asymmetry %lld ns (timetransmitter %u Mbps, local %u Mbps)",
+            (long long)asymmetry_ns, (unsigned)gm_mbps, (unsigned)local_mbps);
+  }
+}
+
+/* Follow renegotiation of the wired link; checked every few seconds. */
+static void ptp_refresh_link_speed(FAR struct ptp_state_s *state) {
+  struct ptp_port_s *port = &state->port[0];
+  if (port->medium != ptp_port_medium_eth_hwts || port->ptp_socket < 0) {
+    return;
+  }
+  int64_t now_us = esp_timer_get_time();
+  if (port->link_speed_checked_us != 0 &&
+      now_us - port->link_speed_checked_us < 3000000) {
+    return;
+  }
+  port->link_speed_checked_us = now_us;
+  uint32_t mbps = 0;
+  esp_eth_handle_t eth_handle;
+  eth_speed_t speed;
+  if (port->link_up && ptp_get_esp_eth_handle(state, &eth_handle) >= 0 &&
+      esp_eth_ioctl(eth_handle, ETH_CMD_G_SPEED, &speed) == ESP_OK) {
+    mbps = speed == ETH_SPEED_1000M ? 1000u
+           : speed == ETH_SPEED_100M ? 100u : 10u;
+  }
+  if (mbps != port->negotiated_link_mbps) {
+    port->negotiated_link_mbps = mbps;
+    ptpinfo("port 0 negotiated link speed %u Mbps", (unsigned)mbps);
+    ptp_update_delay_asymmetry(state);
+  }
+}
+
+/* The EMAC snapshots RX timestamps only for frames its PTP filter
+ * recognises, which need not include tagged PTP. In the AVB Lite
+ * profile, where PTP may arrive priority-tagged, timestamp every
+ * received frame instead. */
+static void ptp_apply_rx_timestamp_mode(FAR struct ptp_state_s *state) {
+#if PTPD_HAVE_ESP_ETH_CLOCK && defined(SOC_EMAC_IEEE1588V2_SUPPORTED)
+  struct ptp_port_s *port = &state->port[0];
+  if (port->medium != ptp_port_medium_eth_hwts || port->ptp_socket < 0) {
+    return;
+  }
+  bool all_frames = !ptp_is_gptp(state);
+  if (port->rx_timestamp_mode_set && port->rx_timestamp_all == all_frames) {
+    return;
+  }
+  esp_eth_handle_t eth_handle;
+  esp_eth_mac_t *mac = NULL;
+  if (ptp_get_esp_eth_handle(state, &eth_handle) < 0 ||
+      esp_eth_get_mac_instance(eth_handle, &mac) != ESP_OK || mac == NULL) {
+    return;
+  }
+  if (esp_eth_mac_enable_ts4all(mac, all_frames) == ESP_OK) {
+    port->rx_timestamp_all = all_frames;
+    port->rx_timestamp_mode_set = true;
+    ptpinfo("RX timestamps for %s", all_frames ? "all frames" : "PTP frames");
+  }
+#else
+  (void)state;
+#endif
 }
 
 /* Send PTP server announcement packet */
@@ -1944,7 +2163,33 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
          sizeof(state->own_identity.btc_identity));
   msg.pathtracetlv = pathtrace_tlv;
 
-  ret = ptp_net_send(state, &msg, sizeof(msg), NULL);
+  /* AVB Lite profile: announce this timetransmitter's link speed in the
+   * Grandmaster Link TLV (profiles/avb_lite.md §5). Omitted while the
+   * speed is unknown, so timereceivers apply no correction. */
+  uint8_t wire[sizeof(msg) + sizeof(struct ptp_gm_link_tlv_s)];
+  size_t wire_len = sizeof(msg);
+  uint32_t link_mbps = state->port[0].negotiated_link_mbps;
+  if (!ptp_is_gptp(state) && link_mbps != 0) {
+    static const uint8_t orgid[3] = PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES;
+    static const uint8_t orgsub[3] = PTP_GM_LINK_TLV_SUBTYPE_BYTES;
+    struct ptp_gm_link_tlv_s link_tlv;
+    link_tlv.type[0] = PTP_TLV_TYPE_ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE >> 8;
+    link_tlv.type[1] = PTP_TLV_TYPE_ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE & 0xFF;
+    link_tlv.length[0] = 0;
+    link_tlv.length[1] = 10;
+    memcpy(link_tlv.orgidentity, orgid, sizeof(orgid));
+    memcpy(link_tlv.orgsubtype, orgsub, sizeof(orgsub));
+    link_tlv.link_speed_mbps[0] = (uint8_t)(link_mbps >> 24);
+    link_tlv.link_speed_mbps[1] = (uint8_t)(link_mbps >> 16);
+    link_tlv.link_speed_mbps[2] = (uint8_t)(link_mbps >> 8);
+    link_tlv.link_speed_mbps[3] = (uint8_t)link_mbps;
+    memcpy(wire + sizeof(msg), &link_tlv, sizeof(link_tlv));
+    wire_len += sizeof(link_tlv);
+  }
+  ptp_set_message_length(&msg.header, wire_len);
+  memcpy(wire, &msg, sizeof(msg));
+
+  ret = ptp_net_send(state, wire, wire_len, NULL);
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
@@ -2117,6 +2362,47 @@ static int ptp_send_sync(FAR struct ptp_state_s *state) {
   return OK;
 }
 
+/* Unicast Delay_Req, IEEE 1588-2019 16.9 and profiles/avb_lite.md §5:
+ * address the timetransmitter the selected Announce came from, and go
+ * back to multicast for a while after three unanswered requests. */
+#define PTP_UNICAST_DELAY_REQ_MISSES 3
+#define PTP_UNICAST_DELAY_REQ_RETRY_US (60 * 1000000LL)
+
+static void ptp_reset_unicast_delay_req(FAR struct ptp_state_s *state) {
+  state->unicast_delay_req_outstanding = false;
+  state->unicast_delay_req_misses = 0;
+  state->unicast_delay_req_retry_us = 0;
+}
+
+static bool ptp_unicast_delay_req_active(FAR struct ptp_state_s *state) {
+#ifdef CONFIG_ESP_PTP_UNICAST_DELAY_REQ
+  if (!state->selected_source_mac_valid ||
+      (state->selected_source_mac[0] & 0x01)) {
+    return false;
+  }
+  int64_t now_us = esp_timer_get_time();
+  if (state->unicast_delay_req_outstanding) {
+    state->unicast_delay_req_outstanding = false;
+    if (++state->unicast_delay_req_misses >= PTP_UNICAST_DELAY_REQ_MISSES) {
+      state->unicast_delay_req_misses = 0;
+      state->unicast_delay_req_retry_us = now_us + PTP_UNICAST_DELAY_REQ_RETRY_US;
+      ptpwarn("Unicast Delay_Req unanswered, sending multicast");
+    }
+  }
+  if (state->unicast_delay_req_retry_us != 0) {
+    if (now_us < state->unicast_delay_req_retry_us) {
+      return false;
+    }
+    state->unicast_delay_req_retry_us = 0;
+    ptpinfo("Retrying unicast Delay_Req");
+  }
+  return true;
+#else
+  (void)state;
+  return false;
+#endif
+}
+
 /* Send delay request packet to selected source */
 
 static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
@@ -2145,11 +2431,15 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
         msec_to_log_period(state->port[0].delayreq_interval_ms);
   }
 
+  bool unicast_request = false;
   if (ptp_is_gptp(state)) {
     req.header.messagetype = PTP_MSGTYPE_PDELAY_REQ | PTP_MSGTYPE_SDOID_GPTP;
     req.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
     req.header.controlfield = 5;
     req_len = sizeof(struct ptp_pdelay_req_s);
+    if (ptp_sends_endpoint_decl(state)) {
+      req_len += ptp_append_endpoint_decl_tlv(req.raw, req_len);
+    }
 
   } else {
     req.header.messagetype = PTP_MSGTYPE_DELAY_REQ;
@@ -2157,8 +2447,12 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
     timespec_to_ptp_format(&state->port[0].delayreq_time,
                            req.delay_req.origintimestamp);
     req_len = sizeof(struct ptp_delay_req_s);
+    unicast_request = ptp_unicast_delay_req_active(state);
+    if (unicast_request) {
+      req.header.flags[0] |= PTP_FLAGS0_UNICAST;
+    }
   }
-  req.header.messagelength[1] = req_len;
+  ptp_set_message_length(&req.header, req_len);
 
   ptp_increment_sequence(&state->delay_req_seq, &req.header);
 
@@ -2200,8 +2494,16 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
     ptpinfo("PDELAY_LOST_FU,%u,%u,%u,%u", expired_sequence,
             follow_up_ingress, follow_up_count, follow_up_rejections);
   }
-  ret = ptp_net_send(state, &req, req_len,
-                    peer_request ? &transmit_time : &state->port[0].delayreq_time);
+  if (unicast_request) {
+    ret = ptp_net_send_to(state, &req, req_len, &state->port[0].delayreq_time,
+                          state->selected_source_mac);
+    if (ret > 0) {
+      state->unicast_delay_req_outstanding = true;
+    }
+  } else {
+    ret = ptp_net_send(state, &req, req_len,
+                       peer_request ? &transmit_time : &state->port[0].delayreq_time);
+  }
   if (peer_request) {
     portENTER_CRITICAL(&s_peer_lock);
     if (ret <= 0 || !ptp_peer_publish(&state->port[0].peer_exchange, request_generation,
@@ -2259,6 +2561,10 @@ static IRAM_ATTR void pdelay_req_timer_cb(void *arg) {
 }
 
 static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
+#ifndef CONFIG_ESP_PTP_AVB_LITE_ENDPOINT
+  (void)state;
+  return;
+#endif
   if (!ptp_is_gptp(state) || state->gptp_fallback_done) {
     return;
   }
@@ -2733,6 +3039,28 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
   memset(&state->selected_source, 0, sizeof(state->selected_source));
   memcpy(&state->selected_source, msg, PTP_ANNOUNCE_BODY_LENGTH);
   state->selected_path = path;
+
+  uint32_t gm_link_mbps = 0;
+  if (!ptp_is_gptp(state)) {
+    static const uint8_t gm_link_subtype[3] = PTP_GM_LINK_TLV_SUBTYPE_BYTES;
+    FAR const uint8_t *value = ptp_find_lite_tlv(
+        (FAR const uint8_t *)msg, length, PTP_ANNOUNCE_BODY_LENGTH,
+        gm_link_subtype, 10);
+    if (value != NULL) {
+      gm_link_mbps = ((uint32_t)value[6] << 24) | ((uint32_t)value[7] << 16) |
+                     ((uint32_t)value[8] << 8) | value[9];
+    }
+  }
+  state->selected_gm_link_mbps = gm_link_mbps;
+  ptp_update_delay_asymmetry(state);
+
+  if (state->port[0].rx_source_mac_valid &&
+      (!state->selected_source_mac_valid ||
+       memcmp(state->selected_source_mac, state->port[0].rx_source_mac, 6))) {
+    memcpy(state->selected_source_mac, state->port[0].rx_source_mac, 6);
+    state->selected_source_mac_valid = true;
+    ptp_reset_unicast_delay_req(state);
+  }
   if (changed || path_changed) {
     ptpinfo("Selected Announce path: %u clock(s)", path.count);
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, path.identities, path.count * 8, ESP_LOG_INFO);
@@ -2749,7 +3077,7 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   if (ptp_is_gptp(state)) {
     offset_ns += state->port[0].peer_delay_ns + state->correction_ns;
   } else {
-    offset_ns += state->port[0].path_delay_ns;
+    offset_ns += state->port[0].path_delay_ns + state->delay_asymmetry_ns;
   }
 
   /* The ESP-IDF hardware clock applies ADJ_FREQUENCY relative to its current
@@ -2895,7 +3223,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
   if (ptp_is_gptp(state)) {
     delta_ns += state->port[0].peer_delay_ns + state->correction_ns;
   } else {
-    delta_ns += state->port[0].path_delay_ns;
+    delta_ns += state->port[0].path_delay_ns + state->delay_asymmetry_ns;
   }
   absdelta_ns = (delta_ns < 0) ? -delta_ns : delta_ns;
 
@@ -3096,11 +3424,27 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
   resp.header.logmessageinterval = msec_to_log_period(
       ptp_is_gptp(state) ? log_period_to_msec(0x7F)
                          : CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS);
-  resp.header.messagelength[1] = resp_len;
+  if (ptp_is_gptp(state) && ptp_sends_endpoint_decl(state)) {
+    resp_len += ptp_append_endpoint_decl_tlv(resp.raw, resp_len);
+  }
+  ptp_set_message_length(&resp.header, resp_len);
+
+  /* A unicast Delay_Req gets a unicast Delay_Resp (IEEE 1588-2019 16.9,
+   * a shall for AVB Lite timetransmitters). */
+  bool unicast_reply = !ptp_is_gptp(state) &&
+                       state->port[0].rx_dest_mac_valid &&
+                       !(state->port[0].rx_dest_mac[0] & 0x01) &&
+                       state->port[0].rx_source_mac_valid;
 
   /* Send the response message */
 
-  ret = ptp_net_send(state, &resp, resp_len, &ts);
+  if (unicast_reply) {
+    resp.header.flags[0] |= PTP_FLAGS0_UNICAST;
+    ret = ptp_net_send_to(state, &resp, resp_len, &ts,
+                          state->port[0].rx_source_mac);
+  } else {
+    ret = ptp_net_send(state, &resp, resp_len, &ts);
+  }
 
   if (ret < 0) {
     ptperr("sendto failed: %d", errno);
@@ -3121,7 +3465,10 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
     resp.header.messagetype = PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP;
     resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
     size_t fup_len = sizeof(struct ptp_delay_resp_follow_up_s);
-    resp.header.messagelength[1] = fup_len;
+    if (ptp_sends_endpoint_decl(state)) {
+      fup_len += ptp_append_endpoint_decl_tlv(resp.raw, fup_len);
+    }
+    ptp_set_message_length(&resp.header, fup_len);
     /* Clear PTP_TWO_STEP — nothing follows the Pdelay_Resp_Follow_Up
      * (IEEE 1588-2008 §13.3.2.6). */
     resp.header.flags[0] = 0;
@@ -3190,6 +3537,8 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
       return OK;
     sequence = ptp_get_sequence(&msg->header);
     if (sequence != state->delay_req_seq) return OK;
+    state->unicast_delay_req_outstanding = false;
+    state->unicast_delay_req_misses = 0;
     /* Path delay is calculated as the average between delta for sync
      * message and delta for delay req message.
      * (IEEE-1588 section 11.3: Delay request-response mechanism)
@@ -3198,7 +3547,9 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
     ptp_format_to_timespec(msg->receivetimestamp, &remote_rxtime);
     path_delay =
         timespec_delta_ns(&remote_rxtime, &state->port[0].delayreq_time);
-    sync_delay = state->port[0].path_delay_ns - state->last_delta_ns;
+    /* Locked, t2 - t1 equals the path delay plus delayAsymmetry. */
+    sync_delay = state->port[0].path_delay_ns + state->delay_asymmetry_ns -
+                 state->last_delta_ns;
     path_delay = (path_delay + sync_delay) / 2;
 
     if (path_delay >= 0 &&
@@ -3671,6 +4022,9 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   status->peer_is_endpoint = state->port[0].peer_is_endpoint;
   status->avb_lite_fallback_reason = state->avb_lite_fallback_reason;
   status->domain = CONFIG_ESP_PTP_DOMAIN;
+  status->link_speed_mbps = state->port[0].negotiated_link_mbps;
+  status->gm_link_speed_mbps = state->selected_gm_link_mbps;
+  status->delay_asymmetry_ns = state->delay_asymmetry_ns;
   status->clock_source_selected = state->selected_source_valid;
   memset(&status->selected_path, 0, sizeof(status->selected_path));
   if (status->clock_source_selected) status->selected_path = state->selected_path;
@@ -3944,6 +4298,7 @@ static void ptp_daemon(void *task_param) {
       state->port[0].rxtime = incoming.received;
       memcpy(state->port[0].rx_source_mac, incoming.source_mac, 6);
       state->port[0].rx_source_mac_valid = incoming.source_mac_valid;
+      state->port[0].rx_dest_mac_valid = false;
       ptp_process_rx_packet(state, incoming.length, incoming.port_index);
     }
 
@@ -3958,8 +4313,12 @@ static void ptp_daemon(void *task_param) {
 
     /* Starvation check runs UNCONDITIONALLY every loop iteration —
      * gating it on the poll outcome or on read() success would mask
-     * the wedge (see comment at PTPD_RX_STARVATION_US). */
-    if (state->port[0].medium == ptp_port_medium_eth_hwts) {
+     * the wedge (see comment at PTPD_RX_STARVATION_US). Silence is
+     * normal for a standard-profile timetransmitter with no
+     * timereceivers on the segment, so there it only runs while a
+     * source is selected (Sync then arrives 8 times a second). */
+    if (state->port[0].medium == ptp_port_medium_eth_hwts &&
+        (ptp_is_gptp(state) || state->selected_source_valid)) {
       int64_t now_us = esp_timer_get_time();
       struct timespec mono;
       clock_gettime(CLOCK_MONOTONIC, &mono);
@@ -3994,6 +4353,8 @@ static void ptp_daemon(void *task_param) {
       ptp_invalidate_timing();
     }
     ptp_publish_local_source(state);
+    ptp_refresh_link_speed(state);
+    ptp_apply_rx_timestamp_mode(state);
     ptp_periodic_send(state);
     ptp_check_profile_fallback(state);
     ptp_process_statusreq(state);

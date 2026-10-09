@@ -83,6 +83,15 @@ struct ptpd_status_s {
   /* PTP domain number of this port. */
   uint8_t domain;
 
+  /* Negotiated speed of the wired link in Mb/s, 0 while unknown. */
+  uint32_t link_speed_mbps;
+
+  /* AVB Lite profile (profiles/avb_lite.md §5): the selected
+   * timetransmitter's link speed from its Grandmaster Link TLV (0 when
+   * absent), and the delayAsymmetry applied for the difference. */
+  uint32_t gm_link_speed_mbps;
+  int64_t delay_asymmetry_ns;
+
   /* Selected Announce source, independent of servo acquisition/holdover. */
   bool clock_source_selected;
   ptp_path_trace_t selected_path;

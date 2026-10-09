@@ -41,6 +41,7 @@
 /* Message flags */
 
 #define PTP_FLAGS0_TWOSTEP (1 << 1)
+#define PTP_FLAGS0_UNICAST (1 << 2)
 #define PTP_FLAGS1_PTP_TIMESCALE (1 << 3)
 #define PTP_MSGTYPE_SDOID_GPTP (1 << 4)
 
@@ -153,7 +154,10 @@ struct ptp_pdelay_req_s {
  * Carried in Pdelay_Req, Pdelay_Resp, and Pdelay_Resp_Follow_Up to let
  * AVB Lite endpoints detect each other across non-AVB-aware bridges. */
 
+/* IEEE 1588-2019 14.3.2.1 keeps 0x0003 for extensions that predate it;
+ * new ones use the do-not-propagate type. Receivers accept both. */
 #define PTP_TLV_TYPE_ORGANIZATION_EXTENSION 0x0003
+#define PTP_TLV_TYPE_ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE 0x8000
 
 #define PTP_ENDPOINT_DECL_TLV_ORG_ID_BYTES {0x8C, 0x1F, 0x64}
 #define PTP_ENDPOINT_DECL_TLV_SUBTYPE_BYTES {0x36, 0xC0, 0x01}
@@ -166,6 +170,20 @@ struct ptp_endpoint_decl_tlv_s {
   uint8_t orgsubtype[3];
   uint8_t data;
   uint8_t pad;
+};
+
+/* AVB Lite Grandmaster Link TLV, profiles/avb_lite.md §5: appended to
+ * every Announce a timetransmitter sends in the AVB Lite PTP profile,
+ * so timereceivers can correct the link-speed delay asymmetry. */
+
+#define PTP_GM_LINK_TLV_SUBTYPE_BYTES {0x36, 0xC0, 0x04}
+
+struct ptp_gm_link_tlv_s {
+  uint8_t type[2];
+  uint8_t length[2]; /* 10 */
+  uint8_t orgidentity[3];
+  uint8_t orgsubtype[3];
+  uint8_t link_speed_mbps[4];
 };
 
 /* Internal API — visible only within the esp_ptp component, not part
