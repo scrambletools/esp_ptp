@@ -1,4 +1,4 @@
-version: "1.3.0"
+version: "1.4.0"
 description: "PTP implementation for ESP32"
 url: "https://github.com/scrambletools/esp_ptp"
 license: "Apache-2.0"
