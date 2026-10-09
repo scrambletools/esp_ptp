@@ -1861,6 +1861,9 @@ static int ptp_send_endpoint_beacon(FAR struct ptp_state_s *state) {
  * buffer at offset base_len. Returns the number of bytes added.
  * Per profiles/avb_lite.md §2.1.
  */
+_Static_assert(sizeof(struct ptp_endpoint_decl_tlv_s) == 12,
+               "Endpoint Declaration TLV is 4 octets of header plus 8");
+
 static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
                                            size_t base_len) {
   FAR struct ptp_endpoint_decl_tlv_s *tlv =
@@ -1871,10 +1874,11 @@ static size_t ptp_append_endpoint_decl_tlv(FAR uint8_t *msg_buf,
   tlv->type[0] = (PTP_TLV_TYPE_ORGANIZATION_EXTENSION >> 8) & 0xFF;
   tlv->type[1] = PTP_TLV_TYPE_ORGANIZATION_EXTENSION & 0xFF;
   tlv->length[0] = 0x00;
-  tlv->length[1] = 0x07;
+  tlv->length[1] = 0x08;
   memcpy(tlv->orgidentity, orgid, sizeof(orgid));
   memcpy(tlv->orgsubtype, orgsub, sizeof(orgsub));
   tlv->data = PTP_ENDPOINT_DECL_TLV_DATA;
+  tlv->pad = 0; /* even lengthField, linuxptp drops odd TLVs */
   return sizeof(struct ptp_endpoint_decl_tlv_s);
 }
 
@@ -2487,7 +2491,18 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
                             &delta);
     if (timespec_to_ms(&delta) > CONFIG_ESP_PTP_SYNC_INTERVAL_MS &&
         (!ptp_is_gptp(state) || state->own_identity.btc_priority1 < 255)) {
-      state->port[0].last_transmitted_sync = time_now;
+      /* Advance on the nominal grid rather than from the send time, so
+       * the poll granularity does not stretch the mean interval. Snap
+       * to now when far behind (first Sync, long stall). */
+      if (timespec_to_ms(&delta) > 2 * CONFIG_ESP_PTP_SYNC_INTERVAL_MS) {
+        state->port[0].last_transmitted_sync = time_now;
+      } else {
+        const struct timespec interval = {
+            .tv_sec = CONFIG_ESP_PTP_SYNC_INTERVAL_MS / 1000,
+            .tv_nsec = (CONFIG_ESP_PTP_SYNC_INTERVAL_MS % 1000) * 1000000L};
+        clock_timespec_add(&state->port[0].last_transmitted_sync, &interval,
+                           &state->port[0].last_transmitted_sync);
+      }
       ptp_send_sync(state);
     }
   }
@@ -3841,17 +3856,19 @@ static void ptp_daemon(void *task_param) {
     pollfds[0].fd = state->port[0].ptp_socket;
     pollfds[0].revents = 0;
 
-    /* While acting as the BTC on a wired gPTP port, Sync must go out
-     * every CONFIG_ESP_PTP_SYNC_INTERVAL_MS (125 ms for 802.1AS). TX
-     * happens once per loop pass, and on a quiet wire poll() sleeps
-     * up to PTPD_POLL_CAP_MS between passes, capping Sync at ~2/s —
-     * peers' syncReceiptTimeout (3 intervals) then expires on every
-     * gap and they never lock to us. Tighten the wait while BTC. */
+    /* While acting as the BTC on a wired port, Sync must go out every
+     * CONFIG_ESP_PTP_SYNC_INTERVAL_MS (125 ms, logMessageInterval -3)
+     * in both profiles. TX happens once per loop pass, and on a quiet
+     * wire poll() sleeps up to PTPD_POLL_CAP_MS between passes,
+     * capping Sync at ~2/s, so peers' syncReceiptTimeout (3 intervals)
+     * expires on every gap and they never lock to us. The standard
+     * profile after an AVB-Lite fallback runs on a quiet non-AVB
+     * switch, so it needs this cap as much as gPTP. */
 #define PTPD_BTC_POLL_CAP_MS 25
     int wait_ms = poll_timeout;
     if (ptp_ftm_daemon_tick && state->port[0].medium == ptp_port_medium_wifi_ftm && wait_ms > 50)
       wait_ms = 50;
-    if (!state->selected_source_valid && ptp_is_gptp(state) &&
+    if (!state->selected_source_valid &&
         state->port[0].medium == ptp_port_medium_eth_hwts &&
         wait_ms > PTPD_BTC_POLL_CAP_MS) {
       wait_ms = PTPD_BTC_POLL_CAP_MS;

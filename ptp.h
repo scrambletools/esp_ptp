@@ -161,10 +161,11 @@ struct ptp_pdelay_req_s {
 
 struct ptp_endpoint_decl_tlv_s {
   uint8_t type[2];
-  uint8_t length[2];
+  uint8_t length[2]; /* 8: IEEE 1588 TLV lengths are even */
   uint8_t orgidentity[3];
   uint8_t orgsubtype[3];
   uint8_t data;
+  uint8_t pad;
 };
 
 /* Internal API — visible only within the esp_ptp component, not part
