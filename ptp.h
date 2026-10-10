@@ -214,6 +214,12 @@ int ptp_wifi_sta_start(int port_index);
 #include "ptp_wifi_capable.h"
 bool ptp_wifi_sta_media(int port_index, ptp_wifi_media_t *media);
 
+/* Defined in ptp.c. The bound AP port identity (zero while unbound) and
+ * the AVB Wireless as_capable_reason: 0 asCapable, 1 FTM burst other than
+ * three or two frames, 2 neither FTM nor TM, 3 no gPTP-capable Signaling. */
+void ptp_wifi_sta_capability_status(int port_index, uint8_t port_identity[10],
+                                    uint8_t *reason);
+
 /* Defined in ptp_beacon_ie.c (only compiled when
  * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y). Registers the §12.7
  * FollowUpInformation beacon-IE publisher as ptpd's sync_egress_cb

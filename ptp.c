@@ -3995,6 +3995,31 @@ static bool ptp_wifi_capability(FAR struct ptp_state_s *state, int index)
   return ptp_wifi_as_capable(&media, neighbor, CONFIG_ESP_PTP_DOMAIN);
 }
 
+void ptp_wifi_sta_capability_status(int index, uint8_t port_identity[10],
+                                    uint8_t *reason)
+{
+  memset(port_identity, 0, 10);
+  *reason = 2;
+  if (!s_state || index < 0 || index >= CONFIG_ESP_PTP_NUM_PORTS) return;
+  struct ptp_port_s *port = &s_state->port[index];
+  portENTER_CRITICAL(&s_peer_lock);
+  if (port->wifi_neighbor.associated && port->wifi_neighbor.bound)
+    memcpy(port_identity, port->wifi_neighbor.port_identity, 10);
+  portEXIT_CRITICAL(&s_peer_lock);
+  if (ptp_wifi_capability(s_state, index)) {
+    *reason = 0;
+    return;
+  }
+  /* The first of the 12.4 conditions that fails: media support, then the
+   * FTM grant, then the neighbor's gPTP-capable Signaling. */
+  ptp_wifi_media_t media;
+  uint8_t support = ptp_wifi_sta_media(index, &media)
+      ? ptp_wifi_tm_ftm_support(&media) : 0;
+  if (!support) return;
+  bool small_burst = media.granted_frames == 3 || media.granted_frames == 2;
+  *reason = !(support & 1) && !small_burst ? 1 : 3;
+}
+
 static bool ptp_wired_capability(FAR struct ptp_state_s *state)
 {
   portENTER_CRITICAL(&s_peer_lock);

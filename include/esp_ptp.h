@@ -150,6 +150,40 @@ struct ptpd_status_s {
   struct timespec last_transmitted_delayreq;
 };
 
+/* AVB Wireless time modes (profiles/avb_wireless.md §2.1, §5.1). */
+typedef enum {
+  ptp_wifi_time_mode_none = 0,
+  ptp_wifi_time_mode_a_ftm = 1, /* 802.1AS §12 over FTM */
+  ptp_wifi_time_mode_a_tm = 2,  /* 802.1AS §12 over TM */
+  ptp_wifi_time_mode_b = 3,     /* beacon carrier, FTM for link delay */
+} ptp_wifi_time_mode_e;
+
+#define PTP_WIFI_STATUS_UNKNOWN 0xFF
+#define PTP_WIFI_STATUS_AGE_NONE 0xFFFF
+
+/* Station time state for GET_WIRELESS_STATUS (profiles/avb_wireless.md
+ * §5.1). Locked and holdover follow §2.6. The FTM burst fields are 0
+ * without FTM and PTP_WIFI_STATUS_UNKNOWN when no grant is reported. */
+typedef struct {
+  ptp_wifi_time_mode_e time_mode;
+  bool associated;
+  bool locked;
+  bool holdover;
+  bool servo_error_valid;
+  bool rtt_valid;
+  int32_t servo_error_ns;
+  int32_t rtt_ns;              /* last valid FTM round trip */
+  uint8_t ftm_success;         /* percent over 10 s, UNKNOWN without FTM */
+  uint8_t as_capable_reason;   /* 0 capable, or Mode B */
+  uint8_t ftm_burst_frames;
+  uint8_t ftm_burst_duration;  /* IEEE 802.11 Burst Duration encoding */
+  uint8_t ftm_min_delta;       /* units of 100 us */
+  uint16_t time_age_ms;        /* since a time element was applied */
+  uint16_t ap_resets;          /* AP TSF resets seen since start */
+  uint32_t association_age_s;
+  uint8_t ap_port_identity[10]; /* zero until known */
+} ptpd_wifi_sta_status_t;
+
 #ifdef __cplusplus
 #define EXTERN extern "C"
 extern "C" {
@@ -195,6 +229,11 @@ int ptpd_stop(int pid);
  * Defaults to true on a freshly bootstrapped port so the first TX
  * cycle isn't dropped before the first link event fires. */
 bool ptpd_port_link_up(int port_index);
+
+/* Station time state of a Wi-Fi STA port for the AVB Wireless status
+ * query. Task context; returns -EINVAL for a port that is not a running
+ * Wi-Fi STA port. */
+int ptpd_wifi_sta_status(int port_index, ptpd_wifi_sta_status_t *status);
 
 /* Feed a received PTP message (Ethernet header already stripped) into
  * the daemon on the given port. frame[0..len-1] is the PTP body

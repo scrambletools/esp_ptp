@@ -32,6 +32,7 @@
 
 #include "sdkconfig.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <string.h>
 
@@ -55,6 +56,8 @@
 #include "ptp_ftm_counter.h"
 #include "ptp_ftm_session.h"
 #include "ptp_ftm_rtt.h"
+#include "ptp_ftm_success.h"
+#include "ptp_ftm_clock.h"
 #include "ptp_rpc_proto.h"
 
 /* esp_wifi_internal_tx is not in any public IDF header. Same forward-
@@ -307,6 +310,7 @@ extern bool ptp_ftm_report_hook(const wifi_event_ftm_report_t *report) __attribu
 extern void ptp_ftm_begin_hook(const uint8_t peer[6]) __attribute__((weak));
 extern bool ptp_ftm_discipline_enabled(void) __attribute__((weak));
 extern void ptp_ftm_reset_hook(void) __attribute__((weak));
+extern bool ptp_ftm_status_hook(ptp_ftm_status_t *status) __attribute__((weak));
 
 static int s_port_index = -1;
 static EventGroupHandle_t s_events;
@@ -468,12 +472,77 @@ static bool s_have_ftm_baseline;
 static uint32_t s_tsf_backward_streak;
 #define TSF_BOUNCE_CONSEC_THRESHOLD 3
 
+/* AVB Wireless station status (profiles/avb_wireless.md §2.6, §5.1).
+ * Locked needs an element applied within three Sync intervals at log -3.
+ * In Mode B the servo counts as converged once its error is within
+ * BEACON_LOCK_ENTER_NS and stops once it exceeds BEACON_LOCK_EXIT_NS. */
+#define STA_LOCK_WINDOW_US 375000
+#define BEACON_LOCK_ENTER_NS 2000000
+#define BEACON_LOCK_EXIT_NS 4000000
+static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_sta_associated_us;
+static uint8_t s_status_bssid[6];
+static int64_t s_beacon_applied_us;
+static int32_t s_beacon_error_ns;
+static bool s_beacon_error_valid, s_beacon_converged, s_beacon_was_locked;
+static uint8_t s_beacon_port_identity[10];
+static int32_t s_ftm_rtt_ns;
+static bool s_ftm_rtt_valid;
+static uint16_t s_ap_resets;
+static ptp_ftm_success_t s_ftm_success;
+
+static int32_t status_clamp_ns(int64_t value_ns) {
+  if (value_ns > INT32_MAX) return INT32_MAX;
+  if (value_ns < INT32_MIN) return INT32_MIN;
+  return (int32_t)value_ns;
+}
+
+/* A new time source: the station acquires again before it is locked. */
+static void beacon_status_new_source(void) {
+  portENTER_CRITICAL(&s_status_lock);
+  s_beacon_applied_us = 0;
+  s_beacon_error_valid = s_beacon_converged = s_beacon_was_locked = false;
+  memset(s_beacon_port_identity, 0, sizeof(s_beacon_port_identity));
+  portEXIT_CRITICAL(&s_status_lock);
+}
+
+static void beacon_status_applied(int64_t error_ns) {
+  int64_t magnitude_ns = error_ns < 0 ? -error_ns : error_ns;
+  portENTER_CRITICAL(&s_status_lock);
+  s_beacon_applied_us = esp_timer_get_time();
+  s_beacon_error_ns = status_clamp_ns(error_ns);
+  s_beacon_error_valid = true;
+  if (magnitude_ns <= BEACON_LOCK_ENTER_NS) s_beacon_converged = true;
+  else if (magnitude_ns > BEACON_LOCK_EXIT_NS) s_beacon_converged = false;
+  if (s_beacon_converged) s_beacon_was_locked = true;
+  portEXIT_CRITICAL(&s_status_lock);
+}
+
+static void ftm_status_measured(bool valid, int32_t rtt_ns) {
+  portENTER_CRITICAL(&s_status_lock);
+  ptp_ftm_success_record(&s_ftm_success, esp_timer_get_time(), valid);
+  if (valid) {
+    s_ftm_rtt_ns = rtt_ns;
+    s_ftm_rtt_valid = true;
+  }
+  portEXIT_CRITICAL(&s_status_lock);
+}
+
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                           void *data) {
   (void)arg;
   (void)base;
   switch (id) {
-  case WIFI_EVENT_STA_CONNECTED:
+  case WIFI_EVENT_STA_CONNECTED: {
+    const wifi_event_sta_connected_t *connected = data;
+    if (memcmp(s_status_bssid, connected->bssid, 6)) {
+      memcpy(s_status_bssid, connected->bssid, 6);
+      beacon_status_new_source();
+    }
+    portENTER_CRITICAL(&s_status_lock);
+    s_sta_associated_us = esp_timer_get_time();
+    s_ftm_rtt_valid = false;
+    portEXIT_CRITICAL(&s_status_lock);
     if (ptp_ftm_reset_hook) ptp_ftm_reset_hook();
     ftm_media_reset();
     cancel_ftm_session();
@@ -483,6 +552,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     s_tsf_backward_streak = 0;
     xEventGroupSetBits(s_events, BIT_STA_CONNECTED);
     break;
+  }
   case WIFI_EVENT_STA_STOP:
   case WIFI_EVENT_STA_DISCONNECTED:
     if (ptp_ftm_reset_hook) ptp_ftm_reset_hook();
@@ -493,6 +563,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     s_have_ftm_baseline = false;
     s_prev_beacon_tsf_us = 0;
     s_tsf_backward_streak = 0;
+    portENTER_CRITICAL(&s_status_lock);
+    s_sta_associated_us = 0;
+    portEXIT_CRITICAL(&s_status_lock);
     xEventGroupClearBits(s_events, BIT_STA_CONNECTED);
     break;
   case WIFI_EVENT_FTM_REPORT: {
@@ -586,9 +659,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
         if (beacon_backward) {
           if (++s_tsf_backward_streak < TSF_BOUNCE_CONSEC_THRESHOLD) {
             ESP_LOGW(TAG, "Beacon TSF moved backward, awaiting confirmation");
+            ftm_status_measured(false, 0);
             break;
           }
           ESP_LOGW(TAG, "Beacon TSF reset confirmed, reassociating");
+          ftm_status_measured(false, 0);
+          portENTER_CRITICAL(&s_status_lock);
+          if (s_ap_resets < UINT16_MAX) ++s_ap_resets;
+          portEXIT_CRITICAL(&s_status_lock);
+          beacon_status_new_source();
           s_tsf_backward_streak = 0;
           s_have_ftm_baseline = false;
           portENTER_CRITICAL(&s_tsf_marker_lock);
@@ -604,6 +683,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
           static uint32_t bad_ftm_count;
           if ((++bad_ftm_count % 10) == 1)
             ESP_LOGW(TAG, "FTM counter moved backward without beacon reset");
+          ftm_status_measured(false, 0);
           break;
         }
         s_prev_ftm_t1_ps = best_t1_ps;
@@ -642,6 +722,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       if (rc == 0) {
         s_peer_delay_ns = peer_delay_ns;
       }
+      int64_t rtt_ns = r->rtt_est ? (int64_t)r->rtt_est
+                                  : (int64_t)((avg_rtt_ps + 500) / 1000);
+      ftm_status_measured(rc == 0, status_clamp_ns(rtt_ns));
 
       static uint32_t s_seen = 0;
       if ((++s_seen % 25) == 1) {
@@ -655,6 +738,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
                  (long long)peer_delay_ns, rc);
       }
     } else {
+      ftm_status_measured(false, 0);
       /* Failure path. In practice num_entries is always 0 here: IDF
        * receives the FTM action frames (it logs "N received measurements")
        * but yields zero valid report entries, so there are no per-entry
@@ -846,6 +930,11 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                      (uint32_t)fu->origintimestamp[9];
     s_gptp_marker_ns = (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs;
     s_seen_gptp = true;
+    /* The element's sourcePortIdentity is the AP's wireless port. */
+    portENTER_CRITICAL(&s_status_lock);
+    memcpy(s_beacon_port_identity, h->sourceidentity, 8);
+    memcpy(&s_beacon_port_identity[8], h->sourceportindex, 2);
+    portEXIT_CRITICAL(&s_status_lock);
   }
 
   /* The AP-TSF marker (µs, little-endian) is appended right after the
@@ -964,7 +1053,8 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
       }
       int64_t btc_now_ns = s_off_filt + sta_tsf_us * 1000;
       int64_t off_ns = btc_now_ns - local_ns;
-      (void)ptpd_inject_sync_pair(s_port_index, btc_now_ns, local_ns);
+      if (ptpd_inject_sync_pair(s_port_index, btc_now_ns, local_ns) == 0)
+        beacon_status_applied(off_ns);
 
       static uint32_t s_disc_seen = 0;
       if ((++s_disc_seen % 25) == 1) {
@@ -1086,6 +1176,11 @@ int ptp_wifi_sta_start(int port_index) {
    * normally by the registered handler. */
   wifi_ap_record_t ap_info = {0};
   if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+    /* The association began earlier; its age counts from here. */
+    memcpy(s_status_bssid, ap_info.bssid, 6);
+    portENTER_CRITICAL(&s_status_lock);
+    s_sta_associated_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_status_lock);
     xEventGroupSetBits(s_events, BIT_STA_CONNECTED);
   }
 
@@ -1207,4 +1302,72 @@ void ptp_wifi_interval_probe_start(int port_index, bool ap, const uint8_t source
   (void)port_index; (void)ap; (void)source_mac; (void)source_port;
   (void)destination; (void)target_port; (void)generation;
 #endif
+}
+
+int ptpd_wifi_sta_status(int port_index, ptpd_wifi_sta_status_t *status) {
+  if (!status || port_index < 0 || port_index != s_port_index || !s_events)
+    return -EINVAL;
+  memset(status, 0, sizeof(*status));
+  int64_t now_us = esp_timer_get_time();
+  bool mode_a = ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled();
+  status->time_mode = mode_a ? ptp_wifi_time_mode_a_ftm : ptp_wifi_time_mode_b;
+  status->associated = (xEventGroupGetBits(s_events) & BIT_STA_CONNECTED) != 0;
+
+  int64_t applied_us = 0;
+  uint8_t beacon_identity[10];
+  portENTER_CRITICAL(&s_status_lock);
+  if (!mode_a) {
+    applied_us = s_beacon_applied_us;
+    bool fresh = applied_us && now_us - applied_us <= STA_LOCK_WINDOW_US;
+    status->locked = fresh && s_beacon_converged;
+    status->holdover = !fresh && s_beacon_was_locked;
+    status->servo_error_valid = s_beacon_error_valid;
+    status->servo_error_ns = s_beacon_error_ns;
+    status->rtt_valid = s_ftm_rtt_valid;
+    status->rtt_ns = s_ftm_rtt_ns;
+    status->ftm_success = ptp_ftm_success_percent(&s_ftm_success, now_us);
+  }
+  memcpy(beacon_identity, s_beacon_port_identity, sizeof(beacon_identity));
+  status->ap_resets = s_ap_resets;
+  if (s_sta_associated_us && status->associated)
+    status->association_age_s = (uint32_t)((now_us - s_sta_associated_us) / 1000000);
+  portEXIT_CRITICAL(&s_status_lock);
+
+  if (mode_a) {
+    ptp_ftm_status_t ftm = {.success = PTP_FTM_SUCCESS_NONE};
+    if (ptp_ftm_status_hook && ptp_ftm_status_hook(&ftm)) {
+      applied_us = ftm.applied_us;
+      status->locked = ftm.locked;
+      status->holdover = ftm.holdover;
+      status->servo_error_valid = ftm.error_valid;
+      status->servo_error_ns = ftm.error_ns;
+      status->rtt_valid = ftm.rtt_valid;
+      status->rtt_ns = ftm.rtt_ns;
+    }
+    status->ftm_success = ftm.success;
+  }
+  status->time_age_ms = PTP_WIFI_STATUS_AGE_NONE;
+  if (applied_us && now_us >= applied_us &&
+      (now_us - applied_us) / 1000 < PTP_WIFI_STATUS_AGE_NONE)
+    status->time_age_ms = (uint16_t)((now_us - applied_us) / 1000);
+
+  /* The SDK reports no grant on the initiator side, so only a three- or
+   * two-frame request the responder accepted is known. */
+  ptp_wifi_media_t media;
+  if (ptp_wifi_sta_media(port_index, &media) && media.ftm_peer) {
+    status->ftm_burst_frames = media.granted_frames ? media.granted_frames
+                                                    : PTP_WIFI_STATUS_UNKNOWN;
+    status->ftm_burst_duration = PTP_WIFI_STATUS_UNKNOWN;
+    status->ftm_min_delta = PTP_WIFI_STATUS_UNKNOWN;
+  } else {
+    status->ftm_success = PTP_WIFI_STATUS_UNKNOWN;
+  }
+
+  uint8_t reason;
+  ptp_wifi_sta_capability_status(port_index, status->ap_port_identity, &reason);
+  status->as_capable_reason = mode_a ? reason : 0;
+  static const uint8_t no_identity[10];
+  if (!memcmp(status->ap_port_identity, no_identity, sizeof(no_identity)))
+    memcpy(status->ap_port_identity, beacon_identity, sizeof(beacon_identity));
+  return 0;
 }
