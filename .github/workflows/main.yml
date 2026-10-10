@@ -14,4 +14,5 @@ jobs:
         uses: espressif/upload-components-ci-action@v2
         with:
           components: "esp_ptp: ."
-          namespace: "scrambletoolsllc"
+          namespace: "scrambletools"
+          api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
