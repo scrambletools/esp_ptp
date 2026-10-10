@@ -165,12 +165,15 @@ menu "PTP Daemon Configuration"
 
             config ESP_PTP_DELAYREQ_INTERVAL_MS
                 int "PTP path-delay (E2E) request interval (ms)"
-                default 16000
+                depends on !ESP_PTP_AVB_LITE_ENDPOINT
+                default 1000
                 help
                     Standard PTP path-delay (E2E) request interval. When responding
                     to a Delay_Req the server uses this value to advertise the
                     suggested interval back to the client. Used only when the
-                    delay mechanism is end-to-end (E2E).
+                    delay mechanism is end-to-end (E2E). AVB Lite endpoints
+                    always use 1 s, the one Delay_Req per follower per second
+                    that the profile budgets for.
                     For peer-delay (P2P) — including the gPTP profile —
                     see ESP_PTP_PDELAYREQ_INTERVAL_MS instead.
 

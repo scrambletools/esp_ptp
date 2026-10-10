@@ -320,8 +320,10 @@ static void ptpd_lateness_tick(void) {
 #ifndef CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT
 #define CONFIG_ESP_PTP_DELAYREQ_AVGCOUNT 0
 #endif
+/* Hidden on AVB Lite endpoints, whose profile budgets one Delay_Req per
+ * follower per second (profiles/avb_lite.md §1). */
 #ifndef CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS
-#define CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS 16000
+#define CONFIG_ESP_PTP_DELAYREQ_INTERVAL_MS 1000
 #endif
 #ifndef CONFIG_ESP_PTP_PDELAYREQ_INTERVAL_MS
 #define CONFIG_ESP_PTP_PDELAYREQ_INTERVAL_MS 1000
@@ -2145,9 +2147,11 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   msg.header.logmessageinterval =
       msec_to_log_period(CONFIG_ESP_PTP_ANNOUNCE_INTERVAL_MS);
 
+  /* gPTP requires the PTP timescale, and AVB Lite needs one common
+   * timescale for media presentation (profiles/avb_lite.md §5). */
+  msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;
   if (ptp_is_gptp(state)) {
     msg.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
-    msg.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
   }
 
   ptp_increment_sequence(&state->announce_seq, &msg.header);
@@ -3398,12 +3402,10 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
       ptp_is_gptp(state) ? PTP_MSGTYPE_PDELAY_RESP : PTP_MSGTYPE_DELAY_RESP;
   size_t resp_len = sizeof(struct ptp_delay_resp_s);
 
-#if defined(CONFIG_ESP_PTP_TWOSTEP_SYNC) ||                              \
-    defined(CONFIG_ESP_PTP_GPTP_PROFILE)
-  resp.header.flags[0] = PTP_FLAGS0_TWOSTEP;
-#endif
-
+  /* twoStepFlag belongs to Pdelay_Resp, not Delay_Resp (IEEE 1588-2019
+   * Table 37); a Pdelay_Resp_Follow_Up always follows. */
   if (ptp_is_gptp(state)) {
+    resp.header.flags[0] = PTP_FLAGS0_TWOSTEP;
     resp.header.messagetype |= PTP_MSGTYPE_SDOID_GPTP; // gPTP profile message
     resp.header.flags[1] = PTP_FLAGS1_PTP_TIMESCALE;   // gPTP required flag
     resp.header.controlfield = 5;
