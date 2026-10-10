@@ -14,4 +14,4 @@ jobs:
         uses: espressif/upload-components-ci-action@v2
         with:
           components: "esp_ptp: ."
-          namespace: "scrambletools"
+          namespace: "scrambletoolsllc"
