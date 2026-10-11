@@ -488,6 +488,9 @@ struct ptp_port_s {
   struct timespec twostep_rxtime;
   int64_t twostep_received_us;
   ptp_sync_receipt_t sync_receipt;
+  /* Receipt timeout set by the port's time source, 0 for three Sync
+   * intervals. */
+  volatile int32_t receipt_window_us;
   bool twostep_pending;
 
   /* Buffered delay_resp packet for two-step peer delay measurement. */
@@ -496,6 +499,9 @@ struct ptp_port_s {
   ptp_peer_capability_t peer_capability;
   bool capability_reported, last_reported_capability;
 };
+
+/* gmTimeBaseIndicator, lastGmPhaseChange and scaledLastGmFreqChange. */
+#define PTP_GM_FIELDS_LEN 18
 
 struct ptp_state_s {
   /* Request for PTPD task to stop or report status */
@@ -570,6 +576,14 @@ struct ptp_state_s {
 
   bool gptp_fallback_done;
   uint8_t avb_lite_fallback_reason; /* §2.2 condition that latched, 0 none */
+
+  /* Information TLV time base fields (802.1AS-2020 10.2.2.2.9 to
+   * 10.2.2.2.11): the selected source's latest, relayed in the beacon
+   * time element, and this instance's own indicator while it is BTC. */
+  uint8_t upstream_gm_fields[PTP_GM_FIELDS_LEN];
+  bool upstream_gm_fields_valid;
+  bool gm_fields_own;
+  uint16_t own_time_base_indicator;
   bool eth_event_handler_registered;
   bool wifi_event_handler_registered;
 };
@@ -1417,13 +1431,26 @@ bool ptpd_ftm_source_observed(int port_index, const uint8_t source_port[10],
       domain != CONFIG_ESP_PTP_DOMAIN ||
       memcmp(source_port, s_state->selected_source.header.sourceidentity, 8) ||
       memcmp(source_port + 8, s_state->selected_source.header.sourceportindex, 2)) return false;
-  if (!ptp_sync_receipt_observe(&s_state->port[port_index].sync_receipt,
-      received_us, log_interval, esp_timer_get_time())) return false;
+  int32_t window_us = s_state->port[port_index].receipt_window_us;
+  ptp_sync_receipt_t *receipt = &s_state->port[port_index].sync_receipt;
+  bool observed = window_us > 0
+      ? ptp_sync_receipt_observe_window(receipt, received_us, window_us,
+                                        esp_timer_get_time())
+      : ptp_sync_receipt_observe(receipt, received_us, log_interval,
+                                 esp_timer_get_time());
+  if (!observed) return false;
   ptp_timing_snapshot_t snapshot;
   ptpd_timing_snapshot(&snapshot);
   *generation = snapshot.generation;
   clock_gettime(CLOCK_MONOTONIC, &s_state->port[port_index].last_received_sync);
   return true;
+}
+
+void ptpd_set_sync_receipt_window(int port_index, int32_t window_us)
+{
+  if (!s_state || port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS)
+    return;
+  s_state->port[port_index].receipt_window_us = window_us;
 }
 
 extern void ptp_ftm_daemon_tick(void) __attribute__((weak));
@@ -2204,15 +2231,40 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   return ret;
 }
 
+/* Time base fields of a Follow_Up this instance originates: relayed
+ * from the selected source (802.1AS-2020 10.2.2.3.11 to 10.2.2.3.13),
+ * or its own while it is BTC. On becoming BTC it takes an indicator
+ * other than the one relayed last, so stations see the change (AVB
+ * Wireless §2.4.1). Its time continues the previous BTC's, so
+ * lastGmPhaseChange stays zero. */
+static void ptp_fill_gm_fields(FAR struct ptp_state_s *state,
+                               FAR struct ptp_info_tlv_s *tlv) {
+  if (state->selected_source_valid && state->upstream_gm_fields_valid) {
+    memcpy(tlv->gmtimebaseindicator, state->upstream_gm_fields,
+           PTP_GM_FIELDS_LEN);
+    state->gm_fields_own = false;
+    return;
+  }
+  if (!state->gm_fields_own) {
+    uint16_t relayed = ((uint16_t)state->upstream_gm_fields[0] << 8) |
+                       state->upstream_gm_fields[1];
+    state->own_time_base_indicator = relayed + 1;
+    state->gm_fields_own = true;
+    ptpinfo("Own time base indicator %u", state->own_time_base_indicator);
+  }
+  tlv->gmtimebaseindicator[0] = state->own_time_base_indicator >> 8;
+  tlv->gmtimebaseindicator[1] = state->own_time_base_indicator & 0xff;
+}
+
 /* Marshal a 76-byte §12.7 FollowUpInformation: 34-byte common
  * header + 10-byte preciseOriginTimestamp + 32-byte FU TLV.
  *
  * We REGENERATE rather than forward (the §11.2.13 bridge model):
  * preciseOriginTimestamp = ptpd_now(), which the wired-side servo
  * has already brought into the BTC time domain. Equivalent under
- * lock; avoids residence-time accounting. Corollary fields
- * (correctionField, cumulativeScaledRateOffset, gmTimeBaseIndicator,
- * lastGmPhaseChange, scaledLastGmFreqChange, sequenceId) are zero. */
+ * lock; avoids residence-time accounting. correctionField,
+ * cumulativeScaledRateOffset and sequenceId are zero; the time base
+ * fields come from ptp_fill_gm_fields. */
 static void
 ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
                                     FAR struct ptp_follow_up_s *out, int port_index) {
@@ -2240,9 +2292,7 @@ ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
   ptp_gettime(state, &ts);
   timespec_to_ptp_format(&ts, out->origintimestamp);
 
-  /* FollowUpInformation TLV — §11.4.4.3. TLV header constants are
-   * always populated; data fields are all zero by design (see
-   * design-choice notes above). */
+  /* FollowUpInformation TLV, §11.4.4.3. */
   struct ptp_info_tlv_s *tlv = (struct ptp_info_tlv_s *)out->informationtlv;
   tlv->type[1] = 3;      /* Organization extension */
   tlv->length[1] = 0x1c; /* 28 bytes of value */
@@ -2250,6 +2300,7 @@ ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
   tlv->orgidentity[1] = 0x80;
   tlv->orgidentity[2] = 0xc2; /* IEEE 802.1 OUI */
   tlv->orgsubtype[2] = 1;     /* FollowUp Information per §11.4.4.3 */
+  ptp_fill_gm_fields(state, tlv);
   ptp_gptp_wire_normalize((uint8_t *)out, sizeof(*out), ptp_is_gptp(state));
 }
 
@@ -3024,9 +3075,11 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
   bool changed = !state->selected_source_valid || !same_port || !same_root;
   bool vector_changed = memcmp(&msg->btc_priority1, &state->selected_source.btc_priority1, 14) ||
       memcmp(msg->stepsremoved, state->selected_source.stepsremoved, 2);
-  if (changed || vector_changed)
+  if (changed || vector_changed) {
+    int32_t window_us = state->port[0].receipt_window_us;
     ptp_sync_receipt_start(&state->port[0].sync_receipt, esp_timer_get_time(),
-        INT64_C(3000) * CONFIG_ESP_PTP_SYNC_INTERVAL_MS);
+        window_us > 0 ? window_us : INT64_C(3000) * CONFIG_ESP_PTP_SYNC_INTERVAL_MS);
+  }
   bool path_changed = state->selected_path.count != path.count ||
                       memcmp(state->selected_path.identities, path.identities,
                              path.count * 8);
@@ -3341,6 +3394,11 @@ static int ptp_process_followup(FAR struct ptp_state_s *state,
   state->port[0].twostep_pending = false;
   if (ptp_is_gptp(state)) {
     state->correction_ns = get_correction_ns(msg->header.correction);
+    const struct ptp_info_tlv_s *tlv =
+        (const struct ptp_info_tlv_s *)msg->informationtlv;
+    memcpy(state->upstream_gm_fields, tlv->gmtimebaseindicator,
+           PTP_GM_FIELDS_LEN);
+    state->upstream_gm_fields_valid = true;
   }
   ptp_timing_snapshot_t previous;
   ptpd_timing_snapshot(&previous);

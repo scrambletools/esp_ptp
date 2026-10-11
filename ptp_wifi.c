@@ -477,12 +477,19 @@ static uint32_t s_tsf_backward_streak;
  * In Mode B the servo counts as converged once its error is within
  * BEACON_LOCK_ENTER_NS and stops once it exceeds BEACON_LOCK_EXIT_NS. */
 #define STA_LOCK_WINDOW_US 375000
+/* Bounds on the measured interval between fresh beacon elements. */
+#define ELEMENT_INTERVAL_MIN_US 100000
+#define ELEMENT_INTERVAL_MAX_US 2000000
 #define BEACON_LOCK_ENTER_NS 2000000
 #define BEACON_LOCK_EXIT_NS 4000000
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_sta_associated_us;
 static uint8_t s_status_bssid[6];
 static int64_t s_beacon_applied_us;
+/* Three delivered element intervals, 0 until measured. */
+static int32_t s_beacon_window_us;
+static int64_t s_last_element_us;
+static int64_t s_element_interval_us;
 static int32_t s_beacon_error_ns;
 static bool s_beacon_error_valid, s_beacon_converged, s_beacon_was_locked;
 static uint8_t s_beacon_port_identity[10];
@@ -497,11 +504,18 @@ static int32_t status_clamp_ns(int64_t value_ns) {
   return (int32_t)value_ns;
 }
 
-/* A new time source: the station acquires again before it is locked. */
-static void beacon_status_new_source(void) {
+/* The station acquires again before it is locked. */
+static void beacon_status_reacquire(void) {
   portENTER_CRITICAL(&s_status_lock);
   s_beacon_applied_us = 0;
   s_beacon_error_valid = s_beacon_converged = s_beacon_was_locked = false;
+  portEXIT_CRITICAL(&s_status_lock);
+}
+
+/* A new time source: as above, and its AP identity is not known yet. */
+static void beacon_status_new_source(void) {
+  beacon_status_reacquire();
+  portENTER_CRITICAL(&s_status_lock);
   memset(s_beacon_port_identity, 0, sizeof(s_beacon_port_identity));
   portEXIT_CRITICAL(&s_status_lock);
 }
@@ -818,14 +832,24 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
   }
 }
 
+/* correctionField in ns, from its 2^-16 ns units. */
+static int64_t follow_up_correction_ns(const struct ptp_header_s *header) {
+  uint64_t scaled = 0;
+  for (int i = 0; i < 8; i++) {
+    scaled = (scaled << 8) | header->correction[i];
+  }
+  return (int64_t)scaled >> 16;
+}
+
 /* Vendor IE callback — fires for every Vendor IE in scanned/received
  * beacons and probe responses. Filters to our OUI and decodes the
- * combined FOLLOWUP IE the bridge publishes: an IEEE 802.1AS-2020
- * §12.7 Follow_Up (its preciseOriginTimestamp is the BTC marker) with
- * the bridge AP TSF µs appended (the AP-TSF marker). Both are captured
- * for the same beacon, giving the STA an atomic (BTC, AP-TSF) anchor;
- * combined with the STA's own TSF (the same counter as the AP TSF) it
- * disciplines its clock to BTC. FTM supplies only the link delay. */
+ * beacon time element the bridge publishes (AVB Wireless §2.4.1): an
+ * IEEE 802.1AS-2020 §12.7 Follow_Up (its preciseOriginTimestamp plus
+ * correctionField is the BTC marker) with the bridge AP TSF µs appended
+ * (the AP-TSF marker). Both are captured for the same beacon, giving
+ * the STA an atomic (BTC, AP-TSF) anchor; combined with the STA's own
+ * TSF (the same counter as the AP TSF) it disciplines its clock to BTC.
+ * FTM supplies only the link delay. */
 static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                          const uint8_t sa[6], const vendor_ie_data_t *vnd_ie,
                          int rssi) {
@@ -845,26 +869,39 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   int payload_len = (int)vnd_ie->length - 4;
   const uint8_t *payload = vnd_ie->payload;
 
-  /* Only the combined FOLLOWUP IE is published now; the AP-TSF marker
-   * rides its trailing bytes (parsed below) rather than a separate IE. */
-  if (vnd_ie->vendor_oui_type != PTP_VND_IE_OUI_TYPE_FOLLOWUP) {
+  /* The beacon time element starts with its sub-ID and may end with a
+   * capture bracket, which goes unused: the envelope below already
+   * follows the smallest gap. The earlier FOLLOWUP form has neither. */
+  const int markers_len =
+      PTP_VND_IE_FOLLOW_UP_LEN + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN;
+  bool length_valid;
+  if (vnd_ie->vendor_oui_type == PTP_VND_IE_OUI_TYPE_AVB_WIRELESS) {
+    if (payload_len < PTP_VND_IE_SUBID_LEN ||
+        payload[0] != PTP_VND_IE_SUBID0 ||
+        payload[1] != PTP_VND_IE_SUBID1_BEACON_TIME) {
+      return;
+    }
+    payload += PTP_VND_IE_SUBID_LEN;
+    payload_len -= PTP_VND_IE_SUBID_LEN;
+    length_valid = payload_len == markers_len ||
+                   payload_len == markers_len + PTP_VND_IE_CAPTURE_BRACKET_LEN;
+  } else if (vnd_ie->vendor_oui_type == PTP_VND_IE_OUI_TYPE_FOLLOWUP) {
+    length_valid = payload_len == markers_len;
+  } else {
     return;
   }
 
   static uint32_t s_seen = 0;
   ++s_seen;
 
-  /* Validate size: §12.7 Follow_Up payload + the appended AP-TSF marker
-   * (the bridge combines them into one IE for atomic BTC/TSF pairing). */
-  const int expect_len =
-      (int)sizeof(struct ptp_follow_up_s) + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN;
-  if (payload_len != expect_len) {
+  if (!length_valid) {
     if ((s_seen % 50) == 1) {
       ESP_LOGW(TAG,
-               "Beacon Vendor IE from %02x:%02x:%02x:%02x:%02x:%02x: "
-               "payload %d B (expected %d for §12.7 FU + AP-TSF). Skipped.",
-               sa[0], sa[1], sa[2], sa[3], sa[4], sa[5], payload_len,
-               expect_len);
+               "Beacon time element from %02x:%02x:%02x:%02x:%02x:%02x: "
+               "type 0x%02x, %d B after the identifier (expected %d). "
+               "Skipped.",
+               sa[0], sa[1], sa[2], sa[3], sa[4], sa[5],
+               vnd_ie->vendor_oui_type, payload_len, markers_len);
     }
     return;
   }
@@ -891,10 +928,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
   if ((s_seen % 50) == 1) {
     const uint8_t *gm = h->sourceidentity;
     uint16_t seq = ((uint16_t)h->sequenceid[0] << 8) | h->sequenceid[1];
-    int64_t correction_ns = 0;
-    for (int i = 0; i < 6; i++) {
-      correction_ns = (correction_ns << 8) | h->correction[i];
-    }
+    int64_t correction_ns = follow_up_correction_ns(h);
     uint64_t secs = 0;
     for (int i = 0; i < 6; i++) {
       secs = (secs << 8) | fu->origintimestamp[i];
@@ -928,7 +962,8 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                      ((uint32_t)fu->origintimestamp[7] << 16) |
                      ((uint32_t)fu->origintimestamp[8] << 8) |
                      (uint32_t)fu->origintimestamp[9];
-    s_gptp_marker_ns = (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs;
+    s_gptp_marker_ns = (int64_t)(secs * 1000000000ULL) + (int64_t)nsecs +
+                       follow_up_correction_ns(h);
     s_seen_gptp = true;
     /* The element's sourcePortIdentity is the AP's wireless port. */
     portENTER_CRITICAL(&s_status_lock);
@@ -941,7 +976,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
    * Follow_Up in the combined IE — atomically paired with the BTC marker
    * above (both captured for the same beacon on the bridge). */
   {
-    const uint8_t *tsf = payload + sizeof(struct ptp_follow_up_s);
+    const uint8_t *tsf = payload + PTP_VND_IE_FOLLOW_UP_LEN;
     int64_t tsf_us = 0;
     for (int i = 0; i < PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN; i++) {
       tsf_us |= ((int64_t)tsf[i]) << (8 * i);
@@ -967,6 +1002,38 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     return;
   }
   memcpy(s_last_origin_ts, fu->origintimestamp, sizeof(s_last_origin_ts));
+
+  /* The station's driver passes on about one beacon in ten (1.024 s at
+   * 100 TU), so the receipt and lock windows are three delivered element
+   * intervals, as syncReceiptTimeout is three Sync intervals. */
+  int64_t element_us = esp_timer_get_time();
+  if (s_last_element_us) {
+    int64_t interval_us = element_us - s_last_element_us;
+    if (interval_us < ELEMENT_INTERVAL_MIN_US) interval_us = ELEMENT_INTERVAL_MIN_US;
+    if (interval_us > ELEMENT_INTERVAL_MAX_US) interval_us = ELEMENT_INTERVAL_MAX_US;
+    s_element_interval_us = s_element_interval_us
+        ? s_element_interval_us + (interval_us - s_element_interval_us) / 8
+        : interval_us;
+    int32_t window_us = (int32_t)(3 * s_element_interval_us);
+    ptpd_set_sync_receipt_window(s_port_index, window_us);
+    portENTER_CRITICAL(&s_status_lock);
+    s_beacon_window_us = window_us;
+    portEXIT_CRITICAL(&s_status_lock);
+  }
+  s_last_element_us = element_us;
+
+  /* Each fresh element is this port's Sync: it keeps the selected
+   * source's syncReceiptTimeout current, whether or not the envelope
+   * below applies it (it does not while acquiring). */
+  {
+    uint8_t source_port[10];
+    uint32_t generation;
+    memcpy(source_port, h->sourceidentity, 8);
+    memcpy(source_port + 8, h->sourceportindex, 2);
+    (void)ptpd_ftm_source_observed(s_port_index, source_port, h->domain,
+                                   (int8_t)h->logmessageinterval, element_us,
+                                   &generation);
+  }
 
   /* Discipline the clock to BTC in two layers, so the cross-chip pairing
    * gap can't corrupt the recovered rate:
@@ -1019,6 +1086,26 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     const int64_t OFF_DECAY_NS = 100000;                /* ~100 ppm drift follow */
     const int64_t OFF_DOWN_STEP_NS = 350LL * 1000 * 1000; /* > worst gap spike */
     const int OFF_DOWN_RUN = 8;                          /* sustained => real step */
+
+    /* A new gmTimeBaseIndicator marks a change of BTC (AVB
+     * Wireless §2.4.1): acquire again rather than wait for the step
+     * detectors below, which miss a small phase change. */
+    static bool s_have_time_base = false;
+    static uint16_t s_time_base;
+    const struct ptp_info_tlv_s *info =
+        (const struct ptp_info_tlv_s *)fu->informationtlv;
+    uint16_t time_base = ((uint16_t)info->gmtimebaseindicator[0] << 8) |
+                         info->gmtimebaseindicator[1];
+    if (s_have_time_base && time_base != s_time_base) {
+      ESP_LOGI(TAG, "BTC time base %u -> %u, acquiring again",
+               (unsigned)s_time_base, (unsigned)time_base);
+      s_acq = 0;
+      s_down_run = 0;
+      beacon_status_reacquire();
+    }
+    s_time_base = time_base;
+    s_have_time_base = true;
+
     int64_t off_err = offset_raw - s_off_filt;
 
     if (s_acq < ACQ_SAMPLES) {
@@ -1318,7 +1405,9 @@ int ptpd_wifi_sta_status(int port_index, ptpd_wifi_sta_status_t *status) {
   portENTER_CRITICAL(&s_status_lock);
   if (!mode_a) {
     applied_us = s_beacon_applied_us;
-    bool fresh = applied_us && now_us - applied_us <= STA_LOCK_WINDOW_US;
+    int64_t window_us = s_beacon_window_us ? s_beacon_window_us
+                                           : STA_LOCK_WINDOW_US;
+    bool fresh = applied_us && now_us - applied_us <= window_us;
     status->locked = fresh && s_beacon_converged;
     status->holdover = !fresh && s_beacon_was_locked;
     status->servo_error_valid = s_beacon_error_valid;

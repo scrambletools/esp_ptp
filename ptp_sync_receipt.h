@@ -32,15 +32,21 @@ static inline bool ptp_sync_receipt_current(const ptp_sync_receipt_t *state,
         now_us - state->received_us < state->interval_us;
 }
 
+static inline bool ptp_sync_receipt_observe_window(ptp_sync_receipt_t *state,
+    int64_t received_us, int64_t window_us, int64_t now_us)
+{
+    if (window_us <= 0 || received_us < 0 || now_us < received_us ||
+        now_us - received_us >= window_us ||
+        (state->armed && received_us < state->received_us)) return false;
+    ptp_sync_receipt_start(state, received_us, window_us);
+    return true;
+}
+
 static inline bool ptp_sync_receipt_observe(ptp_sync_receipt_t *state,
     int64_t received_us, int8_t logarithm, int64_t now_us)
 {
-    int64_t interval = ptp_sync_receipt_interval(logarithm);
-    if (!interval || received_us < 0 || now_us < received_us ||
-        now_us - received_us >= interval ||
-        (state->armed && received_us < state->received_us)) return false;
-    ptp_sync_receipt_start(state, received_us, interval);
-    return true;
+    return ptp_sync_receipt_observe_window(state, received_us,
+        ptp_sync_receipt_interval(logarithm), now_us);
 }
 
 static inline int ptp_sync_receipt_wait_ms(const ptp_sync_receipt_t *state,

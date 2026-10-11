@@ -43,6 +43,9 @@ extern esp_err_t esp_hosted_register_custom_callback(
 
 static const char *TAG = "ptp_beacon_ie";
 
+_Static_assert(sizeof(struct ptp_follow_up_s) == PTP_VND_IE_FOLLOW_UP_LEN,
+               "the beacon time element carries a 76-byte Follow_Up");
+
 /* OUI / sub-types are shared with the coprocessor RPC handler and
  * STA parser via ptp_rpc_proto.h. */
 
@@ -92,16 +95,20 @@ static QueueHandle_t s_fu_mbox;
 
 static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
   /* Wire frame: ptp_rpc_set_vendor_ie_t header + vendor_ie_data_t.
-   * Vendor IE layout per 802.11 9.4.2.25 + 802.1AS §12.7 Figure 12-8. */
-  /* One combined IE: the §12.7 FollowUpInformation followed by an 8-byte
-   * AP-TSF marker. BTC (preciseOriginTimestamp, in fu_info) and the
-   * AP-TSF thus travel atomically paired in a single beacon IE — the STA
-   * needs both from the same instant to map its STA TSF onto BTC. The host
-   * cannot read the AP TSF (the remote esp_wifi_get_tsf_time returns -1),
-   * so it leaves a zero placeholder; the coprocessor patches the live TSF
-   * into the IE's trailing bytes before publishing. */
-  uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + fu_info_len +
-              PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
+   * Beacon time element per AVB Wireless §2.4.1: OUI and sub-ID, the
+   * §12.7 Follow_Up (BTC marker), then the AP TSF, so the STA gets both
+   * markers from the same instant. The host cannot read the AP TSF (the
+   * remote esp_wifi_get_tsf_time returns -1), so it leaves a zero
+   * placeholder that the coprocessor patches before publishing. No
+   * capture bracket: gPTP and the radio are on separate chips, so the
+   * gap is not known here. */
+  if (fu_info == NULL || fu_info_len != PTP_VND_IE_FOLLOW_UP_LEN) {
+    ESP_LOGW(TAG, "Follow_Up of %zu B, expected %d; not published",
+             fu_info_len, PTP_VND_IE_FOLLOW_UP_LEN);
+    return;
+  }
+  uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + PTP_VND_IE_SUBID_LEN +
+              PTP_VND_IE_FOLLOW_UP_LEN + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
   memset(buf, 0, sizeof(buf));
 
   ptp_rpc_set_vendor_ie_t *hdr = (ptp_rpc_set_vendor_ie_t *)buf;
@@ -112,18 +119,14 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
 
   uint8_t *ie = buf + sizeof(*hdr);
   ie[0] = WIFI_VENDOR_IE_ELEMENT_ID; /* 0xDD */
-  ie[1] = (uint8_t)(4 + fu_info_len + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN);
+  ie[1] = (uint8_t)(sizeof(buf) - sizeof(*hdr) - 2);
   ie[2] = PTP_VND_IE_OUI0;
   ie[3] = PTP_VND_IE_OUI1;
   ie[4] = PTP_VND_IE_OUI2;
-  ie[5] = PTP_VND_IE_OUI_TYPE_FOLLOWUP;
-  if (fu_info != NULL && fu_info_len > 0) {
-    memcpy(ie + 6, fu_info, fu_info_len);
-  }
-  /* The trailing PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN bytes stay zero here:
-   * the coprocessor patches the live AP TSF into them at publish (it owns
-   * the radio and is the only side where esp_wifi_get_tsf_time(WIFI_IF_AP)
-   * is valid). */
+  ie[5] = PTP_VND_IE_OUI_TYPE_AVB_WIRELESS;
+  ie[6] = PTP_VND_IE_SUBID0;
+  ie[7] = PTP_VND_IE_SUBID1_BEACON_TIME;
+  memcpy(ie + 6 + PTP_VND_IE_SUBID_LEN, fu_info, fu_info_len);
 
   esp_err_t r = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ, buf,
                                             sizeof(buf));
@@ -132,16 +135,15 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
              esp_err_to_name(r));
   } else if (!s_acked_at_least_once) {
     ESP_LOGI(TAG,
-             "Beacon Vendor IE publish dispatched on port %d "
-             "(OUI %02x:%02x:%02x type %d, payload %zu B). Subsequent "
+             "Beacon time element publish dispatched on port %d "
+             "(%02x:%02x:%02x:%02x:%02x:%02x, length %u). Subsequent "
              "publishes are silent unless an error occurs.",
              PTP_BEACON_IE_PORT, PTP_VND_IE_OUI0, PTP_VND_IE_OUI1,
-             PTP_VND_IE_OUI2, PTP_VND_IE_OUI_TYPE_FOLLOWUP, fu_info_len);
+             PTP_VND_IE_OUI2, PTP_VND_IE_OUI_TYPE_AVB_WIRELESS,
+             PTP_VND_IE_SUBID0, PTP_VND_IE_SUBID1_BEACON_TIME,
+             (unsigned)ie[1]);
     s_acked_at_least_once = true;
   }
-
-  /* The separate slot-1 TSF-mapping IE is gone: the AP TSF now rides the
-   * combined FU IE above, atomically paired with BTC. */
 }
 
 static void republish_task(FAR void *arg) {

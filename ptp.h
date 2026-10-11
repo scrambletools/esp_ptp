@@ -220,6 +220,10 @@ bool ptp_wifi_sta_media(int port_index, ptp_wifi_media_t *media);
 void ptp_wifi_sta_capability_status(int port_index, uint8_t port_identity[10],
                                     uint8_t *reason);
 
+/* Defined in ptp.c. Sets the port's Sync receipt timeout, 0 for three
+ * Sync intervals. */
+void ptpd_set_sync_receipt_window(int port_index, int32_t window_us);
+
 /* Defined in ptp_beacon_ie.c (only compiled when
  * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y). Registers the §12.7
  * FollowUpInformation beacon-IE publisher as ptpd's sync_egress_cb
