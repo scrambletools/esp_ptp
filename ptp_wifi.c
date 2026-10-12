@@ -841,6 +841,23 @@ static int64_t follow_up_correction_ns(const struct ptp_header_s *header) {
   return (int64_t)scaled >> 16;
 }
 
+/* lastGmPhaseChange in ns, false when it does not fit 64 bits. The field
+ * is a ScaledNs, a signed 96-bit count of 2^-16 ns, so the ns are its top
+ * 80 bits, which fit when the first 16 only extend the sign. */
+static bool follow_up_phase_change_ns(const struct ptp_info_tlv_s *info,
+                                      int64_t *phase_ns) {
+  const uint8_t *scaled = info->lastgmphasechange;
+  uint8_t sign_extension = (scaled[2] & 0x80) ? 0xFF : 0x00;
+  if (scaled[0] != sign_extension || scaled[1] != sign_extension)
+    return false;
+  uint64_t value = 0;
+  for (int i = 2; i < 10; i++) {
+    value = (value << 8) | scaled[i];
+  }
+  *phase_ns = (int64_t)value;
+  return true;
+}
+
 /* Vendor IE callback — fires for every Vendor IE in scanned/received
  * beacons and probe responses. Filters to our OUI and decodes the
  * beacon time element the bridge publishes (AVB Wireless §2.4.1): an
@@ -1087,9 +1104,12 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     const int64_t OFF_DOWN_STEP_NS = 350LL * 1000 * 1000; /* > worst gap spike */
     const int OFF_DOWN_RUN = 8;                          /* sustained => real step */
 
-    /* A new gmTimeBaseIndicator marks a change of BTC (AVB
-     * Wireless §2.4.1): acquire again rather than wait for the step
-     * detectors below, which miss a small phase change. */
+    /* A new gmTimeBaseIndicator marks a change of BTC (AVB Wireless
+     * §2.4.1). Its lastGmPhaseChange, where known and within the step
+     * thresholds below, moves the offset, so a brief change costs no lock,
+     * as when the access point loses its upstream and carries on as BTC
+     * (§2.4.3). A larger or unknown one acquires again rather than wait
+     * for the step detectors. */
     static bool s_have_time_base = false;
     static uint16_t s_time_base;
     const struct ptp_info_tlv_s *info =
@@ -1097,11 +1117,21 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     uint16_t time_base = ((uint16_t)info->gmtimebaseindicator[0] << 8) |
                          info->gmtimebaseindicator[1];
     if (s_have_time_base && time_base != s_time_base) {
-      ESP_LOGI(TAG, "BTC time base %u -> %u, acquiring again",
-               (unsigned)s_time_base, (unsigned)time_base);
-      s_acq = 0;
-      s_down_run = 0;
-      beacon_status_reacquire();
+      int64_t phase_ns;
+      if (follow_up_phase_change_ns(info, &phase_ns) &&
+          phase_ns <= OFF_STEP_NS && phase_ns >= -OFF_DOWN_STEP_NS) {
+        ESP_LOGI(TAG, "BTC time base %u -> %u, phase change %lld ns applied",
+                 (unsigned)s_time_base, (unsigned)time_base,
+                 (long long)phase_ns);
+        s_off_filt += phase_ns;
+        s_down_run = 0;
+      } else {
+        ESP_LOGI(TAG, "BTC time base %u -> %u, acquiring again",
+                 (unsigned)s_time_base, (unsigned)time_base);
+        s_acq = 0;
+        s_down_run = 0;
+        beacon_status_reacquire();
+      }
     }
     s_time_base = time_base;
     s_have_time_base = true;

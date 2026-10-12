@@ -584,6 +584,18 @@ struct ptp_state_s {
   bool upstream_gm_fields_valid;
   bool gm_fields_own;
   uint16_t own_time_base_indicator;
+  /* The time base fields the element last carried, the BTC they
+   * describe, the local clock updates by then, and its jumps up to the
+   * last change or steady relay, which a next change reports beyond. */
+  bool published_gm_valid;
+  uint8_t published_btc[8];
+  uint8_t published_gm_fields[PTP_GM_FIELDS_LEN];
+  uint32_t published_clock_updates;
+  int64_t phase_baseline_steps_ns;
+  /* Local clock updates from the selected source, and the sum of the
+   * jumps among them. */
+  uint32_t clock_updates;
+  int64_t clock_steps_ns;
   bool eth_event_handler_registered;
   bool wifi_event_handler_registered;
 };
@@ -2231,29 +2243,85 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   return ret;
 }
 
+/* lastGmPhaseChange as a ScaledNs, a signed 96-bit count of 2^-16 ns. */
+static void ptp_scaled_ns_from_ns(int64_t value_ns, uint8_t scaled[12]) {
+  uint8_t sign_extension = value_ns < 0 ? 0xff : 0x00;
+  scaled[0] = sign_extension;
+  scaled[1] = sign_extension;
+  for (int i = 0; i < 8; i++) {
+    scaled[2 + i] = (uint8_t)((uint64_t)value_ns >> (56 - 8 * i));
+  }
+  scaled[10] = 0;
+  scaled[11] = 0;
+}
+
 /* Time base fields of a Follow_Up this instance originates: relayed
  * from the selected source (802.1AS-2020 10.2.2.3.11 to 10.2.2.3.13),
  * or its own while it is BTC. On becoming BTC it takes an indicator
  * other than the one relayed last, so stations see the change (AVB
- * Wireless §2.4.1). Its time continues the previous BTC's, so
- * lastGmPhaseChange stays zero. */
+ * Wireless §2.4.1).
+ *
+ * lastGmPhaseChange is what a station applies when the indicator
+ * changes (§2.4.3), so it reports the step in the time this instance
+ * publishes: zero on becoming BTC, where its clock carries on. A change
+ * while relaying, to a BTC rejoined or new or to the BTC's new time
+ * base, is published once the local clock has updated from it, with
+ * the jumps it made since it last relayed steadily or published a
+ * change, zero where it slews. A jump while its own BTC, as it locks to
+ * a new source, so counts toward the change that follows. */
 static void ptp_fill_gm_fields(FAR struct ptp_state_s *state,
                                FAR struct ptp_info_tlv_s *tlv) {
-  if (state->selected_source_valid && state->upstream_gm_fields_valid) {
-    memcpy(tlv->gmtimebaseindicator, state->upstream_gm_fields,
-           PTP_GM_FIELDS_LEN);
+  uint8_t fields[PTP_GM_FIELDS_LEN] = {0};
+  const uint8_t *btc;
+  bool relaying = state->selected_source_valid &&
+                  state->upstream_gm_fields_valid;
+  if (relaying) {
+    memcpy(fields, state->upstream_gm_fields, PTP_GM_FIELDS_LEN);
+    btc = state->selected_source.btc_identity;
     state->gm_fields_own = false;
-    return;
+  } else {
+    if (!state->gm_fields_own) {
+      uint16_t relayed = ((uint16_t)state->upstream_gm_fields[0] << 8) |
+                         state->upstream_gm_fields[1];
+      state->own_time_base_indicator = relayed + 1;
+      state->gm_fields_own = true;
+      ptpinfo("Own time base indicator %u", state->own_time_base_indicator);
+    }
+    fields[0] = state->own_time_base_indicator >> 8;
+    fields[1] = state->own_time_base_indicator & 0xff;
+    btc = state->own_identity.btc_identity;
   }
-  if (!state->gm_fields_own) {
-    uint16_t relayed = ((uint16_t)state->upstream_gm_fields[0] << 8) |
-                       state->upstream_gm_fields[1];
-    state->own_time_base_indicator = relayed + 1;
-    state->gm_fields_own = true;
-    ptpinfo("Own time base indicator %u", state->own_time_base_indicator);
+
+  bool changed = state->published_gm_valid &&
+                 (memcmp(btc, state->published_btc, 8) != 0 ||
+                  memcmp(fields, state->published_gm_fields, 2) != 0);
+  if (!changed) {
+    if (state->published_gm_valid)
+      memcpy(&fields[2], &state->published_gm_fields[2], 12);
+    if (!state->published_gm_valid || relaying)
+      state->phase_baseline_steps_ns = state->clock_steps_ns;
+  } else if (!relaying) {
+    ptp_scaled_ns_from_ns(0, &fields[2]);
+    state->phase_baseline_steps_ns = state->clock_steps_ns;
+  } else {
+    if (state->clock_updates == state->published_clock_updates) {
+      memcpy(tlv->gmtimebaseindicator, state->published_gm_fields,
+             PTP_GM_FIELDS_LEN);
+      return;
+    }
+    int64_t jump_ns = state->clock_steps_ns - state->phase_baseline_steps_ns;
+    state->phase_baseline_steps_ns = state->clock_steps_ns;
+    ptp_scaled_ns_from_ns(jump_ns, &fields[2]);
+    ptpinfo("Time base %u to %u, phase change %lld ns",
+            ((unsigned)state->published_gm_fields[0] << 8) |
+                state->published_gm_fields[1],
+            ((unsigned)fields[0] << 8) | fields[1], (long long)jump_ns);
   }
-  tlv->gmtimebaseindicator[0] = state->own_time_base_indicator >> 8;
-  tlv->gmtimebaseindicator[1] = state->own_time_base_indicator & 0xff;
+  memcpy(state->published_btc, btc, 8);
+  memcpy(state->published_gm_fields, fields, PTP_GM_FIELDS_LEN);
+  state->published_clock_updates = state->clock_updates;
+  state->published_gm_valid = true;
+  memcpy(tlv->gmtimebaseindicator, fields, PTP_GM_FIELDS_LEN);
 }
 
 /* Marshal a 76-byte §12.7 FollowUpInformation: 34-byte common
@@ -3294,6 +3362,9 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
     clock_timespec_subtract(&new_time, local_timestamp, &new_time);
     clock_timespec_add(&new_time, remote_timestamp, &new_time);
     ret = ptp_settime(state, &new_time);
+    if (ret == OK)
+      state->clock_steps_ns +=
+          timespec_delta_ns(remote_timestamp, local_timestamp);
 
     /* Reinitialize drift adjustment parameters */
 
@@ -3314,6 +3385,7 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
   } else {
     ptp_lock_local_clock_freq(state, remote_timestamp, local_timestamp);
   }
+  state->clock_updates++;
 
   return ret;
 }
