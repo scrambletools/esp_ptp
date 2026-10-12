@@ -1086,23 +1086,35 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
      *  - Acquire: over the first ACQ_SAMPLES, peak-hold the min-gap offset
      *    WITHOUT disciplining (clock free-runs); the first post-acquire
      *    inject is then one clean jump, not a long slew.
-     *  - Track (peak-hold + slow decay): rise toward cleaner samples but
-     *    cap the step below the servo slew so it never rails; decay slowly
-     *    to follow the BTC<->AP-TSF crystal drift (ignoring how deep each
-     *    gap dips); snap on a genuine step (large upward, or a sustained
-     *    large-downward run that isn't just a transient gap spike). The
-     *    rate rides the live STA TSF, so the residual offset is ~the floor
-     *    (min gap) instead of the mean gap. */
+     *  - Track: the envelope follows the BTC<->AP-TSF crystal drift as a
+     *    learned slope. It rises toward cleaner samples at once (capped
+     *    below the servo slew so it never rails) and moves down only once
+     *    per window, toward that window's best sample, which also trims
+     *    the slope. A fixed per-sample decay instead fell about 100 ppm
+     *    whenever every sample carried a gap, as when the station's own
+     *    stream loads the bridge's SDIO path, and the clock drifted
+     *    milliseconds late. Snap on a genuine step (large upward, or a
+     *    sustained large-downward run that isn't a transient gap spike).
+     *    The rate rides the live STA TSF, so the residual offset is ~the
+     *    floor (min gap) instead of the mean gap. */
     static int s_acq = 0;
     static int64_t s_off_filt;
     static int s_down_run = 0;
+    static int64_t s_slope_ppb;      /* learned envelope drift, ns per s */
+    static int64_t s_last_tsf_us;    /* TSF at the previous envelope update */
+    static int s_window_samples;
+    static int64_t s_window_best;    /* largest off_err in the window */
+    static int64_t s_window_start_tsf_us;
     const int ACQ_SAMPLES = 16;
     const int64_t OFF_STEP_NS = 100LL * 1000 * 1000;     /* up step => snap+jump */
     const int OFF_UP_SHIFT = 1;                          /* rise fast to floor */
     const int64_t OFF_UP_MAX_NS = 400000;               /* but <= ~slew/sample */
-    const int64_t OFF_DECAY_NS = 100000;                /* ~100 ppm drift follow */
     const int64_t OFF_DOWN_STEP_NS = 350LL * 1000 * 1000; /* > worst gap spike */
     const int OFF_DOWN_RUN = 8;                          /* sustained => real step */
+    const int WINDOW_SAMPLES = 8;     /* ~8 s of delivered elements */
+    const int WINDOW_DOWN_SHIFT = 2;  /* move a quarter of the way down */
+    const int SLOPE_GAIN_SHIFT = 5;   /* slope += best error / window / 32 */
+    const int64_t SLOPE_MAX_PPB = 200000;
 
     /* A new gmTimeBaseIndicator marks a change of BTC (AVB Wireless
      * §2.4.1). Its lastGmPhaseChange, where known and within the step
@@ -1125,6 +1137,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                  (long long)phase_ns);
         s_off_filt += phase_ns;
         s_down_run = 0;
+        s_window_samples = 0;
       } else {
         ESP_LOGI(TAG, "BTC time base %u -> %u, acquiring again",
                  (unsigned)s_time_base, (unsigned)time_base);
@@ -1136,6 +1149,10 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     s_time_base = time_base;
     s_have_time_base = true;
 
+    if (s_acq >= ACQ_SAMPLES) {
+      s_off_filt += s_slope_ppb * (sta_tsf_us - s_last_tsf_us) / 1000000;
+    }
+    s_last_tsf_us = sta_tsf_us;
     int64_t off_err = offset_raw - s_off_filt;
 
     if (s_acq < ACQ_SAMPLES) {
@@ -1143,15 +1160,19 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
         s_off_filt = offset_raw; /* peak-hold the min-gap sample */
       }
       s_acq++;
+      s_slope_ppb = 0;
+      s_window_samples = 0;
       static uint32_t s_acq_log = 0;
       if ((++s_acq_log % 8) == 1) {
         ESP_LOGI(TAG, "BTC discipline: acquiring offset %d/%d", s_acq,
                  ACQ_SAMPLES);
       }
     } else {
+      bool snapped = false;
       if (off_err > OFF_STEP_NS) {
         s_off_filt = offset_raw; /* large upward: real step / recovery, snap */
         s_down_run = 0;
+        snapped = true;
       } else if (off_err > 0) {
         int64_t up = off_err >> OFF_UP_SHIFT;
         if (up > OFF_UP_MAX_NS) {
@@ -1162,10 +1183,33 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
       } else if (off_err < -OFF_DOWN_STEP_NS && ++s_down_run >= OFF_DOWN_RUN) {
         s_off_filt = offset_raw; /* sustained deep-down: genuine downward step */
         s_down_run = 0;
+        snapped = true;
+      } else if (off_err >= -OFF_DOWN_STEP_NS) {
+        s_down_run = 0;
+      }
+      if (snapped) {
+        s_window_samples = 0;
       } else {
-        s_off_filt -= OFF_DECAY_NS; /* higher gap: ignore depth, slow decay */
-        if (off_err >= -OFF_DOWN_STEP_NS) {
-          s_down_run = 0;
+        if (s_window_samples == 0 || off_err > s_window_best) {
+          s_window_best = off_err;
+        }
+        if (s_window_samples++ == 0) {
+          s_window_start_tsf_us = sta_tsf_us;
+        }
+        int64_t window_us = sta_tsf_us - s_window_start_tsf_us;
+        if (s_window_samples >= WINDOW_SAMPLES && window_us > 0) {
+          /* The window's best sample has the smallest gap. Above the
+           * envelope it was already risen to; below it, every sample had
+           * a gap or the envelope is drifting high, so come down part of
+           * the way. Either error trims the slope. */
+          if (s_window_best < 0) {
+            s_off_filt += s_window_best >> WINDOW_DOWN_SHIFT;
+          }
+          s_slope_ppb += ((s_window_best * 1000000 / window_us) >>
+                          SLOPE_GAIN_SHIFT);
+          if (s_slope_ppb > SLOPE_MAX_PPB) s_slope_ppb = SLOPE_MAX_PPB;
+          if (s_slope_ppb < -SLOPE_MAX_PPB) s_slope_ppb = -SLOPE_MAX_PPB;
+          s_window_samples = 0;
         }
       }
       int64_t btc_now_ns = s_off_filt + sta_tsf_us * 1000;
@@ -1176,9 +1220,10 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
       static uint32_t s_disc_seen = 0;
       if ((++s_disc_seen % 25) == 1) {
         ESP_LOGI(TAG,
-                 "BTC discipline: off=%lld ns gap=%lld ns link_delay=%lld ns",
+                 "BTC discipline: off=%lld ns gap=%lld ns link_delay=%lld ns "
+                 "slope=%lld ppb",
                  (long long)off_ns, (long long)off_err,
-                 (long long)s_peer_delay_ns);
+                 (long long)s_peer_delay_ns, (long long)s_slope_ppb);
       }
     }
   }
