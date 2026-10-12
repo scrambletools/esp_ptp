@@ -1,10 +1,10 @@
-version: "1.6.0"
+version: "1.7.0"
 description: "PTP implementation for ESP32"
 url: "https://github.com/scrambletoolsllc/esp_ptp"
 license: "Apache-2.0"
 dependencies:
   idf: ^6.0
-  scrambletools/esp_ptp_rpc: ">=0.2.0"
+  scrambletools/esp_ptp_rpc: ">=0.3.0"
 targets:
   - esp32p4
   - esp32c6
