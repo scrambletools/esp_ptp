@@ -1458,13 +1458,19 @@ static bool is_selected_source_valid(FAR struct ptp_state_s *state) {
 bool ptpd_ftm_source_observed(int port_index, const uint8_t source_port[10],
                              uint8_t domain, int8_t log_interval, int64_t received_us, uint32_t *generation)
 {
+  /* The beacon element is one broadcast for every station, so it carries
+   * the access point's physical wireless port, while each station's
+   * Announce comes from its own per-association port (slot 1 and up get
+   * a reserved port number). Match the clock identity only: comparing
+   * ports too never matched for a second station, whose source then
+   * timed out every receipt window. */
   if (!s_state || !source_port || !generation || !s_use_sw_clock ||
       port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS ||
       !s_state->port[port_index].link_up || !s_state->selected_source_valid ||
       !ptp_is_gptp(s_state) || s_state->selected_source.btc_priority1 == 255 ||
       domain != CONFIG_ESP_PTP_DOMAIN ||
-      memcmp(source_port, s_state->selected_source.header.sourceidentity, 8) ||
-      memcmp(source_port + 8, s_state->selected_source.header.sourceportindex, 2)) return false;
+      memcmp(source_port, s_state->selected_source.header.sourceidentity, 8))
+    return false;
   int32_t window_us = s_state->port[port_index].receipt_window_us;
   ptp_sync_receipt_t *receipt = &s_state->port[port_index].sync_receipt;
   bool observed = window_us > 0
