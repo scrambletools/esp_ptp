@@ -38,6 +38,10 @@ bool ptpd_wifi_association_snapshot(int port_index,
 bool ptpd_wifi_association_reconcile(int port_index, uint32_t radio_boot,
     uint32_t radio_generation, const uint8_t macs[][6], unsigned count);
 
+/* The radio does not report its associations: serve the stations the host's
+ * association events give until it does. */
+void ptpd_wifi_association_unreported(int port_index);
+
 /* Copied STA timing ownership, independent of the AP registry wire format. */
 typedef struct {
     uint32_t association, revision;

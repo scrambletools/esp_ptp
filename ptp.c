@@ -726,6 +726,8 @@ bool ptpd_wifi_association_reconcile(int port_index, uint32_t radio_boot,
       accepted = ptp_wifi_peers_reconcile(&port->wifi_peers, radio_boot,
                                            radio_generation, macs, count);
       changed = accepted && previous != port->wifi_peers.generation;
+      if (accepted)
+        port->wifi_peers.unreported = false;
     }
   }
   portEXIT_CRITICAL(&s_peer_lock);
@@ -735,6 +737,26 @@ bool ptpd_wifi_association_reconcile(int port_index, uint32_t radio_boot,
     portEXIT_CRITICAL(&s_injected_lock);
   }
   return accepted;
+}
+
+void ptpd_wifi_association_unreported(int port_index) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_PTP_NUM_PORTS) return;
+  bool changed = false;
+  portENTER_CRITICAL(&s_peer_lock);
+  if (s_state) {
+    struct ptp_port_s *port = &s_state->port[port_index];
+    if (port->medium == ptp_port_medium_wifi_ftm &&
+        port->wifi_mode == ptp_port_wifi_mode_ap && !port->wifi_peers.unreported) {
+      port->wifi_peers.unreported = true;
+      changed = true;
+    }
+  }
+  portEXIT_CRITICAL(&s_peer_lock);
+  if (changed) {
+    portENTER_CRITICAL(&s_injected_lock);
+    ++s_injected_generation[port_index];
+    portEXIT_CRITICAL(&s_injected_lock);
+  }
 }
 
 uint32_t ptpd_wifi_announce_begin(int port_index, const uint8_t mac[6],
@@ -1799,6 +1821,11 @@ static int ptp_port_init_wifi_ftm(FAR struct ptp_state_s *state, int port_index,
     if (ptp_beacon_ie_attach(port_index) != 0) {
       ptpwarn("port %d (wifi_ftm AP): ptp_beacon_ie_attach failed — "
               "STAs will not see §12.7 FollowUpInformation in beacons\n",
+              port_index);
+    }
+    if (ptp_radio_association_attach(port_index) != 0) {
+      ptpwarn("port %d (wifi_ftm AP): ptp_radio_association_attach failed, "
+              "stations will not get Announce\n",
               port_index);
     }
   }

@@ -234,6 +234,13 @@ void ptpd_set_sync_receipt_window(int port_index, int32_t window_us);
  * variant is a no-op (weak symbol below). */
 int ptp_beacon_ie_attach(int port_index);
 
+/* Defined in ptp_radio_association.c (only compiled when
+ * CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR=y). Keeps the AP port's peers
+ * reconciled to the coprocessor's association reports, which gate the
+ * stations' Announce and Signaling. Called with ptp_beacon_ie_attach.
+ * Returns 0 on success, negative errno otherwise. */
+int ptp_radio_association_attach(int port_index);
+
 /* Defined in ptp_wifi.c. Emits one unicast 802.1AS Announce per
  * currently-associated STA on a wifi_ftm/AP port. Per IEEE 802.1AS-
  * 2020 §12.2, media-independent messages (Announce, Signaling) are

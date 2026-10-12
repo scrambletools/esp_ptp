@@ -18,15 +18,19 @@ typedef struct {
 
 typedef struct {
     uint32_t generation, radio_boot, radio_generation, reconciled_generation;
+    /* The radio does not report its associations; the host's events stand. */
+    bool unreported;
     ptp_wifi_peer_t entries[PTP_WIFI_PEERS_MAX];
 } ptp_wifi_peers_t;
 
-/* Hosted AP identities are publishable only after authoritative reconciliation. */
+/* Hosted AP identities are publishable only after authoritative reconciliation,
+ * or from the host's events where the radio does not report. */
 static inline bool ptp_wifi_peers_publishable(const ptp_wifi_peers_t *peers)
 {
 #if CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
-    return peers && peers->radio_boot && peers->radio_generation &&
-           peers->reconciled_generation == peers->generation;
+    return peers && (peers->unreported ||
+           (peers->radio_boot && peers->radio_generation &&
+            peers->reconciled_generation == peers->generation));
 #else
     return peers != NULL;
 #endif
