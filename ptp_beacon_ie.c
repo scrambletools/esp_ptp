@@ -7,7 +7,7 @@
  *
  * Dispatched via esp_hosted custom RPC because the host's local
  * esp_wifi_set_vendor_ie() is a no-op (no radio on this side);
- * esp_ptp_rpc on the coprocessor calls it locally where the radio
+ * esp_hosted_avb on the coprocessor calls it locally where the radio
  * actually lives.
  */
 
@@ -17,7 +17,7 @@
 
 #include "esp_ptp.h"
 #include "ptp.h"
-#include "ptp_rpc_proto.h"
+#include "hosted_avb_proto.h"
 
 #include "esp_err.h"
 #include "esp_event.h"
@@ -47,7 +47,7 @@ _Static_assert(sizeof(struct ptp_follow_up_s) == PTP_VND_IE_FOLLOW_UP_LEN,
                "the beacon time element carries a 76-byte Follow_Up");
 
 /* OUI / sub-types are shared with the coprocessor RPC handler and
- * STA parser via ptp_rpc_proto.h. */
+ * STA parser via hosted_avb_proto.h. */
 
 #if defined(CONFIG_ESP_PTP_PORT0_MEDIUM_WIFI_FTM) &&                           \
     defined(CONFIG_ESP_PTP_PORT0_WIFI_MODE_AP)
@@ -63,12 +63,12 @@ static void on_set_vendor_ie_ack(uint32_t msg_id, const uint8_t *data,
                                  size_t data_len, void *user) {
   (void)msg_id;
   (void)user;
-  if (data_len < sizeof(ptp_rpc_set_vendor_ie_ack_t)) {
+  if (data_len < sizeof(hosted_avb_set_vendor_ie_ack_t)) {
     ESP_LOGW(TAG, "SET_VENDOR_IE_ACK payload too small (%zu)", data_len);
     return;
   }
-  const ptp_rpc_set_vendor_ie_ack_t *ack =
-      (const ptp_rpc_set_vendor_ie_ack_t *)data;
+  const hosted_avb_set_vendor_ie_ack_t *ack =
+      (const hosted_avb_set_vendor_ie_ack_t *)data;
   if (ack->esp_err != 0) {
     ESP_LOGE(TAG, "ACK: coprocessor returned %ld", (long)ack->esp_err);
   }
@@ -94,7 +94,7 @@ typedef struct {
 static QueueHandle_t s_fu_mbox;
 
 static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
-  /* Wire frame: ptp_rpc_set_vendor_ie_t header + vendor_ie_data_t.
+  /* Wire frame: hosted_avb_set_vendor_ie_t header + vendor_ie_data_t.
    * Beacon time element per AVB Wireless §2.4.1: OUI and sub-ID, the
    * §12.7 Follow_Up (BTC marker), then the AP TSF, so the STA gets both
    * markers from the same instant. The host cannot read the AP TSF (the
@@ -107,11 +107,11 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
              fu_info_len, PTP_VND_IE_FOLLOW_UP_LEN);
     return;
   }
-  uint8_t buf[sizeof(ptp_rpc_set_vendor_ie_t) + 6 + PTP_VND_IE_SUBID_LEN +
+  uint8_t buf[sizeof(hosted_avb_set_vendor_ie_t) + 6 + PTP_VND_IE_SUBID_LEN +
               PTP_VND_IE_FOLLOW_UP_LEN + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN];
   memset(buf, 0, sizeof(buf));
 
-  ptp_rpc_set_vendor_ie_t *hdr = (ptp_rpc_set_vendor_ie_t *)buf;
+  hosted_avb_set_vendor_ie_t *hdr = (hosted_avb_set_vendor_ie_t *)buf;
   hdr->enable = 1;
   hdr->type = WIFI_VND_IE_TYPE_BEACON;
   hdr->idx = WIFI_VND_IE_ID_0;
@@ -128,8 +128,8 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
   ie[7] = PTP_VND_IE_SUBID1_BEACON_TIME;
   memcpy(ie + 6 + PTP_VND_IE_SUBID_LEN, fu_info, fu_info_len);
 
-  esp_err_t r = esp_hosted_send_custom_data(PTP_RPC_MSG_SET_VENDOR_IE_REQ, buf,
-                                            sizeof(buf));
+  esp_err_t r = esp_hosted_send_custom_data(HOSTED_AVB_MSG_SET_VENDOR_IE_REQ,
+                                            buf, sizeof(buf));
   if (r != ESP_OK) {
     ESP_LOGE(TAG, "esp_hosted_send_custom_data(SET_VENDOR_IE_REQ): %s",
              esp_err_to_name(r));
@@ -234,7 +234,7 @@ int ptp_beacon_ie_attach(int port_index) {
  * up and registration always succeeds. */
 __attribute__((constructor)) static void ptp_beacon_ie_autoreg(void) {
   (void)esp_event_loop_create_default();
-  (void)esp_hosted_register_custom_callback(PTP_RPC_MSG_SET_VENDOR_IE_ACK,
+  (void)esp_hosted_register_custom_callback(HOSTED_AVB_MSG_SET_VENDOR_IE_ACK,
                                             on_set_vendor_ie_ack, NULL);
 }
 

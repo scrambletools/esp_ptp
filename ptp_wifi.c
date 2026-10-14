@@ -58,7 +58,7 @@
 #include "ptp_ftm_rtt.h"
 #include "ptp_ftm_success.h"
 #include "ptp_ftm_clock.h"
-#include "ptp_rpc_proto.h"
+#include "hosted_avb_proto.h"
 
 /* esp_wifi_internal_tx is not in any public IDF header. Same forward-
  * declaration pattern as in esp_avb/avbnet.c. The wifi_remote layer

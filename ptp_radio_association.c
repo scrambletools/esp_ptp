@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Scramble Tools
  *
- * Host side of the coprocessor's association reports (esp_ptp_rpc
- * PTP_RPC_MSG_ASSOCIATIONS). The AP port sends a station Announce and
+ * Host side of the coprocessor's association reports (esp_hosted_avb
+ * HOSTED_AVB_MSG_ASSOCIATIONS). The AP port sends a station Announce and
  * gPTP-capable Signaling only once its peers are reconciled to the
  * radio's associations, which these reports keep current. A report
  * comes in behind the association event the coprocessor forwarded
@@ -15,7 +15,7 @@
 #ifdef CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
 
 #include "ptp.h"
-#include "ptp_rpc_proto.h"
+#include "hosted_avb_proto.h"
 #include "ptp_wifi_association.h"
 
 #include "esp_err.h"
@@ -54,12 +54,13 @@ static void on_associations(uint32_t msg_id, const uint8_t *data,
                             size_t data_len, void *user) {
   (void)msg_id;
   (void)user;
-  if (data == NULL || data_len != sizeof(ptp_rpc_associations_t)) {
+  if (data == NULL || data_len != sizeof(hosted_avb_associations_t)) {
     return;
   }
-  const ptp_rpc_associations_t *report = (const ptp_rpc_associations_t *)data;
-  if (report->version != PTP_RPC_ASSOCIATIONS_VERSION ||
-      report->count > PTP_RPC_ASSOCIATIONS_MAX) {
+  const hosted_avb_associations_t *report =
+      (const hosted_avb_associations_t *)data;
+  if (report->version != HOSTED_AVB_ASSOCIATIONS_VERSION ||
+      report->count > HOSTED_AVB_ASSOCIATIONS_MAX) {
     return;
   }
   /* A full event queue drops the report; the next refresh repeats it. */
@@ -72,14 +73,14 @@ static void reconcile_associations(void *arg, esp_event_base_t base,
   (void)arg;
   (void)base;
   (void)id;
-  const ptp_rpc_associations_t *report = data;
+  const hosted_avb_associations_t *report = data;
   if (s_port_index < 0 || report == NULL) {
     return;
   }
   s_any_report = true;
   bool new_boot = report->radio_boot != s_radio_boot;
   s_radio_boot = report->radio_boot;
-  if (!(report->flags & PTP_RPC_ASSOCIATIONS_FLAG_LIFECYCLE)) {
+  if (!(report->flags & HOSTED_AVB_ASSOCIATIONS_FLAG_LIFECYCLE)) {
     /* Not reporting changes yet, as before its first association, or
      * without the lifecycle patch: its list cannot be trusted. */
     if (new_boot) {
@@ -103,10 +104,10 @@ static void reconcile_associations(void *arg, esp_event_base_t base,
 }
 
 static void request_associations(void) {
-  static const uint8_t request = PTP_RPC_ASSOCIATIONS_VERSION;
+  static const uint8_t request = HOSTED_AVB_ASSOCIATIONS_VERSION;
   static esp_err_t s_last_result = ESP_OK;
-  esp_err_t result = esp_hosted_send_custom_data(PTP_RPC_MSG_ASSOCIATIONS_REQ,
-                                                 &request, sizeof(request));
+  esp_err_t result = esp_hosted_send_custom_data(
+      HOSTED_AVB_MSG_ASSOCIATIONS_REQ, &request, sizeof(request));
   /* Logged once a failure starts; an older coprocessor fails every time. */
   if (result != ESP_OK && result != s_last_result) {
     ESP_LOGW(TAG, "ASSOCIATIONS_REQ send failed: %s", esp_err_to_name(result));
@@ -139,7 +140,7 @@ int ptp_radio_association_attach(int port_index) {
   if (esp_event_handler_register(PTP_RADIO_ASSOCIATION_EVENT,
                                  ESP_EVENT_ANY_ID, reconcile_associations,
                                  NULL) != ESP_OK ||
-      esp_hosted_register_custom_callback(PTP_RPC_MSG_ASSOCIATIONS,
+      esp_hosted_register_custom_callback(HOSTED_AVB_MSG_ASSOCIATIONS,
                                           on_associations, NULL) != ESP_OK) {
     ESP_LOGE(TAG, "failed to register for association reports");
     return -EIO;

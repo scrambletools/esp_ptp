@@ -1,5 +1,6 @@
 idf_component_register(SRCS "ptp.c" "ptp_clock_sw.c" "ptp_beacon_ie.c" "ptp_radio_association.c" "ptp_wifi.c"
-                       PRIV_REQUIRES esp_eth esp_netif esp_timer esp_event esp_ptp_rpc esp_wifi
+                       PRIV_REQUIRES esp_eth esp_netif esp_timer esp_event esp_hosted_avb
+                                     esp_wifi
                        INCLUDE_DIRS "." "./include"
                        WHOLE_ARCHIVE)
 
