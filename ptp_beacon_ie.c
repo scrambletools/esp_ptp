@@ -17,6 +17,7 @@
 
 #include "esp_ptp.h"
 #include "ptp.h"
+#include "hosted_avb_peer.h"
 #include "hosted_avb_proto.h"
 
 #include "esp_err.h"
@@ -30,16 +31,6 @@
 #include <errno.h>
 #include <stddef.h>
 #include <string.h>
-
-/* Forward-declared instead of #included so we don't pull in a hard
- * dependency on espressif__esp_hosted; symbols only need to resolve
- * in builds gated by CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR. */
-extern esp_err_t esp_hosted_send_custom_data(uint32_t msg_id,
-                                             const uint8_t *data,
-                                             size_t data_len);
-extern esp_err_t esp_hosted_register_custom_callback(
-    uint32_t msg_id, void (*cb)(uint32_t, const uint8_t *, size_t, void *),
-    void *user);
 
 static const char *TAG = "ptp_beacon_ie";
 
@@ -128,10 +119,10 @@ static void publish_ies(FAR const uint8_t *fu_info, size_t fu_info_len) {
   ie[7] = PTP_VND_IE_SUBID1_BEACON_TIME;
   memcpy(ie + 6 + PTP_VND_IE_SUBID_LEN, fu_info, fu_info_len);
 
-  esp_err_t r = esp_hosted_send_custom_data(HOSTED_AVB_MSG_SET_VENDOR_IE_REQ,
-                                            buf, sizeof(buf));
+  esp_err_t r =
+      hosted_avb_peer_send(HOSTED_AVB_MSG_SET_VENDOR_IE_REQ, buf, sizeof(buf));
   if (r != ESP_OK) {
-    ESP_LOGE(TAG, "esp_hosted_send_custom_data(SET_VENDOR_IE_REQ): %s",
+    ESP_LOGE(TAG, "hosted_avb_peer_send(SET_VENDOR_IE_REQ): %s",
              esp_err_to_name(r));
   } else if (!s_acked_at_least_once) {
     ESP_LOGI(TAG,
@@ -234,8 +225,8 @@ int ptp_beacon_ie_attach(int port_index) {
  * up and registration always succeeds. */
 __attribute__((constructor)) static void ptp_beacon_ie_autoreg(void) {
   (void)esp_event_loop_create_default();
-  (void)esp_hosted_register_custom_callback(HOSTED_AVB_MSG_SET_VENDOR_IE_ACK,
-                                            on_set_vendor_ie_ack, NULL);
+  (void)hosted_avb_peer_register(HOSTED_AVB_MSG_SET_VENDOR_IE_ACK,
+                                 on_set_vendor_ie_ack, NULL);
 }
 
 #endif /* CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR */

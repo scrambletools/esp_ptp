@@ -8,13 +8,10 @@ target_sources(${COMPONENT_LIB} PRIVATE "ptp.c" "ptp_clock_sw.c" "ptp_beacon_ie.
                "ptp_wifi.c")
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)
 
-# Host-side ESP-Hosted symbols are referenced via forward declarations
-# in ptp_beacon_ie.c (see the comment block there). We don't list
-# espressif__esp_hosted in PRIV_REQUIRES because it's not present in
-# all projects using esp_ptp — only ones with a wifi_cp port have it.
-# The link succeeds because those builds pull espressif__esp_hosted
-# in transitively (the host application uses esp_wifi_remote, which
-# depends on esp_hosted).
+# ESP-Hosted peer data goes through esp_hosted_avb's hosted_avb_peer_*
+# calls, which build against whichever esp-hosted the project has, so
+# esp_ptp does not list espressif__esp_hosted: only projects with a
+# wifi_cp port have it.
 
 # C6 keeps the fractional SYSTIMER tick discarded by esp_timer_get_time().
 idf_component_get_property(ptp_timer_dir esp_timer COMPONENT_DIR)

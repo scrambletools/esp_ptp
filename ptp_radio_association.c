@@ -15,6 +15,7 @@
 #ifdef CONFIG_ESP_PTP_HAS_AP_VIA_COPROCESSOR
 
 #include "ptp.h"
+#include "hosted_avb_peer.h"
 #include "hosted_avb_proto.h"
 #include "ptp_wifi_association.h"
 
@@ -26,15 +27,6 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
-
-/* Forward-declared, as in ptp_beacon_ie.c, so esp_ptp needs no hard
- * dependency on espressif__esp_hosted. */
-extern esp_err_t esp_hosted_send_custom_data(uint32_t msg_id,
-                                             const uint8_t *data,
-                                             size_t data_len);
-extern esp_err_t esp_hosted_register_custom_callback(
-    uint32_t msg_id, void (*cb)(uint32_t, const uint8_t *, size_t, void *),
-    void *user);
 
 static const char *TAG = "ptp_radio_assoc";
 
@@ -106,7 +98,7 @@ static void reconcile_associations(void *arg, esp_event_base_t base,
 static void request_associations(void) {
   static const uint8_t request = HOSTED_AVB_ASSOCIATIONS_VERSION;
   static esp_err_t s_last_result = ESP_OK;
-  esp_err_t result = esp_hosted_send_custom_data(
+  esp_err_t result = hosted_avb_peer_send(
       HOSTED_AVB_MSG_ASSOCIATIONS_REQ, &request, sizeof(request));
   /* Logged once a failure starts; an older coprocessor fails every time. */
   if (result != ESP_OK && result != s_last_result) {
@@ -140,8 +132,8 @@ int ptp_radio_association_attach(int port_index) {
   if (esp_event_handler_register(PTP_RADIO_ASSOCIATION_EVENT,
                                  ESP_EVENT_ANY_ID, reconcile_associations,
                                  NULL) != ESP_OK ||
-      esp_hosted_register_custom_callback(HOSTED_AVB_MSG_ASSOCIATIONS,
-                                          on_associations, NULL) != ESP_OK) {
+      hosted_avb_peer_register(HOSTED_AVB_MSG_ASSOCIATIONS, on_associations,
+                               NULL) != ESP_OK) {
     ESP_LOGE(TAG, "failed to register for association reports");
     return -EIO;
   }
