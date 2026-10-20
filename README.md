@@ -12,7 +12,7 @@ software-disciplined clocks for chips without IEEE 1588 hardware, and
 out-of-band time transport (e.g. 802.11 beacon Vendor IE for
 AVB-over-Wi-Fi). It is maintained by Scramble.
 
-The source lives at <https://github.com/scrambletoolsllc/esp_ptp>.
+The source lives at <https://github.com/scrambletools/esp_ptp>.
 The component is published in the ESP Component Registry
 (<https://components.espressif.com>) under the **scrambletools**
 namespace, so depend on it as:
@@ -22,8 +22,8 @@ dependencies:
   scrambletools/esp_ptp: "*"
 ```
 
-Old github.com/scrambletools/... links redirect to the
-scrambletoolsllc repos.
+Old github.com/scrambletoolsllc/... links redirect to the
+scrambletools repos.
 
 ## Terminology
 
