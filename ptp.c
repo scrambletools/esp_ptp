@@ -4875,8 +4875,16 @@ int ptpd_start(FAR const char *interface) {
   if (interface != NULL) {
     strncpy(args->interface, interface, sizeof(args->interface) - 1);
   }
-  if (xTaskCreate(ptp_daemon, "PTPD", CONFIG_ESP_PTP_STACKSIZE, args, 6,
-                  NULL) != pdPASS) {
+  /* Core 0 on dual-core targets: an endpoint's talker paces its stream by
+   * busy-waiting at the top priority on core 1, and an unpinned PTPD that
+   * is on core 1 when the stream starts does not run again until it stops. */
+#if portNUM_PROCESSORS > 1
+  const BaseType_t ptpd_core = 0;
+#else
+  const BaseType_t ptpd_core = tskNO_AFFINITY;
+#endif
+  if (xTaskCreatePinnedToCore(ptp_daemon, "PTPD", CONFIG_ESP_PTP_STACKSIZE,
+                              args, 6, NULL, ptpd_core) != pdPASS) {
     free(args);
     ESP_LOGE(TAG, "ptpd_start: xTaskCreate failed");
     return -1;
