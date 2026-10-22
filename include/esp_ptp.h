@@ -224,6 +224,16 @@ int ptpd_set_profile(int pid, ptp_profile_e profile);
  * from any task. */
 void ptpd_eth_rx_restarted(void);
 
+/* Returns the esp_timer time (us) at which the application last saw the
+ * wired receiver drop frames, or 0 if it never has. */
+typedef int64_t (*ptpd_rx_drop_probe_t)(void);
+
+/* Register the probe the daemon asks before falling back to AVB Lite for
+ * unanswered peer delay requests. Responses the local receiver dropped
+ * say nothing about the link, so the fallback waits until the probe
+ * reports no drops for a whole evaluation window. */
+void ptpd_set_rx_drop_probe(ptpd_rx_drop_probe_t probe);
+
 /* Query daemon status. Threads with priority below
  * CONFIG_ESP_PTP_SERVERPRIO may time out if higher-priority
  * threads request status concurrently. */

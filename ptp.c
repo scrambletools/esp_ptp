@@ -625,6 +625,12 @@ static struct ptp_state_s *s_state;
  * loop re-arms the profile fallback evaluation on its next pass. */
 static volatile bool s_eth_rx_restarted;
 
+/* Application's receive-drop probe (ptpd_set_rx_drop_probe). A fallback
+ * for unanswered peer delay requests waits until it has reported no drop
+ * for this long, the nine 1 s deadlines plus one. */
+static volatile ptpd_rx_drop_probe_t s_rx_drop_probe;
+#define PTP_RX_DROP_WINDOW_US (10 * 1000 * 1000)
+
 /* The RX callback publishes bounded copies; only the daemon parses them. */
 #define PTP_INJECT_DEPTH 8
 struct ptp_injected_frame_s {
@@ -2760,6 +2766,25 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
   ptp_peer_expire(&state->port[0].peer_exchange, esp_timer_get_time());
   unsigned unanswered = state->port[0].peer_exchange.lost_responses;
   portEXIT_CRITICAL(&s_peer_lock);
+  /* Responses our own receiver dropped say nothing about the link
+   * (observed: a 10 s RX flood and a stream cut down by a switch to its
+   * old reservation each sprang the latch on an AVB link). While the
+   * application reports drops inside the window, the fallback waits. */
+  static bool s_fallback_held;
+  if (unanswered >= 9) {
+    ptpd_rx_drop_probe_t probe = s_rx_drop_probe;
+    int64_t last_drop_us = probe ? probe() : 0;
+    if (last_drop_us != 0 &&
+        esp_timer_get_time() - last_drop_us < PTP_RX_DROP_WINDOW_US) {
+      if (!s_fallback_held)
+        ptpwarn("%u peer exchanges incomplete while the receiver dropped "
+                "frames; AVB Lite fallback held",
+                unanswered);
+      s_fallback_held = true;
+      return;
+    }
+  }
+  s_fallback_held = false;
   if (unanswered >= 9) {
     ptpwarn(
         "Incomplete peer exchanges after %u deadlines; switching to standard PTP mode\n",
@@ -4954,6 +4979,10 @@ void ptpd_eth_rx_restarted(void) {
    * treated like a link-up, the re-arming point of profiles/avb_lite.md
    * §2.2. */
   s_eth_rx_restarted = true;
+}
+
+void ptpd_set_rx_drop_probe(ptpd_rx_drop_probe_t probe) {
+  s_rx_drop_probe = probe;
 }
 
 int ptpd_status(int pid, FAR struct ptpd_status_s *status) {
