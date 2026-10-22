@@ -621,6 +621,10 @@ static const char *TAG = "ptpd";
 
 static struct ptp_state_s *s_state;
 
+/* Set by ptpd_eth_rx_restarted from the application's task; the daemon
+ * loop re-arms the profile fallback evaluation on its next pass. */
+static volatile bool s_eth_rx_restarted;
+
 /* The RX callback publishes bounded copies; only the daemon parses them. */
 #define PTP_INJECT_DEPTH 8
 struct ptp_injected_frame_s {
@@ -4362,6 +4366,11 @@ static void ptp_daemon(void *task_param) {
 
   while (!state->stop) {
     ptpd_lateness_tick();
+    if (s_eth_rx_restarted) {
+      s_eth_rx_restarted = false;
+      ptpinfo("Ethernet receiver restarted after a local fault");
+      ptp_arm_profile_fallback(state);
+    }
 #ifdef CONFIG_ESP_PTP_SOURCE_LOSS_PROBE
     ptp_timing_snapshot_t probe_timing;
     bool probe_ready = state->port[0].medium == ptp_port_medium_eth_hwts &&
@@ -4936,6 +4945,15 @@ int ptpd_set_profile(int pid, ptp_profile_e profile) {
   }
 
   return OK;
+}
+
+void ptpd_eth_rx_restarted(void) {
+  /* Peer delay responses lost while the local receiver was down are not
+   * evidence about the link, so a fallback they caused, or the lost
+   * responses they added toward one, must not stand. The restart is
+   * treated like a link-up, the re-arming point of profiles/avb_lite.md
+   * §2.2. */
+  s_eth_rx_restarted = true;
 }
 
 int ptpd_status(int pid, FAR struct ptpd_status_s *status) {

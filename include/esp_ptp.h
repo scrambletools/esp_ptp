@@ -218,6 +218,12 @@ int ptpd_now(FAR struct timespec *ts);
 /* Change the active PTP profile at runtime. */
 int ptpd_set_profile(int pid, ptp_profile_e profile);
 
+/* The application restarted the wired Ethernet receiver after a local
+ * fault, such as an EMAC RX lockup cleared by a core reset. The daemon
+ * re-arms the AVB Lite fallback evaluation as on link-up. Safe to call
+ * from any task. */
+void ptpd_eth_rx_restarted(void);
+
 /* Query daemon status. Threads with priority below
  * CONFIG_ESP_PTP_SERVERPRIO may time out if higher-priority
  * threads request status concurrently. */
