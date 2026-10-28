@@ -304,6 +304,9 @@ bool ptp_wifi_capable_result(ptp_wifi_capable_result_t *result) {
  * frm_count: 0(No pref), 16, 24, 32, 64. */
 #define FTM_BURST_PERIOD_100MS 2
 #define FTM_FRM_COUNT 16
+#ifndef CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS
+#define CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS 10000
+#endif
 
 /* Optional FTM transport consumes the same driver-owned report exactly once. */
 extern bool ptp_ftm_report_hook(const wifi_event_ftm_report_t *report) __attribute__((weak));
@@ -1281,7 +1284,8 @@ static void ftm_client_task(void *arg) {
     if (!(completed & BIT_FTM_REPORT_OK))
       (void)esp_event_post(PTP_FTM_CONTROL, FTM_CONTROL_CANCEL,
                            NULL, 0, portMAX_DELAY);
-    /* §12.8.2 cadence: sleep one burst period between sessions. */
+    /* §12.8.2 cadence: one burst period between sessions; ranging only
+     * waits CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS. */
     if (precise_cadence) {
       int64_t now_us = esp_timer_get_time();
       next_start_us += 125000;
@@ -1289,7 +1293,7 @@ static void ftm_client_task(void *arg) {
       ESP_ERROR_CHECK(esp_timer_start_once(cadence_timer, next_start_us - now_us));
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     } else {
-      vTaskDelay(pdMS_TO_TICKS(FTM_BURST_PERIOD_100MS * 100));
+      vTaskDelay(pdMS_TO_TICKS(CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS));
     }
   }
 }

@@ -481,6 +481,20 @@ menu "PTP Daemon Configuration"
             default y if (ESP_PTP_PORT1_MEDIUM_WIFI_FTM && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
             default n
 
+        config ESP_PTP_FTM_RANGING_PAUSE_MS
+            int "Pause between FTM ranging sessions without FTM time transfer (ms)"
+            default 10000
+            range 200 60000
+            depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM || ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+            help
+                A station whose time comes from the beacon element uses FTM
+                for path delay only, a few ns that changes only when the
+                station moves. Each session is two bursts of FTM frames on
+                the shared channel: at a 200 ms pause a station ranged
+                about twice a second, and a station that listened and
+                talked at once lost four to five times more of its
+                downlink than at 10 s.
+
         config ESP_PTP_PEER_LOSS_TEST
             bool "Finite peer-delay request loss diagnostic"
             default n
