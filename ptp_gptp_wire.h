@@ -4,11 +4,14 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Normalize locally transmitted gPTP fields, preserving timing metadata. */
-static inline void ptp_gptp_wire_normalize(uint8_t *wire, size_t length, bool gptp)
+/* Normalize locally transmitted gPTP fields, preserving timing metadata.
+ * minor_version is the minorVersionPTP to send (0 for 802.1AS-2011, 1
+ * for 2020). */
+static inline void ptp_gptp_wire_normalize(uint8_t *wire, size_t length, bool gptp,
+                                           uint8_t minor_version)
 {
     if (!gptp || !wire || length < 34) return;
-    wire[1] = 0x12;
+    wire[1] = (uint8_t)(minor_version << 4) | 0x02;
     wire[5] = 0;
     memset(wire + 16, 0, 4);
     wire[32] = 0;

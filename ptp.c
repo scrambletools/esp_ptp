@@ -417,6 +417,10 @@ struct ptp_port_s {
 
   /* Per-port runtime state. */
   uint8_t intf_hw_addr[ETH_ADDR_LEN];
+  /* minorVersionPTP the neighbor sends, echoed on a wired port's wire:
+   * 802.1AS-2011 devices that check the whole version byte drop the
+   * 2020 value (a PreSonus switch would not sync us). */
+  uint8_t rx_minor_version;
   int ptp_socket;
 
   /* Last received packet timestamps (CLOCK_MONOTONIC). */
@@ -1104,6 +1108,12 @@ static int ptp_get_esp_eth_handle(struct ptp_state_s *state,
   return ioctl(state->port[0].ptp_socket, L2TAP_G_DEVICE_DRV_HNDL, eth_handle);
 }
 
+/* minorVersionPTP for a port's wire: an FTM port exists only in
+ * 802.1AS-2020, a wired one echoes its neighbor. */
+static uint8_t ptp_tx_minor_version(const struct ptp_port_s *port) {
+  return port->medium == ptp_port_medium_wifi_ftm ? 1 : port->rx_minor_version;
+}
+
 static void ptp_create_eth_frame_to(struct ptp_state_s *state,
                                     uint8_t *eth_frame, void *ptp_msg,
                                     uint16_t ptp_msg_len,
@@ -1115,7 +1125,8 @@ static void ptp_create_eth_frame_to(struct ptp_state_s *state,
 
   memcpy(eth_frame, &eth_hdr, sizeof(eth_hdr));
   memcpy(eth_frame + sizeof(eth_hdr), ptp_msg, ptp_msg_len);
-  ptp_gptp_wire_normalize(eth_frame + sizeof(eth_hdr), ptp_msg_len, ptp_is_gptp(state));
+  ptp_gptp_wire_normalize(eth_frame + sizeof(eth_hdr), ptp_msg_len, ptp_is_gptp(state),
+                          ptp_tx_minor_version(&state->port[0]));
 }
 
 static void ptp_create_eth_frame(struct ptp_state_s *state, uint8_t *eth_frame,
@@ -1163,7 +1174,8 @@ static int ptp_net_send_tagged(FAR struct ptp_state_s *state, void *ptp_msg,
   eth_frame[17] = ETH_TYPE_PTP & 0xFF;
   uint8_t *payload = eth_frame + ETH_HEADER_LEN + PTP_VLAN_TAG_LEN;
   memcpy(payload, ptp_msg, ptp_msg_len);
-  ptp_gptp_wire_normalize(payload, ptp_msg_len, ptp_is_gptp(state));
+  ptp_gptp_wire_normalize(payload, ptp_msg_len, ptp_is_gptp(state),
+                          ptp_tx_minor_version(&state->port[0]));
 
   eth_mac_time_t tx_time = {0};
 #pragma GCC diagnostic push
@@ -2412,7 +2424,8 @@ ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
   tlv->orgidentity[2] = 0xc2; /* IEEE 802.1 OUI */
   tlv->orgsubtype[2] = 1;     /* FollowUp Information per §11.4.4.3 */
   ptp_fill_gm_fields(state, tlv);
-  ptp_gptp_wire_normalize((uint8_t *)out, sizeof(*out), ptp_is_gptp(state));
+  /* A §12.7 beacon element: 802.1AS-2020, read only by our stations. */
+  ptp_gptp_wire_normalize((uint8_t *)out, sizeof(*out), ptp_is_gptp(state), 1);
 }
 
 /* Originate from the running hardware clock while the local clock is selected.
@@ -3123,7 +3136,8 @@ static int ptp_periodic_send(FAR struct ptp_state_s *state) {
     size_t wire_length = PTP_ANNOUNCE_BODY_LENGTH + tlv_length;
     wire[2] = wire_length >> 8;
     wire[3] = wire_length;
-    ptp_gptp_wire_normalize(wire, wire_length, ptp_is_gptp(state));
+    ptp_gptp_wire_normalize(wire, wire_length, ptp_is_gptp(state),
+                            ptp_tx_minor_version(port));
     ptp_wifi_ap_send_announce(p, port->intf_hw_addr, wire, wire_length);
   }
 
@@ -3931,6 +3945,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
 
   /* STA timing belongs to the currently associated AP. */
   struct ptp_port_s *ingress = &state->port[ingress_port];
+  ingress->rx_minor_version = state->port[0].rxbuf.raw[1] >> 4 ? 1 : 0;
   if (ptp_is_gptp(state) && ingress->medium == ptp_port_medium_wifi_ftm &&
       ingress->wifi_mode == ptp_port_wifi_mode_sta) {
     portENTER_CRITICAL(&s_peer_lock);
