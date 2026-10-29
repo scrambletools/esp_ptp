@@ -617,6 +617,10 @@ struct ptp_state_s {
 static const char *TAG = "ptpd";
 #define ptpinfo(format, ...) ESP_LOGI(TAG, format, ##__VA_ARGS__)
 #define ptpwarn(format, ...) ESP_LOGW(TAG, format, ##__VA_ARGS__)
+/* Rare state changes, at warning level: a streaming talker turns this
+ * tag down to warnings to keep its console quiet, and an amp's loss of
+ * asCapable went unseen for hours under that. */
+#define ptpstate(format, ...) ESP_LOGW(TAG, format, ##__VA_ARGS__)
 /* Per-sync servo telemetry (~3 lines/s at 1 Hz sync). Compiled out at
  * the default log level; raise CONFIG_LOG_MAXIMUM_LEVEL to DEBUG to
  * get it back for servo forensics. */
@@ -2700,7 +2704,7 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
       ptp_peer_cancel(&state->port[0].peer_exchange, request_generation);
     portEXIT_CRITICAL(&s_peer_lock);
     if (!published && ptp_peer_drop_logged())
-      ptpinfo("PDELAY_DROP,unpublished,%d,%lld,%ld", ret,
+      ptpstate("PDELAY_DROP,unpublished,%d,%lld,%ld", ret,
               (long long)transmit_time.tv_sec, (long)transmit_time.tv_nsec);
   }
 
@@ -3241,7 +3245,7 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
                       memcmp(state->selected_path.identities, path.identities,
                              path.count * 8);
   if (changed) {
-    ptpinfo("Switching PTP time source\n");
+    ptpstate("Switching PTP time source\n");
     ptp_invalidate_timing();
     state->port[0].twostep_pending = false;
     state->port[0].last_received_sync = state->port[0].last_received_announce;
@@ -3276,8 +3280,8 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
     ptp_reset_unicast_delay_req(state);
   }
   if (changed || path_changed) {
-    ptpinfo("Selected Announce path: %u clock(s)", path.count);
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, path.identities, path.count * 8, ESP_LOG_INFO);
+    ptpstate("Selected Announce path: %u clock(s)", path.count);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, path.identities, path.count * 8, ESP_LOG_WARN);
   }
   state->last_selected_announce = state->port[0].last_received_announce;
   return OK;
@@ -3750,7 +3754,7 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
     if (admission != PTP_PEER_ACCEPTED) {
       if (admission != PTP_PEER_IGNORED || state->port[0].peer_exchange.response_rejections) {
         if (ptp_peer_drop_logged())
-          ptpinfo("PDELAY_DROP,response,%d,%u,%u", admission,
+          ptpstate("PDELAY_DROP,response,%d,%u,%u", admission,
                   (unsigned)state->port[0].peer_exchange.response_rejections,
                   (unsigned)ptp_get_sequence(&msg->header));
       }
@@ -3855,7 +3859,7 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
   portEXIT_CRITICAL(&s_peer_lock);
   if (!accepted) {
     if (follow_up_rejections && ptp_peer_drop_logged())
-      ptpinfo("PDELAY_DROP,follow_up,%u,%u", follow_up_rejections,
+      ptpstate("PDELAY_DROP,follow_up,%u,%u", follow_up_rejections,
               (unsigned)ptp_get_sequence(&msg->header));
     return OK;
   }
@@ -3870,7 +3874,7 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
       peer_delay_roundtrip < 0 || peer_delay_roundtrip > 1000000000LL ||
       peer_delay_reflection < 0 || peer_delay_reflection > 1000000000LL) {
     if (ptp_peer_drop_logged())
-      ptpinfo("PDELAY_DROP,range,%lld,%lld,%lld.%09ld,%lld.%09ld",
+      ptpstate("PDELAY_DROP,range,%lld,%lld,%lld.%09ld,%lld.%09ld",
               (long long)peer_delay_roundtrip, (long long)peer_delay_reflection,
               (long long)measurement.transmit.tv_sec, (long)measurement.transmit.tv_nsec,
               (long long)measurement.receive.tv_sec, (long)measurement.receive.tv_nsec);
@@ -3886,7 +3890,7 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
   bool rate_valid = ptp_peer_rate_update(&rate, measurement.lifecycle, responder,
       &remote_txtime, follow_up_correction, &measurement.receive);
   if (!rate_valid && rate_anchored && ptp_peer_drop_logged())
-    ptpinfo("PDELAY_DROP,rate,%lld.%09ld,%lld.%09ld", (long long)remote_txtime.tv_sec,
+    ptpstate("PDELAY_DROP,rate,%lld.%09ld,%lld.%09ld", (long long)remote_txtime.tv_sec,
             (long)remote_txtime.tv_nsec, (long long)measurement.receive.tv_sec,
             (long)measurement.receive.tv_nsec);
   bool delay_valid = rate_valid && ptp_peer_delay_local(rate.ratio,
@@ -4468,7 +4472,7 @@ static void ptp_daemon(void *task_param) {
       }
       if (!state->port[0].capability_reported ||
           capable != state->port[0].last_reported_capability) {
-        ptpinfo("PDELAY_CAPABLE,%u", capable);
+        ptpstate("PDELAY_CAPABLE,%u", capable);
         state->port[0].capability_reported = true;
         state->port[0].last_reported_capability = capable;
       }
