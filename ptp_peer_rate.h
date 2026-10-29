@@ -10,6 +10,7 @@ typedef struct {
     uint32_t lifecycle;
     uint8_t responder[10];
     bool anchored, valid;
+    bool reanchor; /* the local clock stepped: restart elapsed times */
     struct timespec remote_previous, local_previous;
     double correction_previous, ratio;
     unsigned updates;
@@ -41,6 +42,16 @@ static inline bool ptp_peer_rate_update(ptp_peer_rate_t *rate,
         memset(rate, 0, sizeof(*rate));
         rate->lifecycle = lifecycle;
         memcpy(rate->responder, responder, 10);
+    }
+    if (rate->reanchor) {
+        /* Elapsed local time spans the step: keep the ratio measured
+         * before it and measure on from this sample. */
+        rate->reanchor = false;
+        rate->remote_previous = *remote;
+        rate->local_previous = *local;
+        rate->correction_previous = correction;
+        rate->anchored = true;
+        return rate->valid;
     }
     double local_elapsed, remote_elapsed;
     bool valid = rate->anchored &&

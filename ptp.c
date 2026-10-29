@@ -3409,7 +3409,8 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
 
 static void ptp_clean_after_step(FAR struct ptp_state_s *state) {
   portENTER_CRITICAL(&s_peer_lock);
-  ptp_peer_invalidate(&state->port[0].peer_exchange);
+  ptp_peer_abandon(&state->port[0].peer_exchange);
+  state->port[0].peer_rate.reanchor = true;
   portEXIT_CRITICAL(&s_peer_lock);
   ptp_invalidate_timing();
   state->remote_time_ns_prev = 0;

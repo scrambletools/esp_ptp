@@ -58,8 +58,11 @@ static inline bool ptp_peer_expire(ptp_peer_exchange_t *exchange, int64_t now_us
     return true;
 }
 
-static inline uint32_t ptp_peer_begin(ptp_peer_exchange_t *exchange,
-    uint16_t sequence, const struct ptp_header_s *request, int64_t deadline_us)
+/* Drop the request in flight but keep the link's lifecycle and losses:
+ * a step of the local clock spoils the one exchange that spans it, not
+ * the link (each boot stepped onto the GM, dropped asCapable for 2 s,
+ * and a PreSonus failed the talker it was then sent). */
+static inline void ptp_peer_abandon(ptp_peer_exchange_t *exchange)
 {
     uint32_t lifecycle = exchange->lifecycle;
     uint16_t lost_responses = exchange->lost_responses;
@@ -70,6 +73,12 @@ static inline uint32_t ptp_peer_begin(ptp_peer_exchange_t *exchange,
     exchange->lost_responses = lost_responses;
     exchange->missing_response = missing_response;
     exchange->missing_follow_up = missing_follow_up;
+}
+
+static inline uint32_t ptp_peer_begin(ptp_peer_exchange_t *exchange,
+    uint16_t sequence, const struct ptp_header_s *request, int64_t deadline_us)
+{
+    ptp_peer_abandon(exchange);
     exchange->sequence = sequence;
     memcpy(exchange->requester, request->sourceidentity, 8);
     memcpy(exchange->requester + 8, request->sourceportindex, 2);
