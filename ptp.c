@@ -1201,10 +1201,12 @@ static int ptp_net_send_tagged(FAR struct ptp_state_s *state, void *ptp_msg,
 
 /* A dropped peer delay exchange left no trace (an amp behind a Linux
  * bridge stayed not asCapable for hours with nothing logged): log the
- * first drops, then one in 64. */
+ * first drops, then one in 64. Each capable spell counts afresh: a
+ * link-down burst used the first 8, and the drop that later took the
+ * amp's port down went unlogged. */
+static unsigned s_peer_drops;
 static bool ptp_peer_drop_logged(void) {
-  static unsigned drops;
-  return drops++ < 8 || drops % 64 == 0;
+  return s_peer_drops++ < 8 || s_peer_drops % 64 == 0;
 }
 
 static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
@@ -4476,6 +4478,8 @@ static void ptp_daemon(void *task_param) {
         ptpstate("PDELAY_CAPABLE,%u", capable);
         state->port[0].capability_reported = true;
         state->port[0].last_reported_capability = capable;
+        if (capable)
+          s_peer_drops = 0;
       }
     } else if (state->port[0].medium == ptp_port_medium_wifi_ftm &&
                state->port[0].wifi_mode == ptp_port_wifi_mode_sta) {
