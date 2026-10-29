@@ -3896,6 +3896,10 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
     ptpstate("PDELAY_DROP,rate,%lld.%09ld,%lld.%09ld", (long long)remote_txtime.tv_sec,
             (long)remote_txtime.tv_nsec, (long long)measurement.receive.tv_sec,
             (long)measurement.receive.tv_nsec);
+  else if (rate.outliers && ptp_peer_drop_logged())
+    ptpstate("PDELAY_RATE_OUTLIER,%u,%lld.%09ld,%lld.%09ld", rate.outliers,
+            (long long)remote_txtime.tv_sec, (long)remote_txtime.tv_nsec,
+            (long long)measurement.receive.tv_sec, (long)measurement.receive.tv_nsec);
   bool delay_valid = rate_valid && ptp_peer_delay_local(rate.ratio,
       peer_delay_roundtrip, peer_delay_reflection, response_correction,
       follow_up_correction, &peer_delay) &&

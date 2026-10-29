@@ -14,7 +14,16 @@ typedef struct {
     struct timespec remote_previous, local_previous;
     double correction_previous, ratio;
     unsigned updates;
+    unsigned outliers; /* failed intervals kept over, see below */
 } ptp_peer_rate_t;
+
+/* An interval that fails on the remote side while ours is sound is the
+ * neighbor's: a bridge that steps the clock it timestamps with spoils
+ * the interval across each step (scrambox, three in 4 s at its boot),
+ * and dropping those exchanges took the amp's asCapable down. Keep the
+ * ratio measured before over up to this many in a row; a neighbor off
+ * rate for good still fails. */
+#define PTP_PEER_RATE_OUTLIERS_MAX 3
 
 static inline double ptp_peer_correction(const uint8_t wire[8])
 {
@@ -54,8 +63,9 @@ static inline bool ptp_peer_rate_update(ptp_peer_rate_t *rate,
         return rate->valid;
     }
     double local_elapsed, remote_elapsed;
-    bool valid = rate->anchored &&
-        ptp_peer_elapsed(local, &rate->local_previous, &local_elapsed) &&
+    bool local_sound = rate->anchored &&
+        ptp_peer_elapsed(local, &rate->local_previous, &local_elapsed);
+    bool valid = local_sound &&
         ptp_peer_elapsed(remote, &rate->remote_previous, &remote_elapsed);
     double ratio = valid ? (remote_elapsed + correction -
         rate->correction_previous) / local_elapsed : 0;
@@ -64,6 +74,12 @@ static inline bool ptp_peer_rate_update(ptp_peer_rate_t *rate,
     rate->local_previous = *local;
     rate->correction_previous = correction;
     rate->anchored = true;
+    if (!valid && local_sound && rate->valid &&
+        rate->outliers < PTP_PEER_RATE_OUTLIERS_MAX) {
+        ++rate->outliers;
+        return true;
+    }
+    rate->outliers = 0;
     rate->valid = valid;
     rate->ratio = valid ? ratio : 0;
     if (valid) ++rate->updates;
