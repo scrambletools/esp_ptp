@@ -891,7 +891,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
 
   /* The beacon time element starts with its sub-ID and may end with a
    * capture bracket, which goes unused: the envelope below already
-   * follows the smallest gap. The earlier FOLLOWUP form has neither. */
+   * follows the smallest gap. */
   const int markers_len =
       PTP_VND_IE_FOLLOW_UP_LEN + PTP_VND_IE_TSF_MAPPING_PAYLOAD_LEN;
   bool length_valid;
@@ -905,8 +905,6 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     payload_len -= PTP_VND_IE_SUBID_LEN;
     length_valid = payload_len == markers_len ||
                    payload_len == markers_len + PTP_VND_IE_CAPTURE_BRACKET_LEN;
-  } else if (vnd_ie->vendor_oui_type == PTP_VND_IE_OUI_TYPE_FOLLOWUP) {
-    length_valid = payload_len == markers_len;
   } else {
     return;
   }
