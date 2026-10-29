@@ -1195,6 +1195,14 @@ static int ptp_net_send_tagged(FAR struct ptp_state_s *state, void *ptp_msg,
   return (int)sizeof(eth_frame);
 }
 
+/* A dropped peer delay exchange left no trace (an amp behind a Linux
+ * bridge stayed not asCapable for hours with nothing logged): log the
+ * first drops, then one in 64. */
+static bool ptp_peer_drop_logged(void) {
+  static unsigned drops;
+  return drops++ < 8 || drops % 64 == 0;
+}
+
 static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
                            uint16_t ptp_msg_len, struct timespec *ts,
                            const uint8_t *dest_mac) {
@@ -2685,10 +2693,15 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
   }
   if (peer_request) {
     portENTER_CRITICAL(&s_peer_lock);
-    if (ret <= 0 || !ptp_peer_publish(&state->port[0].peer_exchange, request_generation,
-                                     &transmit_time, esp_timer_get_time()))
+    bool published = ret > 0 &&
+        ptp_peer_publish(&state->port[0].peer_exchange, request_generation,
+                         &transmit_time, esp_timer_get_time());
+    if (!published)
       ptp_peer_cancel(&state->port[0].peer_exchange, request_generation);
     portEXIT_CRITICAL(&s_peer_lock);
+    if (!published && ptp_peer_drop_logged())
+      ptpinfo("PDELAY_DROP,unpublished,%d,%lld,%ld", ret,
+              (long long)transmit_time.tv_sec, (long)transmit_time.tv_nsec);
   }
 
   if (ret < 0) {
@@ -3734,7 +3747,15 @@ static int ptp_process_delay_resp(FAR struct ptp_state_s *state,
       state->port[0].pdelay_multi_responder = true;
       return OK;
     }
-    if (admission != PTP_PEER_ACCEPTED) return OK;
+    if (admission != PTP_PEER_ACCEPTED) {
+      if (admission != PTP_PEER_IGNORED || state->port[0].peer_exchange.response_rejections) {
+        if (ptp_peer_drop_logged())
+          ptpinfo("PDELAY_DROP,response,%d,%u,%u", admission,
+                  (unsigned)state->port[0].peer_exchange.response_rejections,
+                  (unsigned)ptp_get_sequence(&msg->header));
+      }
+      return OK;
+    }
     ptpdebug("Waiting for delay response follow-up");
   } else {
     if (!state->selected_source_valid ||
@@ -3830,27 +3851,44 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
   rate = state->port[0].peer_rate;
   if (state->port[0].peer_exchange.multiple)
     state->port[0].peer_capability.qualified = false;
+  unsigned follow_up_rejections = state->port[0].peer_exchange.follow_up_rejections;
   portEXIT_CRITICAL(&s_peer_lock);
-  if (!accepted) return OK;
+  if (!accepted) {
+    if (follow_up_rejections && ptp_peer_drop_logged())
+      ptpinfo("PDELAY_DROP,follow_up,%u,%u", follow_up_rejections,
+              (unsigned)ptp_get_sequence(&msg->header));
+    return OK;
+  }
 
   peer_delay_roundtrip = timespec_delta_ns(&measurement.receive,
                                           &measurement.transmit);
   ptp_format_to_timespec(measurement.response.receivetimestamp, &remote_rxtime);
   ptp_format_to_timespec(msg->origintimestamp, &remote_txtime);
-  if (remote_txtime.tv_sec < remote_rxtime.tv_sec ||
-      remote_txtime.tv_sec - remote_rxtime.tv_sec > 1) return OK;
   peer_delay_reflection = timespec_delta_ns(&remote_txtime, &remote_rxtime);
-  if (peer_delay_roundtrip < 0 || peer_delay_roundtrip > 1000000000LL ||
-      peer_delay_reflection < 0 || peer_delay_reflection > 1000000000LL)
+  if (remote_txtime.tv_sec < remote_rxtime.tv_sec ||
+      remote_txtime.tv_sec - remote_rxtime.tv_sec > 1 ||
+      peer_delay_roundtrip < 0 || peer_delay_roundtrip > 1000000000LL ||
+      peer_delay_reflection < 0 || peer_delay_reflection > 1000000000LL) {
+    if (ptp_peer_drop_logged())
+      ptpinfo("PDELAY_DROP,range,%lld,%lld,%lld.%09ld,%lld.%09ld",
+              (long long)peer_delay_roundtrip, (long long)peer_delay_reflection,
+              (long long)measurement.transmit.tv_sec, (long)measurement.transmit.tv_nsec,
+              (long long)measurement.receive.tv_sec, (long)measurement.receive.tv_nsec);
     return OK;
+  }
   const double response_correction = ptp_peer_correction(
       measurement.response.header.correction);
   const double follow_up_correction = ptp_peer_correction(msg->header.correction);
   uint8_t responder[10];
   memcpy(responder, msg->header.sourceidentity, 8);
   memcpy(responder + 8, msg->header.sourceportindex, 2);
+  bool rate_anchored = rate.anchored;
   bool rate_valid = ptp_peer_rate_update(&rate, measurement.lifecycle, responder,
       &remote_txtime, follow_up_correction, &measurement.receive);
+  if (!rate_valid && rate_anchored && ptp_peer_drop_logged())
+    ptpinfo("PDELAY_DROP,rate,%lld.%09ld,%lld.%09ld", (long long)remote_txtime.tv_sec,
+            (long)remote_txtime.tv_nsec, (long long)measurement.receive.tv_sec,
+            (long)measurement.receive.tv_nsec);
   bool delay_valid = rate_valid && ptp_peer_delay_local(rate.ratio,
       peer_delay_roundtrip, peer_delay_reflection, response_correction,
       follow_up_correction, &peer_delay) &&
