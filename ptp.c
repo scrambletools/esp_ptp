@@ -1218,6 +1218,23 @@ static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
   uint8_t eth_frame[ptp_msg_len + ETH_HEADER_LEN];
   ptp_create_eth_frame_to(state, eth_frame, ptp_msg, ptp_msg_len, dest_mac);
 
+  /* The socket times every frame it sends, waiting for the timestamp
+   * under the EMAC transmit mutex; a frame nobody needs timed goes
+   * straight to the driver instead. */
+  esp_eth_handle_t eth_handle;
+  if (!ts && ptp_get_esp_eth_handle(state, &eth_handle) == 0) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    esp_err_t err = esp_eth_transmit_ctrl_vargs(eth_handle, NULL, 2, eth_frame,
+                                                (uint32_t)sizeof(eth_frame));
+#pragma GCC diagnostic pop
+    if (err != ESP_OK) {
+      errno = (err == ESP_ERR_TIMEOUT) ? EAGAIN : EIO;
+      return ERROR;
+    }
+    return (int)sizeof(eth_frame);
+  }
+
   // wrap "Info Records Buffer" into union to ensure proper alignment of data
   // (this is typically needed when accessing double word variables or structs
   // containing double word variables)
