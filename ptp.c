@@ -1157,6 +1157,15 @@ static bool ptp_tags_frame(FAR const struct ptp_state_s *state,
 #endif
 }
 
+/* Around each wired transmit (esp_ptp.h). */
+static volatile ptpd_tx_hook_fn s_tx_hook;
+void ptpd_set_tx_hook(ptpd_tx_hook_fn fn) { s_tx_hook = fn; }
+static void ptp_tx_hook(bool before, bool timed) {
+  ptpd_tx_hook_fn hook = s_tx_hook;
+  if (hook)
+    hook(before, timed);
+}
+
 /* L2TAP writes only frames of its own ethertype, so tagged frames go
  * straight to the driver, which still returns the descriptor TX
  * timestamp. */
@@ -1182,12 +1191,14 @@ static int ptp_net_send_tagged(FAR struct ptp_state_s *state, void *ptp_msg,
                           ptp_tx_minor_version(&state->port[0]));
 
   eth_mac_time_t tx_time = {0};
+  ptp_tx_hook(true, ts != NULL);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   esp_err_t err = esp_eth_transmit_ctrl_vargs(eth_handle, ts ? &tx_time : NULL,
                                               2, eth_frame,
                                               (uint32_t)sizeof(eth_frame));
 #pragma GCC diagnostic pop
+  ptp_tx_hook(false, ts != NULL);
   if (err != ESP_OK) {
     errno = (err == ESP_ERR_TIMEOUT) ? EAGAIN : EIO;
     return ERROR;
@@ -1223,11 +1234,13 @@ static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
    * straight to the driver instead. */
   esp_eth_handle_t eth_handle;
   if (!ts && ptp_get_esp_eth_handle(state, &eth_handle) == 0) {
+    ptp_tx_hook(true, false);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     esp_err_t err = esp_eth_transmit_ctrl_vargs(eth_handle, NULL, 2, eth_frame,
                                                 (uint32_t)sizeof(eth_frame));
 #pragma GCC diagnostic pop
+    ptp_tx_hook(false, false);
     if (err != ESP_OK) {
       errno = (err == ESP_ERR_TIMEOUT) ? EAGAIN : EIO;
       return ERROR;
@@ -1254,7 +1267,9 @@ static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
   ts_info->len = L2TAP_IREC_LEN(sizeof(struct timespec));
   ts_info->type = L2TAP_IREC_TIME_STAMP;
 
+  ptp_tx_hook(true, true);
   int ret = write(state->port[0].ptp_socket, &ptp_msg_ext_buff, 0);
+  ptp_tx_hook(false, true);
 
   // check if write was successful, ts exists and ts_info is valid
   if (ret > 0 && ts && ts_info->type == L2TAP_IREC_TIME_STAMP) {

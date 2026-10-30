@@ -215,6 +215,14 @@ int ptpd_start_port(int port_index, FAR const char *interface,
  * from the software clock (esp_timer-backed) on platforms without. */
 int ptpd_now(FAR struct timespec *ts);
 
+/* Called just before (before true) and after each transmit on the wired
+ * port. A timed transmit holds the EMAC transmit mutex until the frame's
+ * timestamp is back. A talker sharing the EMAC uses the hook to place
+ * PTP frames right after its own and to keep the mutex hold short, so
+ * its next frame does not wait. NULL clears it. */
+typedef void (*ptpd_tx_hook_fn)(bool before, bool timed);
+void ptpd_set_tx_hook(ptpd_tx_hook_fn fn);
+
 /* Change the active PTP profile at runtime. */
 int ptpd_set_profile(int pid, ptp_profile_e profile);
 
