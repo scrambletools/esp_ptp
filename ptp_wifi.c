@@ -34,6 +34,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -304,6 +305,16 @@ bool ptp_wifi_capable_result(ptp_wifi_capable_result_t *result) {
  * frm_count: 0(No pref), 16, 24, 32, 64. */
 #define FTM_BURST_PERIOD_100MS 2
 #define FTM_FRM_COUNT 16
+#if PTP_FTM_PTP_COMPATIBLE
+/* The sync interval as log2 seconds, rounded like the Sync messages'
+ * logMessageInterval, picks the Table 12-3 row a PTP compatible request asks
+ * for (125 ms gives -3). -2 and slower share one row, and the SDK reads 0 as
+ * unset and uses -3's, so slower intervals ask for -2. */
+static int8_t ftm_log_sync_interval(void) {
+  int log_interval = (int)round(log2(CONFIG_ESP_PTP_SYNC_INTERVAL_MS / 1e3));
+  return log_interval > -2 ? -2 : (int8_t)log_interval;
+}
+#endif
 #ifndef CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS
 #define CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS 10000
 #endif
@@ -409,9 +420,21 @@ static void on_ftm_control(void *arg, esp_event_base_t base, int32_t id,
   }
 #endif
   static uint8_t ftm_requested_frames = 3;
+#if PTP_FTM_PTP_COMPATIBLE
+  static bool ptp_compatible_usable = true;
+#endif
   if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled()) {
     config.burst_period = 0;
     config.frm_count = ftm_requested_frames;
+#if PTP_FTM_PTP_COMPATIBLE
+    /* 802.1AS 12.4: one ASAP burst of three, its duration and Min Delta FTM
+     * from Table 12-3 for this port's sync interval. */
+    if (ptp_compatible_usable) {
+      config.ptp_compatible = true;
+      config.frm_count = 3;
+      config.log_sync_intvl = ftm_log_sync_interval();
+    }
+#endif
   }
   memcpy(config.resp_mac, ap_info.bssid, 6);
   ptp_ftm_session_begin(&s_ftm_session, ap_info.bssid);
@@ -422,6 +445,12 @@ static void on_ftm_control(void *arg, esp_event_base_t base, int32_t id,
   s_ftm_requested_now = result == ESP_OK ? config.frm_count : 0;
   portEXIT_CRITICAL(&s_media_lock);
   if (result != ESP_OK) {
+#if PTP_FTM_PTP_COMPATIBLE
+    if (result == ESP_ERR_INVALID_ARG && config.ptp_compatible) {
+      ptp_compatible_usable = false;
+      ESP_LOGW(TAG, "PTP compatible FTM request rejected by SDK, testing frame-count requests");
+    } else
+#endif
     if (result == ESP_ERR_INVALID_ARG && config.frm_count == 3) {
       ftm_requested_frames = 2;
       ESP_LOGW(TAG, "Three-frame FTM request rejected by SDK, testing two-frame request");
@@ -593,9 +622,28 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
     portENTER_CRITICAL(&s_media_lock);
     bool declined = r->status == FTM_STATUS_CONF_REJECTED ||
         r->status == FTM_STATUS_UNSUPPORTED || r->status == FTM_STATUS_NO_RESPONSE;
+#if PTP_FTM_PTP_COMPATIBLE
+    /* The report carries the grant itself: one ASAP burst of three or two. */
+    s_ftm_media.granted_frames = !declined && r->asap && r->burst_exponent == 0 &&
+        (r->ftms_per_burst == 3 || r->ftms_per_burst == 2) ? r->ftms_per_burst : 0;
+#else
     s_ftm_media.granted_frames = !declined &&
         (s_ftm_requested_now == 3 || s_ftm_requested_now == 2) ? s_ftm_requested_now : 0;
+#endif
     portEXIT_CRITICAL(&s_media_lock);
+#if PTP_FTM_PTP_COMPATIBLE
+    static uint32_t s_last_grant;
+    uint32_t grant = (uint32_t)r->asap << 24 | (uint32_t)r->burst_exponent << 16 |
+        (uint32_t)r->ftms_per_burst << 8 | r->min_delta_ftm;
+    if (grant != s_last_grant) {
+      s_last_grant = grant;
+      ESP_LOGI(TAG, "FTM grant: status=%d asap=%u exp=%u per_burst=%u min_delta=%u00us "
+               "duration=%" PRIu32 "us phy_comp=%u entries=%u vendor=%u",
+               r->status, r->asap, r->burst_exponent, r->ftms_per_burst, r->min_delta_ftm,
+               r->burst_duration_usec, r->phy_ftm_comp, r->ftm_report_num_entries,
+               r->ftm_vendor_num_entries);
+    }
+#endif
     wifi_ap_record_t current_ap = {0};
     bool connected = (xEventGroupGetBits(s_events) & BIT_STA_CONNECTED) &&
         esp_wifi_sta_get_ap_info(&current_ap) == ESP_OK &&

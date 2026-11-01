@@ -8,6 +8,14 @@ target_sources(${COMPONENT_LIB} PRIVATE "ptp.c" "ptp_clock_sw.c" "ptp_beacon_ie.
                "ptp_wifi.c")
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)
 
+# The PTP compatible FTM request (one ASAP burst of three, Table 12-3) is a
+# field of the initiator config, not a macro, so look for it in the header.
+file(READ "${IDF_PATH}/components/esp_wifi/include/esp_wifi_types_generic.h" ptp_wifi_types)
+string(FIND "${ptp_wifi_types}" "ptp_compatible" ptp_ftm_ptp_compatible)
+if(NOT ptp_ftm_ptp_compatible EQUAL -1)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE PTP_FTM_PTP_COMPATIBLE=1)
+endif()
+
 # ESP-Hosted peer data goes through esp_hosted_avb's hosted_avb_peer_*
 # calls, which build against whichever esp-hosted the project has, so
 # esp_ptp does not list espressif__esp_hosted: only projects with a
