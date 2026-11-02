@@ -745,9 +745,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
         }
         s_tsf_backward_streak = 0;
         if (ftm_backward) {
+          /* The responder's FTM clock steps back 72.8 s each time its
+           * 32-bit microsecond counter wraps (every 71.6 min). Take the
+           * new value as the baseline so only this session is dropped,
+           * not every session until real time passes the old one. */
           static uint32_t bad_ftm_count;
           if ((++bad_ftm_count % 10) == 1)
             ESP_LOGW(TAG, "FTM counter moved backward without beacon reset");
+          s_prev_ftm_t1_ps = best_t1_ps;
           ftm_status_measured(false, 0);
           break;
         }
