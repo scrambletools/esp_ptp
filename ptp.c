@@ -354,11 +354,20 @@ static void ptpd_lateness_tick(void) {
 #define PTP_FREQ_STABLE_PPB 12000 /* SW: integrator flat within 12 ppm across the
                                    * window = locked (a slow wind fails this) */
 #define PTP_FREQ_STABLE_WIN 6     /* plateau window (samples) for the SW lock check */
+/* Wired trim held at its limit this long, its offset closing by less than
+ * PTP_TRIM_HELD_CLOSING_NS, restarts from the clock's rate, at most once
+ * per PTP_TRIM_RESTART_MIN_US (a slew at the limit closes 30 ms a minute). */
+#define PTP_TRIM_HELD_US (60 * 1000000LL)
+#define PTP_TRIM_HELD_CLOSING_NS 1000000LL
+#define PTP_TRIM_RESTART_MIN_US (6 * 3600 * 1000000LL)
 typedef struct {
   int32_t kp;
   int32_t ki;
   int32_t drift_acc;
   int64_t wired_integral_q16;
+  int64_t trim_held_since_us;
+  int64_t trim_held_offset_ns;
+  int64_t trim_restarted_us;
 } pi_cntrl_t;
 
 typedef union {
@@ -3359,6 +3368,40 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
     target_trim = ptp_wired_pi_step(&state->offset_pi.wired_integral_q16,
                                    offset_ns, interval_ns);
     state->offset_pi.drift_acc = state->offset_pi.wired_integral_q16 / 65536;
+    /* The addend takes each trim relative to its own rate, so an error in
+     * what it applied builds up in freq_trim_ppb, not in the clock: the
+     * HAL's truncation walked it to the limit in 2.35 days, after which
+     * every step was zero and the clock free-ran (14 ms behind the
+     * grandmaster 36 h later, still reporting lock). A trim held at the
+     * limit while the offset does not close is that: restart the
+     * bookkeeping from the rate the clock runs at now. */
+    int64_t now_us = esp_timer_get_time();
+    if (target_trim < PTP_WIRED_TRIM_LIMIT && target_trim > -PTP_WIRED_TRIM_LIMIT) {
+      state->offset_pi.trim_held_since_us = 0;
+    } else if (state->offset_pi.trim_held_since_us == 0) {
+      state->offset_pi.trim_held_since_us = now_us;
+      state->offset_pi.trim_held_offset_ns = offset_ns;
+    } else if (now_us - state->offset_pi.trim_held_since_us >= PTP_TRIM_HELD_US) {
+      bool closing = llabs(offset_ns) + PTP_TRIM_HELD_CLOSING_NS <=
+                     llabs(state->offset_pi.trim_held_offset_ns);
+      if (!closing && (state->offset_pi.trim_restarted_us == 0 ||
+                       now_us - state->offset_pi.trim_restarted_us >=
+                           PTP_TRIM_RESTART_MIN_US)) {
+        ptpwarn("trim held at %ld ppb, offset %lld ns: restarting it from "
+                "the clock's rate",
+                (long)target_trim, (long long)offset_ns);
+        state->offset_pi.wired_integral_q16 = 0;
+        saved_integral = 0;
+        state->freq_trim_ppb = 0;
+        state->offset_pi.trim_restarted_us = now_us;
+        target_trim = ptp_wired_pi_step(&state->offset_pi.wired_integral_q16,
+                                       offset_ns, interval_ns);
+        state->offset_pi.drift_acc =
+            state->offset_pi.wired_integral_q16 / 65536;
+      }
+      state->offset_pi.trim_held_since_us = now_us;
+      state->offset_pi.trim_held_offset_ns = offset_ns;
+    }
   }
   int32_t trim_delta = s_use_sw_clock ? (int32_t)target_trim - state->freq_trim_ppb :
       ptp_trim_relative_delta(state->freq_trim_ppb, (int32_t)target_trim);
