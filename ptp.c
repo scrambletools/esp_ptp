@@ -501,6 +501,14 @@ struct ptp_port_s {
   struct timespec twostep_rxtime;
   int64_t twostep_received_us;
   ptp_sync_receipt_t sync_receipt;
+  /* Sync continuity for SYNCTIMEOUT_SEQ / SYNCRESUME: the last Sync seen
+   * from the selected source and the last whose Follow_Up set the clock,
+   * so a timeout tells lost Syncs from rejected ones or an upstream gap. */
+  uint16_t sync_seq_seen;
+  uint16_t sync_seq_used;
+  int32_t sync_seq_first_seen; /* first Sync seen after a timeout, or -1 */
+  int64_t sync_origin_used_ns;
+  bool sync_resume_pending;
   /* Receipt timeout set by the port's time source, 0 for three Sync
    * intervals. */
   volatile int32_t receipt_window_us;
@@ -3580,6 +3588,10 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
   /* Update timeout tracking */
 
   clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_sync);
+  state->port[0].sync_seq_seen = ptp_get_sequence(&msg->header);
+  if (state->port[0].sync_resume_pending &&
+      state->port[0].sync_seq_first_seen < 0)
+    state->port[0].sync_seq_first_seen = state->port[0].sync_seq_seen;
   state->port[0].twostep_pending = false;
 
   if (msg->header.flags[0] & PTP_FLAGS0_TWOSTEP) {
@@ -3655,6 +3667,17 @@ static int ptp_process_followup(FAR struct ptp_state_s *state,
     ptp_sync_receipt_observe(&state->port[0].sync_receipt,
         received_us, (int8_t)state->port[0].twostep_packet.header.logmessageinterval,
         received_us);
+    uint16_t seq = ptp_get_sequence(&msg->header);
+    int64_t origin_ns = timespec_to_ns(&remote_time);
+    if (state->port[0].sync_resume_pending) {
+      state->port[0].sync_resume_pending = false;
+      ptpinfo("SYNCRESUME,%u,%u,%ld,%" PRId64, (unsigned)seq,
+              (unsigned)state->port[0].sync_seq_used,
+              (long)state->port[0].sync_seq_first_seen,
+              origin_ns - state->port[0].sync_origin_used_ns);
+    }
+    state->port[0].sync_seq_used = seq;
+    state->port[0].sync_origin_used_ns = origin_ns;
   }
   if (result == OK && current.generation == previous.generation &&
       ptp_is_gptp(state) && state->selected_source_valid &&
@@ -4711,10 +4734,16 @@ static void ptp_daemon(void *task_param) {
     state->selected_source_valid = is_selected_source_valid(state);
     if (source_was_valid && !state->selected_source_valid) {
       if (ptp_is_gptp(state) && state->selected_source.btc_priority1 < 255 &&
-          !ptp_sync_receipt_current(&state->port[0].sync_receipt, esp_timer_get_time()))
+          !ptp_sync_receipt_current(&state->port[0].sync_receipt, esp_timer_get_time())) {
         ptpinfo("SYNCTIMEOUT,%" PRId64 ",%" PRId64 ",%" PRId64,
             esp_timer_get_time(), state->port[0].sync_receipt.received_us,
             state->port[0].sync_receipt.interval_us);
+        ptpinfo("SYNCTIMEOUT_SEQ,%u,%u",
+            (unsigned)state->port[0].sync_seq_seen,
+            (unsigned)state->port[0].sync_seq_used);
+        state->port[0].sync_seq_first_seen = -1;
+        state->port[0].sync_resume_pending = true;
+      }
       ptp_invalidate_timing();
     }
     ptp_publish_local_source(state);
