@@ -3571,6 +3571,24 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
 
 /* Process received PTP sync packet */
 
+/* Record a Sync from the selected source for SYNCTIMEOUT_SEQ / SYNCRESUME.
+ * Runs before the validity gate: after a timeout Syncs are ignored until
+ * the next Announce re-selects the source, and counting them here shows
+ * whether they kept arriving through that wait. */
+static void ptp_note_sync_seen(FAR struct ptp_state_s *state,
+                               FAR const struct ptp_sync_s *msg) {
+  if (memcmp(msg->header.sourceidentity,
+             state->selected_source.header.sourceidentity,
+             sizeof(msg->header.sourceidentity)) != 0 ||
+      memcmp(msg->header.sourceportindex,
+             state->selected_source.header.sourceportindex, 2) != 0)
+    return;
+  state->port[0].sync_seq_seen = ptp_get_sequence(&msg->header);
+  if (state->port[0].sync_resume_pending &&
+      state->port[0].sync_seq_first_seen < 0)
+    state->port[0].sync_seq_first_seen = state->port[0].sync_seq_seen;
+}
+
 static int ptp_process_sync(FAR struct ptp_state_s *state,
                             FAR struct ptp_sync_s *msg) {
   struct timespec remote_time;
@@ -3588,10 +3606,6 @@ static int ptp_process_sync(FAR struct ptp_state_s *state,
   /* Update timeout tracking */
 
   clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_received_sync);
-  state->port[0].sync_seq_seen = ptp_get_sequence(&msg->header);
-  if (state->port[0].sync_resume_pending &&
-      state->port[0].sync_seq_first_seen < 0)
-    state->port[0].sync_seq_first_seen = state->port[0].sync_seq_seen;
   state->port[0].twostep_pending = false;
 
   if (msg->header.flags[0] & PTP_FLAGS0_TWOSTEP) {
@@ -4261,6 +4275,7 @@ static int ptp_process_rx_packet(FAR struct ptp_state_s *state,
     ptpd_lateness_record_rx_sync();
     ptpdebug("Got sync packet, seq %ld",
             (long)ptp_get_sequence(&state->port[0].rxbuf.header));
+    ptp_note_sync_seen(state, &state->port[0].rxbuf.sync);
     if (!state->selected_source_valid ||
         (ptp_is_gptp(state) && state->selected_source.btc_priority1 == 255)) {
       return OK;
