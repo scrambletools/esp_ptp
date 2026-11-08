@@ -938,6 +938,14 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
       vnd_ie->vendor_oui[2] != PTP_VND_IE_OUI2) {
     return;
   }
+  /* Only the access point this station is associated with times it. A
+   * scan between association attempts also delivers other access points'
+   * beacons, elements included: a neighbouring bridge's element once
+   * changed the time base during a reconnect. */
+  if (!(xEventGroupGetBits(s_events) & BIT_STA_CONNECTED) ||
+      memcmp(sa, s_status_bssid, 6) != 0) {
+    return;
+  }
   /* vnd_ie->length covers OUI(3) + oui_type(1) + payload. */
   int payload_len = (int)vnd_ie->length - 4;
   const uint8_t *payload = vnd_ie->payload;
