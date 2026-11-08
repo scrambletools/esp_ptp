@@ -318,6 +318,8 @@ static int8_t ftm_log_sync_interval(void) {
 #ifndef CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS
 #define CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS 10000
 #endif
+#define FTM_DECLINED_BACKOFF_AFTER 3
+#define FTM_DECLINED_PAUSE_MS 60000
 
 /* Optional FTM transport consumes the same driver-owned report exactly once. */
 extern bool ptp_ftm_report_hook(const wifi_event_ftm_report_t *report) __attribute__((weak));
@@ -341,6 +343,8 @@ static ptp_wifi_sta_timing_t s_ftm_timing;
 static portMUX_TYPE s_media_lock = portMUX_INITIALIZER_UNLOCKED;
 static ptp_wifi_media_t s_ftm_media = {.ftm_local = true};
 static uint8_t s_ftm_requested_now;
+/* Sessions in a row the responder refused or never answered. */
+static volatile uint32_t s_ftm_declined_streak;
 
 bool ptp_wifi_sta_media(int port_index, ptp_wifi_media_t *media) {
   if (!media || port_index < 0 || port_index != s_port_index || !s_events ||
@@ -631,6 +635,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
         (s_ftm_requested_now == 3 || s_ftm_requested_now == 2) ? s_ftm_requested_now : 0;
 #endif
     portEXIT_CRITICAL(&s_media_lock);
+    s_ftm_declined_streak = declined ? s_ftm_declined_streak + 1 : 0;
 #if PTP_FTM_PTP_COMPATIBLE
     static uint32_t s_last_grant;
     uint32_t grant = (uint32_t)r->asap << 24 | (uint32_t)r->burst_exponent << 16 |
@@ -1330,6 +1335,20 @@ static void ftm_client_task(void *arg) {
         next_start_us = esp_timer_get_time();
         continue;
       }
+    } else {
+      /* Range only an access point that offers an FTM responder: with
+       * none, every session ends unanswered, and each one held the
+       * station's receive off for 0.3-0.4 s. */
+      wifi_ap_record_t ap = {0};
+      if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK && !ap.ftm_responder) {
+        static bool s_no_responder_logged;
+        if (!s_no_responder_logged) {
+          s_no_responder_logged = true;
+          ESP_LOGI(TAG, "FTM: the access point offers no responder, not ranging");
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS));
+        continue;
+      }
     }
     xEventGroupClearBits(s_events, BIT_FTM_REPORT_OK);
     esp_err_t result = esp_event_post(PTP_FTM_CONTROL, FTM_CONTROL_START,
@@ -1352,7 +1371,11 @@ static void ftm_client_task(void *arg) {
       ESP_ERROR_CHECK(esp_timer_start_once(cadence_timer, next_start_us - now_us));
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     } else {
-      vTaskDelay(pdMS_TO_TICKS(CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS));
+      /* A responder that keeps refusing or not answering is asked once a
+       * minute until it answers again. */
+      vTaskDelay(pdMS_TO_TICKS(s_ftm_declined_streak >= FTM_DECLINED_BACKOFF_AFTER
+                                   ? FTM_DECLINED_PAUSE_MS
+                                   : CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS));
     }
   }
 }
