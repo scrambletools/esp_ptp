@@ -3502,7 +3502,11 @@ static void ptp_clean_after_step(FAR struct ptp_state_s *state) {
   state->remote_time_ns_prev = 0;
   state->local_time_ns_prev = 0;
 
-  state->offset_pi.drift_acc = 0;
+  /* The software clock's integrator is its learned crystal rate, which a
+   * step does not change: cleared, the servo rang for an hour (about
+   * 27 ppm kick, 2.5 ms swings on a 9.5 min period) after every jump. */
+  if (!s_use_sw_clock)
+    state->offset_pi.drift_acc = 0;
   state->offset_pi.wired_integral_q16 = (int64_t)state->freq_trim_ppb * 65536;
   state->last_offset_ns = 0;
 }
