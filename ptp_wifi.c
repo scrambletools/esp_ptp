@@ -1418,10 +1418,15 @@ int ptp_wifi_sta_start(int port_index) {
    * the public ptp_inject_received_frame() API (see esp_ptp.h) —
    * no callback registration needed here. */
 
+#if CONFIG_ESP_PTP_FTM_RANGING
   if (xTaskCreate(ftm_client_task, "ftm_client", 4096, NULL, 5, NULL) !=
       pdPASS) {
     ESP_LOGW(TAG, "xTaskCreate ftm_client failed");
   }
+#else
+  (void)ftm_client_task;
+  ESP_LOGI(TAG, "FTM ranging off: path delay stays 0");
+#endif
 
   if (ptp_ftm_discipline_enabled && ptp_ftm_discipline_enabled())
     ESP_LOGI(TAG, "FTM discipline: private beacon timing disabled");

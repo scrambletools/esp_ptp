@@ -481,11 +481,21 @@ menu "PTP Daemon Configuration"
             default y if (ESP_PTP_PORT1_MEDIUM_WIFI_FTM && ESP_PTP_PORT1_WIFI_MODE_AP && (ESP_PTP_PORT1_HOST_IF_SDIO || ESP_PTP_PORT1_HOST_IF_SPI))
             default n
 
+        config ESP_PTP_FTM_RANGING
+            bool "Range the access point with FTM"
+            default y
+            depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM || ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+            help
+                Without it the station never starts an FTM session and its
+                path delay stays 0. For an access point with no FTM
+                responder, whose sessions all end without a response and
+                only take channel time from the downlink.
+
         config ESP_PTP_FTM_RANGING_PAUSE_MS
             int "Pause between FTM ranging sessions without FTM time transfer (ms)"
             default 10000
             range 200 60000
-            depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM || ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+            depends on ESP_PTP_FTM_RANGING
             help
                 A station whose time comes from the beacon element uses FTM
                 for path delay only, a few ns that changes only when the
