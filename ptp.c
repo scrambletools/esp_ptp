@@ -665,6 +665,7 @@ struct ptp_injected_frame_s {
   uint8_t source_mac[6];
   bool source_mac_valid;
   struct timespec received;
+  int64_t station_tsf_us; /* -1 unless an Announce on a station */
   ptp_msgbuf message;
 };
 static struct ptp_injected_frame_s s_injected[PTP_INJECT_DEPTH];
@@ -4702,6 +4703,13 @@ static void ptp_daemon(void *task_param) {
       memcpy(state->port[0].rx_source_mac, incoming.source_mac, 6);
       state->port[0].rx_source_mac_valid = incoming.source_mac_valid;
       state->port[0].rx_dest_mac_valid = false;
+#if CONFIG_ESP_PTP_ANNOUNCE_TSF_LOG
+      if (incoming.station_tsf_us >= 0)
+        ESP_LOGI(TAG, "ANNOUNCE_TSF,%u,%lld",
+                 (unsigned)((incoming.message.header.sequenceid[0] << 8) |
+                            incoming.message.header.sequenceid[1]),
+                 (long long)incoming.station_tsf_us);
+#endif
       ptp_process_rx_packet(state, incoming.length, incoming.port_index);
     }
 
@@ -4936,6 +4944,15 @@ int ptp_inject_received_frame_from(int port_index, const uint8_t *frame,
   portEXIT_CRITICAL(&s_injected_lock);
   struct timespec received;
   if (ptp_gettime(NULL, &received) != 0) return -EIO;
+  int64_t station_tsf_us = -1;
+#if SOC_WIFI_SUPPORTED && CONFIG_ESP_PTP_ANNOUNCE_TSF_LOG
+  /* The station's TSF when an Announce is handed over, logged with its
+   * sequenceId so an access point that logs its own clock per Announce
+   * can pair the two and recover its TSF-to-clock offset. */
+  if ((((const struct ptp_header_s *)frame)->messagetype & PTP_MSGTYPE_MASK) ==
+      PTP_MSGTYPE_ANNOUNCE)
+    station_tsf_us = esp_wifi_get_tsf_time(WIFI_IF_STA);
+#endif
   portENTER_CRITICAL(&s_injected_lock);
   int result = OK;
   if (!s_injected_enabled) {
@@ -4949,6 +4966,7 @@ int ptp_inject_received_frame_from(int port_index, const uint8_t *frame,
     s_injected[tail].length = len;
     s_injected[tail].port_index = (uint8_t)port_index;
     s_injected[tail].received = received;
+    s_injected[tail].station_tsf_us = station_tsf_us;
     s_injected[tail].link_generation = generation;
     s_injected[tail].source_mac_valid = source_mac != NULL;
     memset(s_injected[tail].source_mac, 0, 6);

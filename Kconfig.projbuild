@@ -495,6 +495,17 @@ menu "PTP Daemon Configuration"
                 talked at once lost four to five times more of its
                 downlink than at 10 s.
 
+        config ESP_PTP_ANNOUNCE_TSF_LOG
+            bool "Log the station TSF with each received Announce"
+            default n
+            depends on ESP_PTP_PORT0_MEDIUM_WIFI_FTM || ESP_PTP_PORT1_MEDIUM_WIFI_FTM
+            help
+                One line per Announce, ANNOUNCE_TSF,<sequenceId>,<TSF us>,
+                with the TSF read as the frame is handed to the daemon.
+                An access point that logs its own clock per Announce can
+                pair the two by sequenceId to find its TSF-to-clock
+                offset, when its radio cannot report its TSF.
+
         config ESP_PTP_PEER_LOSS_TEST
             bool "Finite peer-delay request loss diagnostic"
             default n
