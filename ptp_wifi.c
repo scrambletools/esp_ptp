@@ -700,6 +700,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
               valid++;
               last_valid = i;
             }
+#ifdef CONFIG_ESP_PTP_FTM_LOG_SESSIONS
+            ESP_LOGI(TAG,
+                     "FTM entry %u: token=%u rssi=%d ppm=%d rtt=%" PRIu32
+                     " ps t1=%" PRIu64 " t2=%" PRIu64 " t3=%" PRIu64
+                     " t4=%" PRIu64 " ps",
+                     i, entries[i].dlog_token, entries[i].rssi,
+                     entries[i].ppm, entries[i].rtt, entries[i].t1,
+                     entries[i].t2, entries[i].t3, entries[i].t4);
+#endif
           }
           if (valid) {
             avg_rtt_ps = sum_ps / valid;
@@ -802,7 +811,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id,
       ftm_status_measured(rc == 0, status_clamp_ns(rtt_ns));
 
       static uint32_t s_seen = 0;
-      if ((++s_seen % 25) == 1) {
+#ifdef CONFIG_ESP_PTP_FTM_LOG_SESSIONS
+      const bool log_report = true;
+#else
+      const bool log_report = false;
+#endif
+      if ((++s_seen % 25) == 1 || log_report) {
         ESP_LOGI(TAG,
                  "FTM report #%u: peer %02x:%02x:%02x:%02x:%02x:%02x "
                  "RTT_est=%u ns  avg_rtt=%llu ps (%u/%u valid)  "
@@ -1356,6 +1370,7 @@ static void ftm_client_task(void *arg) {
         continue;
       }
     } else {
+#ifndef CONFIG_ESP_PTP_FTM_RANGING_ANY_AP
       /* Range only an access point that offers an FTM responder: with
        * none, every session ends unanswered, and each one held the
        * station's receive off for 0.3-0.4 s. */
@@ -1369,6 +1384,7 @@ static void ftm_client_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_ESP_PTP_FTM_RANGING_PAUSE_MS));
         continue;
       }
+#endif
     }
     xEventGroupClearBits(s_events, BIT_FTM_REPORT_OK);
     esp_err_t result = esp_event_post(PTP_FTM_CONTROL, FTM_CONTROL_START,

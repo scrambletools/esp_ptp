@@ -505,6 +505,26 @@ menu "PTP Daemon Configuration"
                 talked at once lost four to five times more of its
                 downlink than at 10 s.
 
+        config ESP_PTP_FTM_RANGING_ANY_AP
+            bool "Range an access point that advertises no FTM responder"
+            default n
+            depends on ESP_PTP_FTM_RANGING
+            help
+                For testing a responder outside the access point's firmware,
+                such as one answering through hostapd, while the access
+                point leaves the FTM responder bit out of its Extended
+                Capabilities. Each unanswered session holds the station's
+                receive off for 0.3-0.4 s, so leave it off otherwise.
+
+        config ESP_PTP_FTM_LOG_SESSIONS
+            bool "Log every FTM session and its report entries"
+            default n
+            depends on ESP_PTP_FTM_RANGING
+            help
+                One line per session, and one per report entry with its
+                RTT and t1-t4, rather than every 25th session. For
+                checking a responder.
+
         config ESP_PTP_ANNOUNCE_TSF_LOG
             bool "Log the station TSF with each received Announce"
             default n
