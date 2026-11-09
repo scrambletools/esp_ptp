@@ -1182,6 +1182,26 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     const int WINDOW_DOWN_SHIFT = 2;  /* move a quarter of the way down */
     const int SLOPE_GAIN_SHIFT = 5;   /* slope += best error / window / 32 */
     const int64_t SLOPE_MAX_PPB = 200000;
+    const int64_t TSF_BACK_US = 1000000; /* further back => AP restarted */
+
+    /* An access point that restarted began its TSF, and the station's
+     * with it, again from zero, so the offset to BTC is new. Acquire it
+     * over ACQ_SAMPLES rather than let the step detector snap to one
+     * sample, whose gap then rings in the servo (seen on scrambox: 231 us
+     * after a snap, 17 us after acquiring). A brief drop from an AP that
+     * kept running keeps the TSF going forward and the offset as is. */
+    bool tsf_restarted =
+        s_acq > 0 && sta_tsf_us < s_last_tsf_us - TSF_BACK_US;
+    if (tsf_restarted) {
+      ESP_LOGI(TAG, "BTC: AP TSF went back %lld ms, acquiring again",
+               (long long)((s_last_tsf_us - sta_tsf_us) / 1000));
+      s_acq = 0;
+      s_down_run = 0;
+      beacon_status_reacquire();
+      portENTER_CRITICAL(&s_status_lock);
+      if (s_ap_resets < UINT16_MAX) ++s_ap_resets;
+      portEXIT_CRITICAL(&s_status_lock);
+    }
 
     /* A new gmTimeBaseIndicator marks a change of BTC (AVB Wireless
      * §2.4.1). Its lastGmPhaseChange, where known and within the step
@@ -1197,7 +1217,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
                          info->gmtimebaseindicator[1];
     if (s_have_time_base && time_base != s_time_base) {
       int64_t phase_ns;
-      if (follow_up_phase_change_ns(info, &phase_ns) &&
+      if (!tsf_restarted && follow_up_phase_change_ns(info, &phase_ns) &&
           phase_ns <= OFF_STEP_NS && phase_ns >= -OFF_DOWN_STEP_NS) {
         ESP_LOGI(TAG, "BTC time base %u -> %u, phase change %lld ns applied",
                  (unsigned)s_time_base, (unsigned)time_base,
