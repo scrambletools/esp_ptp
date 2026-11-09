@@ -11,12 +11,15 @@ typedef struct {
     uint8_t peer[6];
 } ptp_ftm_session_t;
 
+/* The clock element counts as fresh for max_age_us after it arrived, as
+ * long as it arrived after the association. */
 static inline bool ptp_ftm_beacon_fresh(bool have_tsf, bool have_gptp,
-    int64_t associated_us, int64_t received_us, int64_t now_us)
+    int64_t associated_us, int64_t received_us, int64_t now_us,
+    int64_t max_age_us)
 {
     return have_tsf && have_gptp && associated_us > 0 &&
            received_us >= associated_us && now_us >= received_us &&
-           now_us - received_us <= 1000000;
+           now_us - received_us <= max_age_us;
 }
 
 static inline bool ptp_ftm_session_begin(ptp_ftm_session_t *session,

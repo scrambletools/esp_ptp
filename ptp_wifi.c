@@ -487,15 +487,6 @@ static int64_t s_tsf_marker_received_us;
 static bool s_seen_gptp;
 static bool s_seen_tsf;
 
-static bool ftm_clock_beacon_fresh(void) {
-  int64_t now_us = esp_timer_get_time();
-  portENTER_CRITICAL(&s_tsf_marker_lock);
-  bool fresh = ptp_ftm_beacon_fresh(s_seen_tsf, s_seen_gptp,
-      s_ftm_associated_us, s_tsf_marker_received_us, now_us);
-  portEXIT_CRITICAL(&s_tsf_marker_lock);
-  return fresh;
-}
-
 /* Latest FTM-derived link delay (ns). The beacon disciplining path adds
  * it to BTC_now; FTM only refines this value, so the clock still tracks
  * when FTM is unavailable (it just loses the ~propagation correction). */
@@ -533,6 +524,22 @@ static int32_t s_ftm_rtt_ns;
 static bool s_ftm_rtt_valid;
 static uint16_t s_ap_resets;
 static ptp_ftm_success_t s_ftm_success;
+
+/* Fresh within the sync receipt window, three element intervals, and at
+ * least 1 s. A fixed 1 s against an access point that sends the element
+ * every 1.024 s dropped about one completed FTM report in 40. */
+static bool ftm_clock_beacon_fresh(void) {
+  portENTER_CRITICAL(&s_status_lock);
+  int64_t max_age_us = s_beacon_window_us > 1000000 ? s_beacon_window_us
+                                                     : 1000000;
+  portEXIT_CRITICAL(&s_status_lock);
+  int64_t now_us = esp_timer_get_time();
+  portENTER_CRITICAL(&s_tsf_marker_lock);
+  bool fresh = ptp_ftm_beacon_fresh(s_seen_tsf, s_seen_gptp,
+      s_ftm_associated_us, s_tsf_marker_received_us, now_us, max_age_us);
+  portEXIT_CRITICAL(&s_tsf_marker_lock);
+  return fresh;
+}
 
 static int32_t status_clamp_ns(int64_t value_ns) {
   if (value_ns > INT32_MAX) return INT32_MAX;
