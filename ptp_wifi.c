@@ -940,6 +940,17 @@ static bool follow_up_phase_change_ns(const struct ptp_info_tlv_s *info,
   return true;
 }
 
+/* cumulativeScaledRateOffset in ppb: (rate - 1) x 2^41 as a signed 32-bit
+ * count. In the beacon element the rate is BTC's against the access
+ * point's TSF; our bridge sends 0. */
+static int64_t follow_up_rate_ppb(const struct ptp_info_tlv_s *info) {
+  const uint8_t *scaled = info->cumulativescaledrateoffset;
+  int32_t value = (int32_t)(((uint32_t)scaled[0] << 24) |
+                            ((uint32_t)scaled[1] << 16) |
+                            ((uint32_t)scaled[2] << 8) | scaled[3]);
+  return (int64_t)value * 1000000000LL / (1LL << 41);
+}
+
 /* Vendor IE callback — fires for every Vendor IE in scanned/received
  * beacons and probe responses. Filters to our OUI and decodes the
  * beacon time element the bridge publishes (AVB Wireless §2.4.1): an
@@ -1174,8 +1185,8 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
      *  - Acquire: over the first ACQ_SAMPLES, peak-hold the min-gap offset
      *    WITHOUT disciplining (clock free-runs); the first post-acquire
      *    inject is then one clean jump, not a long slew.
-     *  - Track: the envelope follows the BTC<->AP-TSF crystal drift as a
-     *    learned slope. It rises toward cleaner samples at once (capped
+     *  - Track: the envelope follows the BTC<->AP-TSF crystal drift as the
+     *    element's rate plus a learned slope. It rises toward cleaner samples at once (capped
      *    below the servo slew so it never rails) and moves down only once
      *    per window, toward that window's best sample, which also trims
      *    the slope. A fixed per-sample decay instead fell about 100 ppm
@@ -1189,6 +1200,7 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     static int64_t s_off_filt;
     static int s_down_run = 0;
     static int64_t s_slope_ppb;      /* learned envelope drift, ns per s */
+    static int64_t s_rate_ppb;       /* the element's BTC rate vs TSF */
     static int64_t s_last_tsf_us;    /* TSF at the previous envelope update */
     static int s_window_samples;
     static int64_t s_window_best;    /* largest off_err in the window */
@@ -1258,8 +1270,18 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
     s_have_time_base = true;
 
     if (s_acq >= ACQ_SAMPLES) {
-      s_off_filt += s_slope_ppb * (sta_tsf_us - s_last_tsf_us) / 1000000;
+      s_off_filt += (s_rate_ppb + s_slope_ppb) *
+                    (sta_tsf_us - s_last_tsf_us) / 1000000;
     }
+    /* An access point that measures its own BTC rate against its TSF
+     * carries it in the element. Feeding it forward follows a warming
+     * radio crystal at once, where the learned slope found it only
+     * through the min-gap envelope about 20 s late; the slope then learns
+     * just the residual. Behind an access point that sends 0, the slope
+     * learns all of it, as before. */
+    s_rate_ppb = follow_up_rate_ppb(info);
+    if (s_rate_ppb > SLOPE_MAX_PPB) s_rate_ppb = SLOPE_MAX_PPB;
+    if (s_rate_ppb < -SLOPE_MAX_PPB) s_rate_ppb = -SLOPE_MAX_PPB;
     s_last_tsf_us = sta_tsf_us;
     int64_t off_err = offset_raw - s_off_filt;
 
@@ -1329,9 +1351,10 @@ static void on_vendor_ie(void *ctx, wifi_vendor_ie_type_t type,
       if ((++s_disc_seen % 25) == 1) {
         ESP_LOGI(TAG,
                  "BTC discipline: off=%lld ns gap=%lld ns link_delay=%lld ns "
-                 "slope=%lld ppb",
+                 "slope=%lld ppb rate=%lld ppb",
                  (long long)off_ns, (long long)off_err,
-                 (long long)s_peer_delay_ns, (long long)s_slope_ppb);
+                 (long long)s_peer_delay_ns, (long long)s_slope_ppb,
+                 (long long)s_rate_ppb);
       }
     }
   }
