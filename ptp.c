@@ -3274,6 +3274,14 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
   bool same_root = !memcmp(msg->btc_identity, state->selected_source.btc_identity, 8);
   if (!is_better_clock(msg, &state->own_identity)) {
     if (same_port) {
+      /* Logged because nothing else marks it: the next good Announce
+       * re-selects and only the switch shows. */
+      ptpinfo("ANNOUNCE_WORSE,%u,%u,%u,%02x%02x%02x%02x%02x%02x%02x%02x,%u,%u",
+          msg->btc_priority1, msg->btc_quality[0], msg->btc_priority2,
+          msg->btc_identity[0], msg->btc_identity[1], msg->btc_identity[2],
+          msg->btc_identity[3], msg->btc_identity[4], msg->btc_identity[5],
+          msg->btc_identity[6], msg->btc_identity[7], steps,
+          (unsigned)((msg->header.sequenceid[0] << 8) | msg->header.sequenceid[1]));
       ptp_invalidate_timing();
       state->selected_source_valid = false;
       memset(&state->selected_source, 0, sizeof(state->selected_source));
@@ -3297,6 +3305,7 @@ static int ptp_process_announce(FAR struct ptp_state_s *state,
                       memcmp(state->selected_path.identities, path.identities,
                              path.count * 8);
   if (changed) {
+    ptpinfo("SOURCE_CHANGE,%u,%u,%u", state->selected_source_valid, same_port, same_root);
     ptpstate("Switching PTP time source\n");
     ptp_invalidate_timing();
     state->port[0].twostep_pending = false;
