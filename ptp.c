@@ -597,6 +597,7 @@ struct ptp_state_s {
 
   bool gptp_fallback_done;
   uint8_t avb_lite_fallback_reason; /* §2.2 condition that latched, 0 none */
+  int64_t fallback_armed_us; /* when the last link-up re-armed it */
 
   /* Information TLV time base fields (802.1AS-2020 10.2.2.2.9 to
    * 10.2.2.2.11): the selected source's latest, relayed in the beacon
@@ -655,6 +656,15 @@ static volatile bool s_eth_rx_restarted;
  * for this long, the nine 1 s deadlines plus one. */
 static volatile ptpd_rx_drop_probe_t s_rx_drop_probe;
 #define PTP_RX_DROP_WINDOW_US (10 * 1000 * 1000)
+
+/* Unanswered peer delay requests in the first seconds after a link-up do
+ * not count toward the AVB Lite fallback. A neighbour booting behind the
+ * link brings it up before anything answers Pdelay: a PC's NIC came up
+ * for 2 s and 8 s windows during its firmware and boot loader, and each
+ * window, or the wait for its gPTP daemon, filled the nine deadlines and
+ * latched the endpoint into AVB Lite until the next link change. A
+ * neighbour that never answers still latches, nine deadlines after this. */
+#define PTP_FALLBACK_LINK_GRACE_US (10 * 1000 * 1000)
 
 /* The RX callback publishes bounded copies; only the daemon parses them. */
 #define PTP_INJECT_DEPTH 8
@@ -853,6 +863,7 @@ static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
 
   state->avb_lite_fallback_reason = 0;
   state->gptp_fallback_done = false;
+  state->fallback_armed_us = esp_timer_get_time();
   state->port[0].last_transmitted_delayreq.tv_sec = 0;
   state->port[0].last_transmitted_delayreq.tv_nsec = 0;
 
@@ -869,7 +880,8 @@ static void ptp_arm_profile_fallback(FAR struct ptp_state_s *state) {
   state->port[0].last_endpoint_beacon.tv_sec = 0;
   state->port[0].last_endpoint_beacon.tv_nsec = 0;
 
-  ptpinfo("Armed profile fallback evaluation\n");
+  ptpinfo("Armed profile fallback evaluation (losses count after %d s)\n",
+          (int)(PTP_FALLBACK_LINK_GRACE_US / 1000000));
 }
 
 /* Find the first port whose medium matches; returns -1 if none. The
@@ -2844,8 +2856,11 @@ static void ptp_check_profile_fallback(FAR struct ptp_state_s *state) {
    * published requests after their deadline, not the request still in flight.
    * This policy is separate from gPTP asCapable fault tolerance. */
 
+  int64_t now_us = esp_timer_get_time();
   portENTER_CRITICAL(&s_peer_lock);
-  ptp_peer_expire(&state->port[0].peer_exchange, esp_timer_get_time());
+  ptp_peer_expire(&state->port[0].peer_exchange, now_us);
+  if (now_us - state->fallback_armed_us < PTP_FALLBACK_LINK_GRACE_US)
+    state->port[0].peer_exchange.lost_responses = 0; /* link-up grace */
   unsigned unanswered = state->port[0].peer_exchange.lost_responses;
   portEXIT_CRITICAL(&s_peer_lock);
   /* Responses our own receiver dropped say nothing about the link
