@@ -135,9 +135,11 @@ Network peers:
 No conformance claim is made. These are bench measurements against
 IEEE Std 802.1AS-2020 Annex B (time-synchronization performance) and a
 clause-by-clause review of the Wi-Fi media-dependent layer (clause 12).
-The Annex B figures quoted are B.1.2 (LocalClock granularity no
-coarser than 40 ns) and B.3 (any two PTP Instances within seven hops
-synchronized to within 1 µs peak-to-peak).
+The Annex B items covered are B.1.2 (LocalClock granularity no
+coarser than 40 ns), B.2.4 (rate ratio measurement error within
+0.1 ppm), B.3 (any two PTP Instances within seven hops synchronized to
+within 1 µs peak-to-peak) and B.4 (MTIE and jitter of synchronized time
+through a reference endpoint filter).
 
 ### How it was measured
 
@@ -156,6 +158,13 @@ synchronized to within 1 µs peak-to-peak).
   ESP32-P4-WIFI6-POE-ETH (its bank powered from LDO4), GPIO33 on the
   ESP32-P4-ETH (a header pin outside the audio hat), GPIO18 on the
   ESP32-C6-LCD-1.69.
+- **Hardware pulses.** On P4 silicon v3.0 or later, the probe can
+  instead route the EMAC's own PPS0 output to the pin
+  (`CONFIG_CLOCK_SCOPE_HW_PPS`). The edges then come straight from the
+  PTP counter with no software in the path. With binary rollover it
+  gives 2^n Hz square waves; the probe alternates on gPTP time between
+  2 Hz and 16384 Hz. Older P4 silicon (v1.x) cannot route PPS0 to a
+  GPIO.
 - **Oscilloscope.** A Rigol DHO804 (four channels, 10x probes,
   1 V/div), triggered on the bridge's pulse, takes one single-shot
   acquisition a second at 2 µs/div (20 ns a sample, ±10 µs window).
@@ -189,6 +198,57 @@ throughout, and endpoint B ran a two-way AVB audio session for about
   292–312 ns. TDEV over 1 / 10 / 100 s: 46–49 / 14–15 / 4.3–4.6 ns. It
   falls like white noise; no wander shows within the hour.
 - B.3 is met for these two-hop pairs. Seven hops were not built.
+- With a hardware edge on one side (2026-11-18, 540 s, a P4 v3.2
+  ESP32-P4-ETH's PPS0 against the bridge's corrected pulse): std dev
+  39 ns, peak-to-peak 221 ns, all within ±1 µs, plus a constant
+  −166 ns offset between the two outputs (pin path and edge type).
+
+### Rate ratio measurement (B.2.4)
+
+Every neighbor rate ratio estimate (`CONFIG_ESP_PTP_PDELAY_RATE_LOG_ALL`)
+from two Waveshare ESP32-P4-ETH endpoints against the MOTU AVB Switch,
+2026-11-18, about 1.5 hours each, excluding the first 300 s after boot.
+esp_ptp computes each ratio over one Pdelay interval (1 s) with no
+averaging. The error is taken as each estimate's difference from the
+mean of the 61 around it. That also includes the servo's own rate
+steering, so it is an upper bound.
+
+| Board | Estimates | Std dev | 99.9th percentile | Largest | Over 100 ppb |
+| --- | --- | --- | --- | --- | --- |
+| Endpoint A | 5,863 | 30 ppb | 89 ppb | 96 ppb | 0 |
+| Endpoint B | 5,129 | 31 ppb | 96 ppb | 101 ppb | 2 |
+
+B.2.4 is met within this bound, with the largest estimates at the
+0.1 ppm limit. That is what its note expects for a 1 s interval
+measured with 40 ns timestamps; averaging the ratio over several
+intervals would leave margin.
+
+### Synchronized time through the reference endpoint filter (B.4)
+
+A P4 v3.2 Waveshare ESP32-P4-ETH endpoint output its synchronized time
+as a 16384 Hz square wave from the EMAC (PPS0). The oscilloscope took
+twenty 0.8 s records at 160 ns a sample, plus fifteen 32 ms records at
+6.4 ns. For each record, a straight-line fit to the edge times removes
+the scope's own frequency offset, which leaves the phase of the
+synchronized time at 16384 samples a second. The two reference endpoint
+filters of Table B-4 (first order, 1 Hz and 10 Hz) were applied in
+software, then MTIE over 0.05–0.4 s and the peak-to-peak jitter through
+the matching high-pass filter were computed. The reference is the
+scope's timebase rather than the BTC, and the endpoint is one hop
+from it.
+
+| Endpoint filter | MTIE at 0.05–0.4 s | Mask | Jitter (high-pass) | Limit |
+| --- | --- | --- | --- | --- |
+| 1 Hz (Mask 1) | ≤ 6 ns | 348–443 ns | 0.23 ns p-p (200 Hz) | 11.1 ns |
+| 10 Hz (Mask 2) | ≤ 16 ns | 407 ns | 0.23 ns p-p (8 kHz) | 10.2 ns |
+
+- Unfiltered, the hardware edges show 14 ns rms and 66 ns peak-to-peak
+  of phase noise, almost all between 1 and 8 kHz. That is the PTP
+  counter's tick pattern, and the endpoint filter removes it.
+- For observation intervals of 1 s and more, the wired one-hour run
+  above gives MTIE of at most 312 ns, unfiltered, against masks of
+  1 µs (Mask 2) and 50 µs (Mask 1) at 1 s.
+- B.4 is met with a wide margin for one hop.
 
 ### LocalClock granularity (B.1.2)
 
@@ -235,5 +295,5 @@ transfer and Espressif's pre-release PTP-compatible FTM libraries
   §12.7 Follow_Up element need the Espressif PTP-compatible FTM API,
   which is not in a released ESP-IDF yet. Per-association PortSync/MD
   state machines (12.1.3) are partial.
-- Not measured: B.1.3 jitter and wander, B.2.4 rate ratio error, and
-  B.4 MTIE/jitter through the reference endpoint filter.
+- Not measured yet: B.1.3 jitter and wander generation of the
+  free-running LocalClock.
