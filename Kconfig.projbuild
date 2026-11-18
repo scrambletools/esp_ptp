@@ -605,6 +605,16 @@ config ESP_PTP_SOURCE_LOSS_ANNOUNCE_SECONDS
     range 8 60
     default 8
 
+config ESP_PTP_PDELAY_RATE_LOG_ALL
+    bool "Log every neighbor rate ratio estimate"
+    default n
+    help
+        Diagnostic. Logs PDELAY_RATE_ALL for each Pdelay rate estimate:
+        the update count, (rate ratio - 1) in 0.01 ppb, the servo's
+        frequency trim in ppb, the peer delay and its validity. About one
+        line a second per port. For measuring the rate ratio error
+        against 802.1AS-2020 B.2.4.
+
 config ESP_PTP_ANNOUNCE_PATH_PROBE
     bool "Run finite AP Announce path-omission diagnostic"
     default n

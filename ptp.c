@@ -4083,6 +4083,15 @@ ptp_process_delay_resp_follow_up(FAR struct ptp_state_s *state,
     ptpinfo("PDELAY_RATE,%u,%ld,%ld,%d", rate.updates,
             (long)llround((rate.ratio - 1.0) * 1e9),
             (long)llround(peer_delay), delay_valid);
+#if CONFIG_ESP_PTP_PDELAY_RATE_LOG_ALL
+  /* Every estimate, in 0.01 ppb, with the servo's trim at the time: the
+   * estimate plus the trim follows the free-running clock, whose slow drift
+   * leaves the estimation error (802.1AS B.2.4). */
+  if (current && rate_valid)
+    ptpinfo("PDELAY_RATE_ALL,%u,%lld,%ld,%ld,%d", rate.updates,
+            (long long)llround((rate.ratio - 1.0) * 1e11),
+            (long)state->freq_trim_ppb, (long)llround(peer_delay), delay_valid);
+#endif
 
   return OK;
 }
