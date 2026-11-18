@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <stdbool.h>
+#include "sdkconfig.h"
 
 /* Time-critical messages (id < 8) go to port 319, others to 320. */
 
@@ -291,8 +292,29 @@ int ptpd_register_sync_egress_cb(int port_index, ptpd_sync_egress_cb_t cb,
  * ptpd_now() routes through this once ptp_clock_sw_init() runs; on
  * EMAC 1588 platforms it is unused. */
 
-/* Raw local clock used by the software backend, not disciplined PTP time. */
+/* Raw local clock used by the software backend, not disciplined PTP time.
+ * On the C6 it is SYSTIMER (62.5 ns a tick) or, with
+ * CONFIG_ESP_PTP_LOCAL_CLOCK_GPTIMER, a 40 MHz general purpose timer
+ * (25 ns), started by ptp_clock_sw_init(); it reads 0 until then. */
 int64_t ptp_clock_local_ns(void);
+
+/* For code that brackets the local clock with another counter (the Wi-Fi
+ * MAC clock, a scope timer): ptp_clock_local_latch() latches the counter
+ * at that instant and ptp_clock_local_latched_ns() reads the latched value
+ * later. Call both inside one critical section, so no other reader moves
+ * the latch in between (the C6 is single core). */
+void ptp_clock_local_latch(void);
+int64_t ptp_clock_local_latched_ns(void);
+
+/* One tick of the local clock, rounded up: the quantization to allow for
+ * when bounding a latched value. */
+#if CONFIG_ESP_PTP_LOCAL_CLOCK_GPTIMER
+#define PTP_CLOCK_LOCAL_TICK_NS 25
+#elif CONFIG_IDF_TARGET_ESP32C6
+#define PTP_CLOCK_LOCAL_TICK_NS 63
+#else
+#define PTP_CLOCK_LOCAL_TICK_NS 1000
+#endif
 
 /* Initialize and select the software clock as the backend for
  * ptpd_now(). Resets its anchor and rate. After this call ptpd_now() returns the

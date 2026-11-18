@@ -544,6 +544,18 @@ menu "PTP Daemon Configuration"
                 Responses to the neighbor and received Sync remain active.
                 For bench expiry/recovery testing only; restore off afterward.
 
+    config ESP_PTP_LOCAL_CLOCK_GPTIMER
+        bool "Software clock on a 40 MHz hardware timer (C6)"
+        depends on IDF_TARGET_ESP32C6
+        default n
+        help
+            Runs the software PTP clock's local counter on a general
+            purpose timer at 40 MHz (25 ns a tick, PLL_F80M / 2) instead
+            of SYSTIMER (16 MHz, 62.5 ns a tick). IEEE 802.1AS-2020 B.1.2
+            asks for a LocalClock granularity of 40 ns or finer. Both
+            counters run from the 40 MHz crystal, so only the resolution
+            changes. Takes one of the C6's two general purpose timers.
+
     endif # ESP_PTP
 
 endmenu # PTP Daemon Configuration

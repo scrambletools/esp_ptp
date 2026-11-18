@@ -1,6 +1,6 @@
 idf_component_register(SRCS "ptp.c" "ptp_clock_sw.c" "ptp_beacon_ie.c" "ptp_radio_association.c" "ptp_wifi.c"
                        PRIV_REQUIRES esp_eth esp_netif esp_timer esp_event esp_hosted_avb
-                                     esp_wifi
+                                     esp_wifi esp_driver_gptimer esp_hal_systimer
                        INCLUDE_DIRS "." "./include"
                        WHOLE_ARCHIVE)
 
@@ -24,3 +24,11 @@ endif()
 # C6 keeps the fractional SYSTIMER tick discarded by esp_timer_get_time().
 idf_component_get_property(ptp_timer_dir esp_timer COMPONENT_DIR)
 target_include_directories(${COMPONENT_LIB} PRIVATE "${ptp_timer_dir}/private_include")
+
+# The C6 software clock on a hardware timer reads the timer's counter
+# registers itself; this file, built into the GPTimer driver's library,
+# hands it the driver's private register handle.
+if(CONFIG_ESP_PTP_LOCAL_CLOCK_GPTIMER)
+    idf_component_get_property(ptp_gptimer_lib esp_driver_gptimer COMPONENT_LIB)
+    target_sources(${ptp_gptimer_lib} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ptp_local_timer.c")
+endif()

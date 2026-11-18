@@ -12,8 +12,17 @@
 #include "sdkconfig.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#if CONFIG_IDF_TARGET_ESP32C6
+#if CONFIG_ESP_PTP_LOCAL_CLOCK_GPTIMER
+#include "esp_log.h"
+#include "driver/gptimer.h"
+#include "hal/timer_ll.h"
+/* ptp_local_timer.c, built into the GPTimer driver, reads its handle. */
+extern bool ptp_local_timer_hw(gptimer_handle_t timer, timg_dev_t **dev,
+                               uint32_t *timer_id);
+#elif CONFIG_IDF_TARGET_ESP32C6
 #include "esp_timer_impl.h"
+#include "hal/systimer_ll.h"
+#include "soc/systimer_struct.h"
 #endif
 
 typedef int (*ptpd_sw_clock_now_fn)(struct timespec *ts);
@@ -33,16 +42,95 @@ bool ptp_clock_sw_snapshot(ptp_clock_affine_t *snapshot)
     return initialized;
 }
 
+#if CONFIG_ESP_PTP_LOCAL_CLOCK_GPTIMER
+/* A free running 40 MHz general purpose timer (PLL_F80M / 2, the
+ * fastest a TIMG prescaler allows): 25 ns a tick. */
+#define LOCAL_TIMER_HZ 40000000
+static gptimer_handle_t s_local_timer;
+static timg_dev_t *volatile s_local_dev;
+static uint32_t s_local_id;
+static portMUX_TYPE s_local_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static int local_timer_start(void)
+{
+    if (s_local_dev) return 0;
+    gptimer_config_t config = {.clk_src = GPTIMER_CLK_SRC_PLL_F80M,
+                               .direction = GPTIMER_COUNT_UP,
+                               .resolution_hz = LOCAL_TIMER_HZ};
+    esp_err_t err = s_local_timer ? ESP_OK : gptimer_new_timer(&config, &s_local_timer);
+    if (err == ESP_OK) err = gptimer_enable(s_local_timer);
+    if (err == ESP_OK) err = gptimer_start(s_local_timer);
+    timg_dev_t *dev = NULL;
+    uint32_t id = 0;
+    if (err == ESP_OK && !ptp_local_timer_hw(s_local_timer, &dev, &id)) err = ESP_FAIL;
+    if (err != ESP_OK) {
+        ESP_LOGE("ptp_clock", "local clock timer: %s", esp_err_to_name(err));
+        return -1;
+    }
+    s_local_id = id;
+    s_local_dev = dev;
+    ESP_LOGI("ptp_clock", "local clock: 40 MHz hardware timer, 25 ns a tick");
+    return 0;
+}
+
+void ptp_clock_local_latch(void)
+{
+    if (s_local_dev) timer_ll_trigger_soft_capture(s_local_dev, s_local_id);
+}
+
+int64_t ptp_clock_local_latched_ns(void)
+{
+    if (!s_local_dev) return 0;
+    return (int64_t)timer_ll_get_counter_value(s_local_dev, s_local_id) * 25;
+}
+
 int64_t ptp_clock_local_ns(void)
 {
-#if CONFIG_IDF_TARGET_ESP32C6
-    /* C6 SYSTIMER uses the 40 MHz crystal divided by 2.5, or 62.5 ns/tick. */
-    uint64_t ticks = esp_timer_impl_get_counter_reg();
-    return (int64_t)(ticks / 2 * 125 + (ticks & 1) * 62);
-#else
-    return esp_timer_get_time() * 1000;
-#endif
+    if (!s_local_dev) return 0;
+    portENTER_CRITICAL_SAFE(&s_local_lock);
+    timer_ll_trigger_soft_capture(s_local_dev, s_local_id);
+    uint64_t ticks = timer_ll_get_counter_value(s_local_dev, s_local_id);
+    portEXIT_CRITICAL_SAFE(&s_local_lock);
+    return (int64_t)ticks * 25;
 }
+#elif CONFIG_IDF_TARGET_ESP32C6
+/* C6 SYSTIMER uses the 40 MHz crystal divided by 2.5, or 62.5 ns/tick. */
+static inline int64_t systimer_ns(uint64_t ticks)
+{
+    return (int64_t)(ticks / 2 * 125 + (ticks & 1) * 62);
+}
+
+void ptp_clock_local_latch(void)
+{
+    systimer_ll_counter_snapshot(&SYSTIMER, 0);
+    for (unsigned attempts = 0;
+         !systimer_ll_is_counter_value_valid(&SYSTIMER, 0) && attempts < 64; ++attempts) {}
+}
+
+int64_t ptp_clock_local_latched_ns(void)
+{
+    uint32_t low = systimer_ll_get_counter_value_low(&SYSTIMER, 0);
+    uint32_t high = systimer_ll_get_counter_value_high(&SYSTIMER, 0);
+    return systimer_ns(((uint64_t)high << 32) | low);
+}
+
+int64_t ptp_clock_local_ns(void)
+{
+    return systimer_ns(esp_timer_impl_get_counter_reg());
+}
+#else
+void ptp_clock_local_latch(void) {}
+
+int64_t ptp_clock_local_latched_ns(void)
+{
+    return esp_timer_get_time() * 1000;
+}
+
+int64_t ptp_clock_local_ns(void)
+{
+    return esp_timer_get_time() * 1000;
+}
+#endif
 
 static int sw_now_timespec(struct timespec *ts)
 {
@@ -67,6 +155,9 @@ static int sw_now_timespec(struct timespec *ts)
 
 int ptp_clock_sw_init(const struct timespec *initial_ts)
 {
+#if CONFIG_ESP_PTP_LOCAL_CLOCK_GPTIMER
+    if (local_timer_start() != 0) return -1;
+#endif
     int64_t initial_ns = initial_ts ?
         (int64_t)initial_ts->tv_sec * 1000000000LL + initial_ts->tv_nsec : 0;
     portENTER_CRITICAL(&s_clock_lock);
