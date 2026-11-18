@@ -136,7 +136,7 @@ No conformance claim is made. These are bench measurements against
 IEEE Std 802.1AS-2020 Annex B (time-synchronization performance) and a
 clause-by-clause review of the Wi-Fi media-dependent layer (clause 12).
 The Annex B items covered are B.1.2 (LocalClock granularity no
-coarser than 40 ns), B.2.4 (rate ratio measurement error within
+coarser than 40 ns), B.1.3.1 (LocalClock jitter generation), B.2.4 (rate ratio measurement error within
 0.1 ppm), B.3 (any two PTP Instances within seven hops synchronized to
 within 1 µs peak-to-peak) and B.4 (MTIE and jitter of synchronized time
 through a reference endpoint filter).
@@ -263,6 +263,29 @@ pulse placement error against the local clock fell from 25.3 ns to
 10.2 ns std dev with the 40 MHz clock (39 % to 94 % of pulses within
 ±13 ns).
 
+### LocalClock jitter generation (B.1.3.1)
+
+The P4's PTP counter counts its 40 MHz crystal (EMAC PTP clock source
+XTAL, 25 ns). A P4 v3.2 Waveshare ESP32-P4-ETH routed that crystal to a
+header pin through the clock output matrix (`CONFIG_CLOCK_SCOPE_XTAL_OUT`
+of the scope probe). The oscilloscope recorded it on one channel at
+1.6 ns a sample, in 16 ms records of about 640,000 edges each,
+2026-11-18. Each edge was timed at the waveform's mid level, and a
+straight-line fit removed the frequency offset to the scope, leaving the
+time interval error (TIE).
+
+| Run (25 records over about 71 s) | TIE rms | TIE peak-to-peak |
+| --- | --- | --- |
+| 1 | 0.071 ns | 0.75 ns |
+| 2 | 0.071 ns | 0.72 ns |
+| 3 | 0.072 ns | 0.74 ns |
+
+B.1.3.1 allows 2 ns peak-to-peak over 60 s in a 10 Hz to 20 MHz band,
+so it is met. These figures include the scope's own sampling and
+quantization noise, and most of the TIE lies above 100 kHz, so they are
+an upper bound. A 16 ms record cannot show the 10–60 Hz part of the
+band; the measured spectrum below 1 kHz contributes about 0.002 ns rms.
+
 ### Wi-Fi (one hop, bridge to station)
 
 Waveshare ESP32-P4-WIFI6-POE-ETH bridge (onboard C6 as the AP and FTM
@@ -295,5 +318,6 @@ transfer and Espressif's pre-release PTP-compatible FTM libraries
   §12.7 Follow_Up element need the Espressif PTP-compatible FTM API,
   which is not in a released ESP-IDF yet. Per-association PortSync/MD
   state machines (12.1.3) are partial.
-- Not measured yet: B.1.3 jitter and wander generation of the
-  free-running LocalClock.
+- Not measured yet: B.1.3.2 wander generation (TDEV) of the
+  free-running LocalClock, which needs continuous phase samples at
+  30 Hz or more for at least 120 s; and B.1.3.1 on the ESP32-C6.
