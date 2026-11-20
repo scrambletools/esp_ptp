@@ -74,6 +74,17 @@ participates as a time-aware bridge (BRIDGED+BRIDGED).
 - **External peer-delay** — applications can push out-of-band
   peer-delay measurements (e.g. from 802.11 FTM) via
   `ptpd_inject_peer_delay()` on `wifi_ftm` ports operating as STA.
+- **External time source** (`ptp_external.h`) — pairs of this PTP clock
+  and gPTP time measured some other way, such as a Wi-Fi coprocessor's
+  FTM time engine, through `ptpd_external_observe()`. In standby it
+  steers the hardware clock while the wired source is lost and hands
+  back when it returns, so an endpoint keeps gPTP through a failover to
+  Wi-Fi. Its servo is slow (natural frequency 0.05 rad/s), shares the
+  wired servo's integral and never steps the clock. Shadow mode only
+  measures; forced mode steers with wired up and measures wired Sync
+  against the clock (EXTERNAL lines). On the bench, Wi-Fi time alone
+  held a P4 endpoint's clock to a mean of -2 ns, 83 ns standard
+  deviation, against wired gPTP over 15 minutes.
 
 ## Clock backends
 

@@ -79,6 +79,7 @@ static bool s_use_sw_clock = false;
 #include "ptp_timing_snapshot.h"
 #include "ptp_sync_receipt.h"
 #include "ptp_wired_pi.h"
+#include "ptp_external.h"
 #include "freertos/FreeRTOS.h"
 #include "esp_vfs_l2tap.h"
 #include "esp_wifi.h"
@@ -3539,6 +3540,232 @@ static void ptp_clean_after_step(FAR struct ptp_state_s *state) {
  * Remote time was remote_timestamp at local_timestamp.
  */
 
+/* ------------------------------------------------------------------
+ * External time source (ptp_external.h). Samples queue from any task;
+ * the daemon averages them in groups and, when the mode says so, steers
+ * the hardware clock with the wired servo, sharing its integral.
+ * ------------------------------------------------------------------ */
+#define PTP_EXTERNAL_DEPTH 32
+#define PTP_EXTERNAL_GROUP 16 /* about 2 s of 125 ms FTM sessions */
+/* A session that loses its first frame waits 2 s for a report. */
+#define PTP_EXTERNAL_FRESH_US 3000000
+/* The external servo is slow: natural frequency 0.05 rad/s, damping 0.7
+ * (the wired one runs at 2 rad/s). Its time-transfer samples go through
+ * the clock link, a fit of this very clock against the coprocessor's
+ * timer over 8 s, so a rate that changes every few seconds would bend
+ * the fit and feed back; on the bench a 2 s loop oscillated at several
+ * hundred ns. Gains in ppb per ns of offset: Kp = 2 zeta wn per second,
+ * Ki = wn^2 per second squared. */
+#define PTP_EXTERNAL_KP 0.07
+#define PTP_EXTERNAL_KI 0.0025
+#define PTP_EXTERNAL_REPORT_US 10000000
+#define PTP_EXTERNAL_MAX_STEER_NS 1000000 /* never step from it */
+
+typedef struct {
+  double sum, squares, low, high;
+  uint32_t count;
+} ptp_external_window_t;
+
+static portMUX_TYPE s_external_lock = portMUX_INITIALIZER_UNLOCKED;
+static ptp_external_sample_t s_external_queue[PTP_EXTERNAL_DEPTH];
+static unsigned s_external_head, s_external_count;
+static uint32_t s_external_dropped;
+static volatile ptp_external_mode_t s_external_mode;
+static struct {
+  bool driving;
+  int64_t last_sample_us;
+  int64_t offset_ns;
+  uint32_t updates;
+  double group_sum;
+  unsigned group_count;
+  int64_t group_local_ns;
+  int64_t applied_local_ns;
+  ptp_external_window_t samples, wired;
+  int64_t next_report_us;
+} s_external;
+
+void ptpd_external_set_mode(ptp_external_mode_t mode) {
+  s_external_mode = mode;
+}
+
+bool ptpd_external_observe(const ptp_external_sample_t *sample) {
+  if (!sample) return false;
+  bool queued = false;
+  portENTER_CRITICAL(&s_external_lock);
+  if (s_external_count < PTP_EXTERNAL_DEPTH) {
+    s_external_queue[(s_external_head + s_external_count++) %
+                     PTP_EXTERNAL_DEPTH] = *sample;
+    queued = true;
+  } else {
+    ++s_external_dropped;
+  }
+  portEXIT_CRITICAL(&s_external_lock);
+  return queued;
+}
+
+void ptpd_external_status(ptp_external_status_t *status) {
+  portENTER_CRITICAL(&s_external_lock);
+  *status = (ptp_external_status_t){
+      .mode = s_external_mode,
+      .driving = s_external.driving,
+      .fresh = s_external.last_sample_us &&
+               esp_timer_get_time() - s_external.last_sample_us <=
+                   PTP_EXTERNAL_FRESH_US,
+      .offset_ns = s_external.offset_ns,
+      .updates = s_external.updates,
+  };
+  portEXIT_CRITICAL(&s_external_lock);
+}
+
+static void ptp_external_window_add(ptp_external_window_t *window,
+                                    double value) {
+  if (!window->count || value < window->low) window->low = value;
+  if (!window->count || value > window->high) window->high = value;
+  window->sum += value;
+  window->squares += value * value;
+  window->count++;
+}
+
+static void ptp_external_window_log(const char *name,
+                                    const ptp_external_window_t *window) {
+  if (!window->count) return;
+  double mean = window->sum / window->count;
+  double variance = window->squares / window->count - mean * mean;
+  ptpinfo("EXTERNAL,%s,%" PRIu32 " samples,mean %.0f ns,sd %.0f,p-p %.0f",
+          name, window->count, mean, sqrt(variance > 0 ? variance : 0),
+          window->high - window->low);
+}
+
+/* One servo update from an averaged external offset (gPTP minus clock). */
+static void ptp_external_steer(FAR struct ptp_state_s *state,
+                               int64_t offset_ns, int64_t local_ns) {
+  if (offset_ns > PTP_EXTERNAL_MAX_STEER_NS ||
+      offset_ns < -PTP_EXTERNAL_MAX_STEER_NS) {
+    ptpwarn("EXTERNAL,offset %lld ns is too far to steer", (long long)offset_ns);
+    return;
+  }
+  int64_t interval_ns = s_external.applied_local_ns &&
+                                local_ns > s_external.applied_local_ns
+                            ? local_ns - s_external.applied_local_ns
+                            : (int64_t)PTP_EXTERNAL_GROUP * 125000000;
+  int64_t saved_integral = state->offset_pi.wired_integral_q16;
+  /* The integral is the wired servo's, in ppb Q16, so the rate it holds
+   * carries over to and from the wired source. */
+  const double limit_q16 = (double)PTP_WIRED_TRIM_LIMIT * 65536;
+  double integral_q16 = (double)state->offset_pi.wired_integral_q16 +
+                        PTP_EXTERNAL_KI * (double)offset_ns *
+                            ((double)interval_ns / 1e9) * 65536;
+  if (integral_q16 > limit_q16) integral_q16 = limit_q16;
+  if (integral_q16 < -limit_q16) integral_q16 = -limit_q16;
+  state->offset_pi.wired_integral_q16 = (int64_t)integral_q16;
+  double target_ppb = integral_q16 / 65536 + PTP_EXTERNAL_KP * (double)offset_ns;
+  if (target_ppb > PTP_WIRED_TRIM_LIMIT) target_ppb = PTP_WIRED_TRIM_LIMIT;
+  if (target_ppb < -PTP_WIRED_TRIM_LIMIT) target_ppb = -PTP_WIRED_TRIM_LIMIT;
+  int32_t target = (int32_t)llround(target_ppb);
+  struct timex tx = {
+      .modes = ADJ_FREQUENCY,
+      .freq = ptp_trim_relative_delta(state->freq_trim_ppb, target),
+  };
+  if (clock_adjtime(PTPD_CLOCK_ID, &tx) == 0) {
+    state->freq_trim_ppb = target;
+    state->offset_pi.drift_acc = state->offset_pi.wired_integral_q16 / 65536;
+    s_external.applied_local_ns = local_ns;
+    portENTER_CRITICAL(&s_external_lock);
+    s_external.updates++;
+    portEXIT_CRITICAL(&s_external_lock);
+  } else {
+    state->offset_pi.wired_integral_q16 = saved_integral;
+  }
+}
+
+static bool ptp_external_should_drive(FAR struct ptp_state_s *state,
+                                      int64_t now_us) {
+  if (s_use_sw_clock) return false; /* the hardware clock only */
+  bool fresh = s_external.last_sample_us &&
+               now_us - s_external.last_sample_us <= PTP_EXTERNAL_FRESH_US;
+  switch (s_external_mode) {
+  case PTP_EXTERNAL_FORCED:
+    return fresh;
+  case PTP_EXTERNAL_STANDBY:
+    return fresh && !state->selected_source_valid;
+  default:
+    return false;
+  }
+}
+
+/* Daemon loop: drain, average, steer when due, report every 10 s. */
+static void ptp_external_tick(FAR struct ptp_state_s *state) {
+  for (unsigned drained = 0; drained < PTP_EXTERNAL_DEPTH; ++drained) {
+    ptp_external_sample_t sample;
+    portENTER_CRITICAL(&s_external_lock);
+    bool available = s_external_count != 0;
+    if (available) {
+      sample = s_external_queue[s_external_head];
+      s_external_head = (s_external_head + 1) % PTP_EXTERNAL_DEPTH;
+      --s_external_count;
+    }
+    portEXIT_CRITICAL(&s_external_lock);
+    if (!available) break;
+    if (s_external_mode == PTP_EXTERNAL_OFF) continue;
+    double offset = (double)(sample.reference_ns - sample.local_ns);
+    s_external.last_sample_us = sample.received_us;
+    ptp_external_window_add(&s_external.samples, offset);
+    s_external.group_sum += offset;
+    s_external.group_count++;
+    s_external.group_local_ns = sample.local_ns;
+  }
+  int64_t now_us = esp_timer_get_time();
+  bool drive = ptp_external_should_drive(state, now_us);
+  if (drive != s_external.driving) {
+    ptpstate("EXTERNAL,driving %u (mode %d, wired source %u)", drive,
+             (int)s_external_mode, state->selected_source_valid);
+    portENTER_CRITICAL(&s_external_lock);
+    s_external.driving = drive;
+    portEXIT_CRITICAL(&s_external_lock);
+    s_external.group_sum = 0;
+    s_external.group_count = 0;
+    s_external.applied_local_ns = 0;
+    /* The wired servo restarts its interval from its next Sync. */
+    state->local_time_ns_prev = 0;
+  }
+  if (s_external.group_count >= PTP_EXTERNAL_GROUP) {
+    int64_t offset_ns =
+        (int64_t)llround(s_external.group_sum / s_external.group_count);
+    portENTER_CRITICAL(&s_external_lock);
+    s_external.offset_ns = offset_ns;
+    portEXIT_CRITICAL(&s_external_lock);
+    if (drive) ptp_external_steer(state, offset_ns, s_external.group_local_ns);
+    s_external.group_sum = 0;
+    s_external.group_count = 0;
+  }
+  if (s_external_mode != PTP_EXTERNAL_OFF && now_us >= s_external.next_report_us) {
+    if (s_external.next_report_us) {
+      portENTER_CRITICAL(&s_external_lock);
+      uint32_t dropped = s_external_dropped;
+      uint32_t updates = s_external.updates;
+      portEXIT_CRITICAL(&s_external_lock);
+      ptpinfo("EXTERNAL,mode %d,driving %u,updates %" PRIu32
+              ",trim %ld ppb,dropped %" PRIu32,
+              (int)s_external_mode, s_external.driving, updates,
+              (long)state->freq_trim_ppb, dropped);
+      ptp_external_window_log("external vs clock", &s_external.samples);
+      ptp_external_window_log("wired vs clock", &s_external.wired);
+    }
+    s_external.samples = (ptp_external_window_t){0};
+    s_external.wired = (ptp_external_window_t){0};
+    s_external.next_report_us = now_us + PTP_EXTERNAL_REPORT_US;
+  }
+}
+
+/* While the external source is forced to steer, a wired Sync is only
+ * measured: how far the clock it steers sits from wired gPTP. */
+static bool ptp_external_takes_wired(int64_t wired_offset_ns) {
+  if (!s_external.driving || s_external_mode != PTP_EXTERNAL_FORCED)
+    return false;
+  ptp_external_window_add(&s_external.wired, (double)wired_offset_ns);
+  return true;
+}
+
 static int ptp_update_local_clock(FAR struct ptp_state_s *state,
                                   FAR struct timespec *remote_timestamp,
                                   FAR struct timespec *local_timestamp) {
@@ -3559,6 +3786,11 @@ static int ptp_update_local_clock(FAR struct ptp_state_s *state,
     delta_ns += state->port[0].path_delay_ns + state->delay_asymmetry_ns;
   }
   absdelta_ns = (delta_ns < 0) ? -delta_ns : delta_ns;
+
+  if (ptp_external_takes_wired(delta_ns)) {
+    state->clock_updates++;
+    return OK;
+  }
 
   if (absdelta_ns > adj_limit_ns) {
     /* Large difference, move by jumping.
@@ -4790,6 +5022,7 @@ static void ptp_daemon(void *task_param) {
     }
 
     if (ptp_ftm_daemon_tick) ptp_ftm_daemon_tick();
+    ptp_external_tick(state);
     bool source_was_valid = state->selected_source_valid;
     state->selected_source_valid = is_selected_source_valid(state);
     if (source_was_valid && !state->selected_source_valid) {
