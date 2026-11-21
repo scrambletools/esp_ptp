@@ -3565,6 +3565,11 @@ static void ptp_clean_after_step(FAR struct ptp_state_s *state) {
  * Ki = wn^2 per second squared. */
 #define PTP_EXTERNAL_KP 0.07
 #define PTP_EXTERNAL_KI 0.0025
+/* While the wired source holds the clock, the external source's offset
+ * from it is its bias (on the bench Wi-Fi time read a few tens of ns
+ * off wired gPTP). It is learned over about a minute of samples and
+ * taken out while the external source steers. */
+#define PTP_EXTERNAL_BIAS_SAMPLES 480
 #define PTP_EXTERNAL_REPORT_US 10000000
 #define PTP_EXTERNAL_MAX_STEER_NS 1000000 /* never step from it */
 
@@ -3590,6 +3595,9 @@ static struct {
   int64_t applied_local_ns;
   ptp_external_window_t samples, wired;
   int64_t next_report_us;
+  double bias_ns;          /* external minus wired, while wired holds */
+  uint32_t bias_samples;
+  double steer_bias_ns;    /* the bias frozen while steering */
 } s_external;
 
 void ptpd_external_set_mode(ptp_external_mode_t mode) {
@@ -3718,6 +3726,15 @@ static void ptp_external_tick(FAR struct ptp_state_s *state) {
     double offset = (double)(sample.reference_ns - sample.local_ns);
     s_external.last_sample_us = sample.received_us;
     ptp_external_window_add(&s_external.samples, offset);
+    if (!s_external.driving && state->selected_source_valid) {
+      /* Learn the bias against the wired source: a running mean, then
+       * an exponential one over about a minute. */
+      uint32_t n = s_external.bias_samples < PTP_EXTERNAL_BIAS_SAMPLES
+                       ? ++s_external.bias_samples
+                       : PTP_EXTERNAL_BIAS_SAMPLES;
+      s_external.bias_ns += (offset - s_external.bias_ns) / n;
+    }
+    if (s_external.driving) offset -= s_external.steer_bias_ns;
     s_external.group_sum += offset;
     s_external.group_count++;
     s_external.group_local_ns = sample.local_ns;
@@ -3725,8 +3742,17 @@ static void ptp_external_tick(FAR struct ptp_state_s *state) {
   int64_t now_us = esp_timer_get_time();
   bool drive = ptp_external_should_drive(state, now_us);
   if (drive != s_external.driving) {
-    ptpstate("EXTERNAL,driving %u (mode %d, wired source %u)", drive,
-             (int)s_external_mode, state->selected_source_valid);
+    /* Steer to the wired time it was calibrated against, once it has
+     * a minute of calibration. */
+    s_external.steer_bias_ns =
+        s_external.bias_samples >= PTP_EXTERNAL_BIAS_SAMPLES / 4
+            ? s_external.bias_ns
+            : 0;
+    ptpstate("EXTERNAL,driving %u (mode %d, wired source %u, bias %.0f ns "
+             "from %" PRIu32 " samples)",
+             drive, (int)s_external_mode, state->selected_source_valid,
+             drive ? s_external.steer_bias_ns : s_external.bias_ns,
+             s_external.bias_samples);
     portENTER_CRITICAL(&s_external_lock);
     s_external.driving = drive;
     portEXIT_CRITICAL(&s_external_lock);
@@ -3754,9 +3780,9 @@ static void ptp_external_tick(FAR struct ptp_state_s *state) {
       uint32_t updates = s_external.updates;
       portEXIT_CRITICAL(&s_external_lock);
       ptpinfo("EXTERNAL,mode %d,driving %u,updates %" PRIu32
-              ",trim %ld ppb,dropped %" PRIu32,
+              ",trim %ld ppb,dropped %" PRIu32 ",bias %.0f ns",
               (int)s_external_mode, s_external.driving, updates,
-              (long)state->freq_trim_ppb, dropped);
+              (long)state->freq_trim_ppb, dropped, s_external.bias_ns);
       ptp_external_window_log("external vs clock", &s_external.samples);
       ptp_external_window_log("wired vs clock", &s_external.wired);
     }
