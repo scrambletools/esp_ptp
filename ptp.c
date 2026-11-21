@@ -1254,6 +1254,13 @@ static bool ptp_peer_drop_logged(void) {
 static int ptp_net_send_to(FAR struct ptp_state_s *state, void *ptp_msg,
                            uint16_t ptp_msg_len, struct timespec *ts,
                            const uint8_t *dest_mac) {
+  /* Nothing goes out on a wired port without carrier; callers keep
+   * quiet about ENETDOWN (a pulled cable would log every second). */
+  if (state->port[0].medium == ptp_port_medium_eth_hwts &&
+      !state->port[0].link_up) {
+    errno = ENETDOWN;
+    return ERROR;
+  }
   if (ptp_tags_frame(state, dest_mac)) {
     return ptp_net_send_tagged(state, ptp_msg, ptp_msg_len, ts, dest_mac);
   }
@@ -2367,7 +2374,7 @@ static int ptp_send_announce(FAR struct ptp_state_s *state) {
   ret = ptp_net_send(state, wire, wire_len, NULL);
 
   if (ret < 0) {
-    ptperr("sendto failed: %d", errno);
+    if (errno != ENETDOWN) ptperr("sendto failed: %d", errno);
   } else {
     ptpdebug("Sent announce, seq %ld", (long)ptp_get_sequence(&msg.header));
   }
@@ -2774,7 +2781,7 @@ static int ptp_send_delay_req(FAR struct ptp_state_s *state) {
   }
 
   if (ret < 0) {
-    ptperr("sendto failed: %d", errno);
+    if (errno != ENETDOWN) ptperr("sendto failed: %d", errno);
   } else {
     clock_gettime(CLOCK_MONOTONIC, &state->port[0].last_transmitted_delayreq);
     ptpdebug("Sent delay req, seq %ld", (long)ptp_get_sequence(&req.header));
@@ -4048,7 +4055,7 @@ static int ptp_process_delay_req(FAR struct ptp_state_s *state,
   }
 
   if (ret < 0) {
-    ptperr("sendto failed: %d", errno);
+    if (errno != ENETDOWN) ptperr("sendto failed: %d", errno);
     return ret;
   }
 
