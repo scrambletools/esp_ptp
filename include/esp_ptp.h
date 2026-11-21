@@ -105,6 +105,11 @@ struct ptpd_status_s {
    * Wired ports require fresh qualified peer-delay exchanges. */
   bool as_capable;
 
+  /* The external time source (ptp_external.h) holds the clock through a
+   * lost wired source; clock_source_* then describe the last grandmaster
+   * the wired port held. */
+  bool external_holding;
+
   /* Information about selected best clock source */
 
   clock_info_s clock_source_info;

@@ -3599,6 +3599,12 @@ static struct {
   uint32_t bias_samples;
   double steer_bias_ns;    /* the bias frozen while steering */
 } s_external;
+/* The last source the wired port held, kept through a link loss (which
+ * clears the daemon's own): while the external source holds the clock it
+ * is still on that grandmaster's time, and status says so. */
+static struct ptp_announce_s s_external_source;
+static ptp_path_trace_t s_external_path;
+static bool s_external_source_valid;
 
 void ptpd_external_set_mode(ptp_external_mode_t mode) {
   s_external_mode = mode;
@@ -3711,6 +3717,11 @@ static bool ptp_external_should_drive(FAR struct ptp_state_s *state,
 
 /* Daemon loop: drain, average, steer when due, report every 10 s. */
 static void ptp_external_tick(FAR struct ptp_state_s *state) {
+  if (state->selected_source_valid) {
+    s_external_source = state->selected_source;
+    s_external_path = state->selected_path;
+    s_external_source_valid = true;
+  }
   for (unsigned drained = 0; drained < PTP_EXTERNAL_DEPTH; ++drained) {
     ptp_external_sample_t sample;
     portENTER_CRITICAL(&s_external_lock);
@@ -4746,6 +4757,21 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   status->as_capable = state->port[0].medium == ptp_port_medium_wifi_ftm
       ? ptp_wifi_capability(state, 0) : ptp_wired_capability(state);
 
+  /* While the external source holds the clock through a wired outage the
+   * clock is still on the last grandmaster's time: report that source as
+   * selected and valid, so media clocks and listeners carry on. asCapable
+   * stays false. */
+  FAR struct ptp_announce_s *source = &state->selected_source;
+  status->external_holding = false;
+  if (!status->clock_source_selected && s_external.driving &&
+      s_external_mode == PTP_EXTERNAL_STANDBY && s_external_source_valid) {
+    status->external_holding = true;
+    status->clock_source_selected = true;
+    status->clock_source_valid = true;
+    status->selected_path = s_external_path;
+    source = &s_external_source;
+  }
+
   /* Copy own identity info to status struct */
 
   FAR struct ptp_announce_s *o = &state->own_identity;
@@ -4772,7 +4798,7 @@ static void ptp_process_statusreq(FAR struct ptp_state_s *state) {
   if (status->clock_source_selected) {
     /* Copy relevant parts of selected source announce info to status struct */
 
-    FAR struct ptp_announce_s *s = &state->selected_source;
+    FAR struct ptp_announce_s *s = source;
 
     memcpy(status->clock_source_info.id, s->header.sourceidentity,
            sizeof(status->clock_source_info.id));
