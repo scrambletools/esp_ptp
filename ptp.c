@@ -3580,6 +3580,7 @@ static uint32_t s_external_dropped;
 static volatile ptp_external_mode_t s_external_mode;
 static struct {
   bool driving;
+  bool log_wired_return; /* log the first wired offset after steering */
   int64_t last_sample_us;
   int64_t offset_ns;
   uint32_t updates;
@@ -3729,6 +3730,7 @@ static void ptp_external_tick(FAR struct ptp_state_s *state) {
     portENTER_CRITICAL(&s_external_lock);
     s_external.driving = drive;
     portEXIT_CRITICAL(&s_external_lock);
+    if (drive) s_external.log_wired_return = true;
     s_external.group_sum = 0;
     s_external.group_count = 0;
     s_external.applied_local_ns = 0;
@@ -3767,6 +3769,12 @@ static void ptp_external_tick(FAR struct ptp_state_s *state) {
 /* While the external source is forced to steer, a wired Sync is only
  * measured: how far the clock it steers sits from wired gPTP. */
 static bool ptp_external_takes_wired(int64_t wired_offset_ns) {
+  /* How far the external source left the clock: the first wired Sync
+   * after a period it steered, before the wired servo corrects it. */
+  if (s_external.log_wired_return && s_external_mode != PTP_EXTERNAL_FORCED) {
+    s_external.log_wired_return = false;
+    ptpstate("EXTERNAL,wired back,offset %lld ns", (long long)wired_offset_ns);
+  }
   if (!s_external.driving || s_external_mode != PTP_EXTERNAL_FORCED)
     return false;
   ptp_external_window_add(&s_external.wired, (double)wired_offset_ns);
