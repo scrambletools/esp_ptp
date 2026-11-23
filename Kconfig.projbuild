@@ -558,7 +558,7 @@ menu "PTP Daemon Configuration"
 
     config ESP_PTP_SW_SERVO_DAMPED
         bool "Damped servo for the software clock (beacon time)"
-        default n
+        default y
         help
             Steers the software clock with a proportional-integral loop
             whose gains are per second, scaled by the time between
@@ -568,6 +568,8 @@ menu "PTP Daemon Configuration"
             Off, the servo keeps its per-observation gains: at about one
             element a second they ring after every association, +-2.5 ms
             on a 9.5 min period, for hours.
+            Soaked 4 h on two stations (11-23): settled within 2-5 min,
+            then -9 us +-2.4 us on the scope behind a clean element.
 
     endif # ESP_PTP
 
