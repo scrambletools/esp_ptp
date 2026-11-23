@@ -942,7 +942,8 @@ static bool follow_up_phase_change_ns(const struct ptp_info_tlv_s *info,
 
 /* cumulativeScaledRateOffset in ppb: (rate - 1) x 2^41 as a signed 32-bit
  * count. In the beacon element the rate is BTC's against the access
- * point's TSF; our bridge sends 0. */
+ * point's TSF; our bridge sends 0 unless its coprocessor fills the
+ * element from the clock link (ESP-AVB-Bridge BEACON_TIME_FROM_LINK). */
 static int64_t follow_up_rate_ppb(const struct ptp_info_tlv_s *info) {
   const uint8_t *scaled = info->cumulativescaledrateoffset;
   int32_t value = (int32_t)(((uint32_t)scaled[0] << 24) |

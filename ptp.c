@@ -2474,7 +2474,9 @@ static void ptp_fill_gm_fields(FAR struct ptp_state_s *state,
  * has already brought into the BTC time domain. Equivalent under
  * lock; avoids residence-time accounting. correctionField,
  * cumulativeScaledRateOffset and sequenceId are zero; the time base
- * fields come from ptp_fill_gm_fields. */
+ * fields come from ptp_fill_gm_fields. A coprocessor that knows gPTP
+ * time on its own clock may rewrite the timestamp and rate for the AP
+ * TSF it adds (esp_hosted_avb hosted_avb_beacon_time_fill). */
 static void
 ptp_marshal_follow_up_for_beacon_ie(FAR struct ptp_state_s *state,
                                     FAR struct ptp_follow_up_s *out, int port_index) {
