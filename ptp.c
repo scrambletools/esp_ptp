@@ -79,6 +79,7 @@ static bool s_use_sw_clock = false;
 #include "ptp_timing_snapshot.h"
 #include "ptp_sync_receipt.h"
 #include "ptp_wired_pi.h"
+#include "ptp_sw_pi.h"
 #include "ptp_external.h"
 #include "freertos/FreeRTOS.h"
 #include "esp_vfs_l2tap.h"
@@ -366,6 +367,7 @@ typedef struct {
   int32_t ki;
   int32_t drift_acc;
   int64_t wired_integral_q16;
+  int64_t sw_integral_q16; /* ESP_PTP_SW_SERVO_DAMPED, kept over a step */
   int64_t trim_held_since_us;
   int64_t trim_held_offset_ns;
   int64_t trim_restarted_us;
@@ -1960,6 +1962,7 @@ static int ptp_initialize_state(FAR struct ptp_state_s *state,
   state->offset_pi.kp = 1;
   state->offset_pi.ki = 3; /* matches ptp4l default gain ~0.3 */
   state->offset_pi.drift_acc = 0;
+  state->offset_pi.sw_integral_q16 = 0;
 
 #ifdef CONFIG_ESP_PTP_GPTP_PROFILE
   state->active_ptp_profile = ptp_profile_gptp;
@@ -3396,6 +3399,14 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
   int64_t target_trim;
   int64_t saved_integral = state->offset_pi.wired_integral_q16;
   if (s_use_sw_clock) {
+#if CONFIG_ESP_PTP_SW_SERVO_DAMPED
+    int64_t interval_ns = state->local_time_ns_prev && local_delta_ns > 0 ?
+        local_delta_ns : INT64_C(1000000000);
+    target_trim = ptp_sw_pi_step(&state->offset_pi.sw_integral_q16,
+                                 offset_ns, interval_ns);
+    state->offset_pi.drift_acc =
+        (int32_t)(state->offset_pi.sw_integral_q16 / 65536);
+#else
     /* Keep the existing controller for noisy beacon observations. */
     state->offset_pi.drift_acc += offset_ns / PTP_FREQ_I_DIV_SW;
     if (state->offset_pi.drift_acc > ADJ_FREQ_MAX) state->offset_pi.drift_acc = ADJ_FREQ_MAX;
@@ -3403,6 +3414,7 @@ static void ptp_lock_local_clock_freq(FAR struct ptp_state_s *state,
     target_trim = offset_ns / PTP_FREQ_P_DIV_SW + state->offset_pi.drift_acc;
     if (target_trim > ADJ_FREQ_MAX) target_trim = ADJ_FREQ_MAX;
     if (target_trim < -ADJ_FREQ_MAX) target_trim = -ADJ_FREQ_MAX;
+#endif
   } else {
     int64_t interval_ns = state->local_time_ns_prev && local_delta_ns > 0 ?
         local_delta_ns : (int64_t)CONFIG_ESP_PTP_SYNC_INTERVAL_MS * 1000000;

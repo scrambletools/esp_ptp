@@ -556,6 +556,19 @@ menu "PTP Daemon Configuration"
             counters run from the 40 MHz crystal, so only the resolution
             changes. Takes one of the C6's two general purpose timers.
 
+    config ESP_PTP_SW_SERVO_DAMPED
+        bool "Damped servo for the software clock (beacon time)"
+        default n
+        help
+            Steers the software clock with a proportional-integral loop
+            whose gains are per second, scaled by the time between
+            observations: natural frequency 0.05 rad/s, damping 0.8.
+            A station taking its time from the beacon element then
+            settles within a few minutes of associating.
+            Off, the servo keeps its per-observation gains: at about one
+            element a second they ring after every association, +-2.5 ms
+            on a 9.5 min period, for hours.
+
     endif # ESP_PTP
 
 endmenu # PTP Daemon Configuration
